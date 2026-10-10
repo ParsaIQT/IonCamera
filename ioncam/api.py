@@ -147,19 +147,31 @@ class IonCamAPI:
 
     # ------------------------------------------------------------------ images
 
-    def get_frame(self, since_index=0, bin=1, roi=None):
+    def get_frame(self, since_index=0, bin=1, roi=None, view="raw"):
         """Newest frame if newer than ``since_index`` else None.
 
-        Returns {"index", "t", "tag", "image" (uint16 array, raw orientation),
-        "roi" (sensor rect of the image), "hbin", "vbin", "exposure", "em_gain"}.
+        Returns {"index", "t", "tag", "image" (raw orientation), "roi" (sensor
+        rect of the image), "hbin", "vbin", "exposure", "em_gain", "view"}.
         ``bin`` > 1 averages bin x bin blocks (less network traffic for viewers);
-        ``roi`` = [x0, y0, x1, y1] in sensor pixels crops the image."""
+        ``roi`` = [x0, y0, x1, y1] in sensor pixels crops the image.
+        ``view="corrected"``: the analysed live frame with the background
+        model removed (learned static background, scatter profile, bias) -
+        float32 - as the ion detection sees it; other frames stay raw."""
         f = self._engine.latest_frame(int(since_index))
         if f is None:
             return None
-        img = f.data
-        x0, y0 = f.x0, f.y0
-        hb, vb = f.hbin, f.vbin
+        a = f.applied
+        out = {"index": f.index, "t": f.timestamp, "tag": f.tag, "exposure": a.exposure,
+               "em_gain": a.em_gain, "view": "raw"}
+        img, x0, y0, hb, vb = f.data, f.x0, f.y0, f.hbin, f.vbin
+        if view == "corrected" and f.tag == "live":
+            det = self._engine.last_detection()
+            if det is None or det.frame_index <= int(since_index):
+                return None
+            img = det.residual
+            hb, vb = det.hbin, det.vbin
+            x0, y0 = det.x0 + det.crop[0] * hb, det.y0 + det.crop[1] * vb
+            out.update(index=det.frame_index, t=det.timestamp, view="corrected")
         if roi is not None:
             u0 = max(0, (int(roi[0]) - x0) // hb)
             v0 = max(0, (int(roi[1]) - y0) // vb)
@@ -170,12 +182,11 @@ class IonCamAPI:
         b = int(bin)
         if b > 1:
             h, w = (img.shape[0] // b) * b, (img.shape[1] // b) * b
-            img = img[:h, :w].reshape(h // b, b, w // b, b).mean(axis=(1, 3)).astype(np.uint16)
+            img = img[:h, :w].reshape(h // b, b, w // b, b).mean(axis=(1, 3)).astype(img.dtype)
             hb, vb = hb * b, vb * b
-        a = f.applied
-        return {"index": f.index, "t": f.timestamp, "tag": f.tag, "image": np.ascontiguousarray(img),
-                "roi": [x0, y0, x0 + img.shape[1] * hb, y0 + img.shape[0] * vb],
-                "hbin": hb, "vbin": vb, "exposure": a.exposure, "em_gain": a.em_gain}
+        out.update(image=np.ascontiguousarray(img), hbin=hb, vbin=vb,
+                   roi=[x0, y0, x0 + img.shape[1] * hb, y0 + img.shape[0] * vb])
+        return out
 
     # -------------------------------------------------------------------- ions
 
@@ -350,7 +361,7 @@ class IonCamAPI:
 
     # --------------------------------------------------------------- background
 
-    async def learn_background(self, n_frames=20, mask_ions=True, full_sensor=True,
+    async def learn_background(self, n_frames=50, mask_ions=True, full_sensor=True,
                                **settings):
         """Learn the static background - laser scatter from surface defects,
         dust and electrode edges (which can look like ions or clouds), hot
@@ -449,6 +460,31 @@ class IonCamAPI:
         if load_rate is not None:
             self._engine.sim_camera().cfg.load_rate = float(load_rate)
         self._scene().set_oven(bool(on))
+
+    def sim_get_params(self):
+        """[simulation] All simulator parameters (photon rate, PSF and halo,
+        surface scatter / defects, NA, ion height, camera noise ...) and the
+        surface presets."""
+        return _plain(self._scene().parameters())
+
+    def sim_set_params(self, **params):
+        """[simulation] Change simulator parameters at run time, e.g.
+        ``sim_set_params(surface="horrendous")``, ``scatter_rate=100``,
+        ``beam_angle_deg=30``, ``scatter_sigma_across=20``, ``defects=300``,
+        ``numerical_aperture=0.4``, ``ion_height_um=50``, ``photon_rate=8000``,
+        ``psf_halo_fraction=0.2``, ``laser_power=0.7``, ``surface_seed=7`` (a
+        new surface).  Returns all parameters."""
+        return _plain(self._scene().set_params(**params))
+
+    def sim_set_repumper(self, on):
+        """[simulation] Repumper off: the ions are shelved (dark) while the
+        lasers still scatter from the surface - e.g. to learn the background."""
+        self._scene().set_repumper(bool(on))
+
+    def sim_move_camera(self, dx, dy):
+        """[simulation] Move the camera (imaging system) by (dx, dy) px: ions,
+        scatter and surface structure all move in the image."""
+        self._scene().move_camera(float(dx), float(dy))
 
     def sim_trigger(self, n=1, spacing=0.0):
         """[simulation] External trigger pulses (what the ARTIQ TTL would do).

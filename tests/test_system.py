@@ -225,6 +225,42 @@ def test_overexposure_protection(tmp_path):
         engine.shutdown()
 
 
+def test_background_and_simulation_controls(tmp_path):
+    """Over RPC: a dirty trap surface, learn the background with the ions dark
+    (repumper off), see it used, view the corrected image, forget it."""
+    engine, server, port = make_system(tmp_path)
+    c = client(port)
+    try:
+        assert c.wait_for_ions(3, timeout=15)["ok"]
+        p = c.sim_get_params()
+        assert "scatter_rate" in p and "horrendous" in p["presets"]
+        p = c.sim_set_params(surface="dirty", beam_angle_deg=30.0, laser_power=0.8)
+        assert p["surface"] == "dirty" and p["beam_angle_deg"] == 30.0
+        with pytest.raises(Exception):
+            c.sim_set_params(no_such_knob=1)
+        assert c.get_background() is None
+        c.sim_set_repumper(False)
+        info = c.learn_background(20, False)
+        c.sim_set_repumper(True)
+        assert info["n_frames"] == 20 and info["mask_ions"] is False
+        assert info["region"] == [0, 0, 512, 512] and info["shot_noise"] > 0
+        assert c.get_status()["mode"] == "live"          # live resumed
+        assert c.get_status()["background"]["n_frames"] == 20
+        fr, t = None, time.time()
+        while (fr is None or fr["view"] != "corrected") and time.time() - t < 10:
+            fr = c.get_frame(0, 1, None, "corrected")    # (non-live frames stay raw)
+            time.sleep(0.1)
+        assert fr["view"] == "corrected" and fr["image"].dtype == np.float32
+        assert abs(float(np.median(fr["image"]))) < 5.0   # bias and scatter removed
+        c.sim_move_camera(3.0, 0.0)
+        c.clear_background()
+        assert c.get_background() is None
+    finally:
+        c.close_rpc()
+        server.stop()
+        engine.shutdown()
+
+
 def test_full_stack_on_emulated_andor_sdk(tmp_path):
     """Same workflow through the real AndorCamera driver (fake SDK underneath)."""
     engine, server, port = make_system(tmp_path, backend="fake_sdk")

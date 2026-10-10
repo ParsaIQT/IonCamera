@@ -8,10 +8,15 @@
   It also recognises hot **clouds**, **melting**, **lasers off** and **rigid moves**
   (shuttling, a bumped camera), and it infers where dark ions sit;
 * **careful Grabber readout preparation**. A long exposure at low gain locates every
-  ion to about 0.01 px. The camera **AQROI** is then centred on the crystal and aligned
-  to the binning grid, each ion gets **its own Grabber ROI** sized for maximum light
-  containment and minimum crosstalk, and everything is **verified with the real
-  readout settings** before the camera is **armed** (external trigger + Camera Link);
+  ion to a few hundredths of a pixel and measures the PSF, including its broad halo
+  (which is what makes neighbouring ROIs see each other). The camera **AQROI** is then
+  centred on the crystal and aligned to the binning grid, each ion gets **its own
+  Grabber ROI** sized for maximum light containment and minimum crosstalk, and
+  everything is **verified with the real readout settings** before the camera is
+  **armed** (external trigger + Camera Link);
+* **learned background**. The static light of the trap surface - laser scatter,
+  defects and dust that look like ions or clouds, electrode edges, hot pixels - is
+  learned once and subtracted from then on, at any ROI and binning;
 * **monitoring during experiments**. The iXon sends every Grabber frame over USB as
   well, so ioncam keeps watching the ions, fits bright/dark thresholds and warns when
   the crystal changes under a running experiment;
@@ -19,8 +24,10 @@
   experiments can wait for ions, calibrate and arm the readout, get the ROIs, hand off
   control while shuttling, and so on;
 * a **Qt GUI** (`ioncam_gui`) that runs with the camera in-process or as a remote viewer;
-* a physically realistic **simulator** (ion chain physics plus an EMCCD noise model),
-  so everything can be tried and tested without hardware.
+* a physically realistic **simulator**: ion chain physics, ~13k photons/s per ion into
+  the camera, a blurred PSF with a halo, laser scatter from the trap surface and surface
+  defects out of focus (set by NA and ion height), from a clean to a horrendous trap,
+  and an EMCCD noise model - so everything can be tried and tested without hardware.
 
 ```
                  ┌───────────────────── camera PC ─────────────────────┐
@@ -44,7 +51,7 @@ pip install git+https://github.com/m-labs/sipyco      # not on PyPI (ARTIQ envs 
 
 ioncam_gui --simulate          # GUI + simulated trap; use the "Simulation" tab to play
 aqctl_ioncam --simulate        # headless RPC server with the simulator
-pytest                         # 82 tests (~50 s), all on the simulator / emulated SDK
+pytest                         # 93 tests (~2 min), all on the simulator / emulated SDK
 ```
 
 With the real camera on the camera PC (Windows):
@@ -100,7 +107,7 @@ with their docstrings):
 | `get_ion_count()` / `get_ion_counts()` / `get_ions()` | bright ions / counts / per-ion sites (position, state, brightness) |
 | `wait_for_ions(n, timeout, at_least)` | block until a *stable* crystal of n bright ions |
 | `get_events(since_id)` / `wait_for_event(kinds, since_id, timeout)` | the event stream |
-| `locate_ions(expected)` | long exposure + joint fit: positions to ~0.01 px, PSF, chain fit |
+| `locate_ions(expected)` | long exposure + joint fit: positions (with errors), PSF core + halo, chain fit |
 | `calibrate_readout(n_ions, hbin, vbin, auto_binning, ...)` | locate → plan AQROI/ROIs → verify → arm |
 | `get_readout_plan()` / `get_grabber_rois()` / `get_grabber_roi_lists()` / `is_readout_valid()` | the plan |
 | `arm_readout()` / `disarm_readout(resume_live)` | external trigger + Camera Link on/off |
@@ -108,9 +115,9 @@ with their docstrings):
 | `hold_tracking(reason, timeout)` / `resume_tracking()` | "ions will move on purpose" (shuttling, camera) |
 | `take_control(owner, reason, timeout)` / `release_control(owner)` | advisory lease shown in all GUIs |
 | `start_live(**settings)` / `set_live(...)` / `set_exposure` / `set_em_gain` / `set_roi` / `stop()` | live video |
-| `get_frame(since_index, bin, roi)` | newest image (uint16, raw orientation) |
-| `learn_background(n)` | learn hot pixels / scatter structure (ions are masked) |
-| `sim_*` | drive the simulated trap: load/lose/darken ions, melt, shift, lasers, triggers |
+| `get_frame(since_index, bin, roi, view)` | newest image (raw orientation); `view="corrected"`: background removed, as the detector sees it |
+| `learn_background(n, mask_ions)` / `get_background()` / `clear_background()` | learn / inspect / forget the static surface light (see below) |
+| `sim_*` | drive the simulated trap: ions, lasers, repumper, oven, camera moves, triggers; `sim_set_params()` for surface, optics and light |
 
 Long calls run as coroutines on the server (`allow_parallel`), so one client waiting for
 ions never blocks another client or the GUI.
@@ -146,30 +153,45 @@ gives clean fingerprints:
 The detector uses a matched filter with a robust spatial noise map; EMCCD noise is skewed
 at low light, so the threshold comes from upper quantiles, not from a Gaussian assumption.
 The ions are masked out of the noise and background statistics, so a camera ROI that
-hugs the crystal works as well as the full frame. (`locate_ions` still pads its ROI to
-at least 64 × 64 px, so the fit always has background around the ions.)
-It measures each spot's width from the log-curvature of the filtered peak, which
-separates ions from clouds (wider) and from single-pixel spikes (narrower). Measured on
-the simulator: about 0.02 px position error for separated ions, about 1 false spot per
-15 empty full frames at 6σ (removed by the temporal confirmation), and around 15 ms per
-512×512 frame (about 1 ms with an analysis ROI).
+hugs the crystal works as well as the full frame - without mistaking the photon-counting
+noise of EM gain 300 (just as skewed) for a frame full of ions. (`locate_ions` still pads
+its ROI to at least 64 × 64 px, so the fit always has background around the ions.)
+Ions whose images overlap (blurred PSF, dense chains) are separated by joint fits with
+the PSF model (core + halo) and model selection, started from the tracked crystal when
+there is one. A hot, uncrystallised ion is recognised as one broad blob rather than a
+cluster of faint "ions", and faint clouds are found by integrating the light no ion
+explains over ~0.3 s against the usual background.
+
+Measured on the simulator (13k photons/s per ion, PSF σ 1.8 px + 15 % halo, typical
+surface): every ion found and ~0.2 px rms per 50 ms frame at EM gain 50-100 (the photon
+limit); single frames resolve chains down to ~2.7 σ spacing, denser ones are followed
+through the tracker's prior; no false clouds and < 1 false spot per 7 empty frames at EM
+gain 300; ~26 ms per 512×512 frame, ~12-14 ms with a smaller ROI (scipy; installing
+`opencv-python-headless`, the `fast` extra, speeds up the filtering).
 
 ## Grabber readout, step by step
 
 `calibrate_readout()` (the GUI's **Calibrate + arm**) does:
 
 1. **Locate.** It takes `calibration.n_frames` exposures with the `[locate]` settings
-   (0.5 s, minimum EM gain, 1×1 binning), averages them, and jointly fits a
-   pixel-integrated Gaussian to *all* ions at once. Overlapping PSFs in dense chains are
+   (0.5 s, EM gain 10, 1×1 binning - a little EM gain keeps the read noise below the
+   shot noise of ~10⁴ photons/s ions), averages them, and jointly fits a
+   pixel-integrated PSF - a Gaussian core plus a broad Gaussian halo (aberration wings),
+   kept when significant - to *all* ions at once. Overlapping PSFs in dense chains are
    resolved this way; ions the detector merged are recovered from the chain model when
-   `n_ions` is given. Dark ions known to the tracker are carried along.
+   `n_ions` is given. Position errors are honest (EMCCD noise law, sandwich estimator).
+   Dark ions known to the tracker are carried along. With `detection.auto_psf` the
+   measured core and halo are used by the detector and the planner from then on.
 2. **Plan.** For every binning-grid phase it gives each ion its own ROI. An ion centred
    in a super-pixel needs 1, an ion on a boundary needs 2. The layout maximises the worst
-   ion's light **containment** (exact Gaussian integrals with the fitted PSF) while
+   ion's light **containment** (exact integrals of the fitted PSF, halo included) while
    penalising **crosstalk** and area. The AQROI is the bounding box plus `frame_margin`
    super-pixels, so it is centred on the crystal, and it includes a background ROI.
-   With one ion at 4×4 binning this gives an 8×8 px AQROI with the ion at the centre of
-   2×2 super-pixels and over 99% containment, the same layout as an AQROI of
+   ROI edges can only lie on the binning grid, so an ion sits as centrally in its ROI as
+   the grid allows (the GUI draws the grid as dotted lines, and the plan lists each
+   ion's offset from its ROI centre) - offsets of up to half a super-pixel are expected,
+   not a drawing error. With one ion at 4×4 binning this gives an 8×8 px AQROI with the
+   ion at the centre of 2×2 super-pixels, the same layout as an AQROI of
    `257,264,161,168` in Solis.
 3. **Verify.** It takes `verify_frames` frames with the *final* readout settings
    (internal trigger) and checks that every ion stands out in its own ROI.
@@ -177,9 +199,11 @@ the simulator: about 0.02 px position error for separated ions, about 1 false sp
    frame and nothing has to be re-armed per shot.
 
 The returned plan includes `binning_advice`, which shows how other binnings would score.
-For example, a 3-ion chain with 6 px spacing gets 85% / 12% (containment / crosstalk) at
-4×4, but 96% / 3% at 2×8 with an even smaller frame. `auto_binning=True` picks the
-cheapest binning that meets the targets.
+Real ion images are blurred and have wings, so neighbouring ROIs do see each other: a
+3-ion chain with 6 px spacing (PSF σ 1.8 px + 15 % halo) gets 58 % / 11 % (worst
+containment / crosstalk) at 4×4, 80 % / 10 % at 3×3 and 71 % / 4 % at 1×1.
+`auto_binning=True` picks the cheapest binning that meets the targets
+(`calibration.min_containment`, `max_crosstalk`).
 
 Your Solis readout settings map onto `[readout]` (the defaults):
 
@@ -220,6 +244,48 @@ Some points that matter when using the Grabber:
   `get_readout_stats()`. If more light than at arming falls outside the ROIs, you get
   `readout_geometry_changed`; any crystal change in live mode marks the plan
   **outdated** (`is_readout_valid()` returns False).
+
+## Learning the background (dirty traps)
+
+Surface traps scatter the cooling laser: a broad, Gaussian-ish glow along the beam
+(obvious in long exposures), plus bright points from defects, dust, scratches and
+electrode edges. Out of focus these are blurred disks (radius h·tan(asin NA)·M/pixel for
+a point at depth h below the ions - ~19 px at NA 0.25, 60 µm); dust standing up from the
+surface is closer to focus and looks like an ion. **Learn background** (GUI, or
+`learn_background()` over RPC) takes `n_frames` (default 50) of the full sensor without
+binning at the live exposure and gain and keeps:
+
+* the static light: a smooth part everywhere plus the fine structure where it is
+  significant (defects, edges, hot pixels) - not the noise of the learning frames, and
+  not single amplified photons (EMCCD bursts are told from hot pixels by the per-frame
+  median);
+* the camera's noise law (photon transfer: variance per count of signal), so the
+  detector expects more noise where it subtracted bright static light.
+
+From then on it is subtracted from every analysed frame - any ROI, binning, exposure and
+EM gain (it is stored per sensor pixel and per unit exposure × gain) - and its brightness
+follows the laser power frame by frame. Ions may stay in the trap (they are modelled and
+masked); better, switch the **repumper off** (ions shelved: dark, but the laser still
+scatters) or empty the trap, and tick *ions dark / trap empty* (`mask_ions=False`).
+The display can show the raw image or the image with the background removed (what the
+detector sees). Learn again after moving the camera or realigning the beam (ioncam hints
+at it when the whole picture shifts).
+
+On the simulator, a dirty surface with dust near focus gives ~20-50 false "ions" per
+frame without it and none with it; the ions are still found.
+
+## The simulator
+
+`ioncam_gui --simulate` / `aqctl_ioncam --simulate` run on a simulated trap. The
+*Simulation* tab (or `sim_set_params()` over RPC) sets: surface preset (`clean`,
+`typical`, `dirty`, `horrendous`) and a new random surface, ion fluorescence (photons/s
+reaching the camera, default 13 000), laser power, PSF core and halo, chain length scale,
+uniform stray light, laser scatter (rate at the beam centre, widths along / across the
+beam, angle, offset), defects (number, brightness, height above the surface), scratches,
+electrode-gap scatter, collection NA and ion height; plus ions (load, lose, dark,
+melt), lasers, repumper, oven, camera moves and external triggers. The EMCCD model has
+Poisson photo-electrons, clock-induced charge, the gamma-distributed EM register, read
+noise, bias and 16-bit saturation.
 
 ## Taking over
 
@@ -286,15 +352,18 @@ These are worth knowing, because several would silently corrupt data:
 
 ## Tests
 
-`pytest` runs 82 tests in under a minute:
+`pytest` runs 93 tests in about 2 minutes, in the realistic regime (13k photons/s
+per ion, blurred PSF with halo, laser scatter, surface defects):
 - chain physics against James' published values;
-- detector accuracy and false-alarm rates, also with a camera ROI hugging the crystal;
-- the joint fit and its Jacobian;
+- detector accuracy (photon-limited) and false-alarm rates at EM gain 1, 50 and 300,
+  also with a camera ROI hugging the crystal, clouds vs ions, the learned background on a
+  dirty surface with ion-like dust (any ROI and binning, laser power changes);
+- the joint core + halo fit of a dense chain (unbiased, honest errors) and its Jacobian;
 - every tracker scenario (load via cloud, dark vs lost at every chain position, loss with
   a dark ion present, melting, lasers off, rigid moves, shuttling with hold, a quiet
   stable crystal);
-- planner invariants, and agreement with the Grabber gateware model, including its `x1`
-  quirk;
+- planner invariants, its containment / crosstalk against the simulated image (halo
+  included), and agreement with the Grabber gateware model, including its `x1` quirk;
 - the Andor driver's exact SDK call sequence on the emulated SDK;
 - a full stack over real sipyco RPC with concurrent clients;
 - a headless GUI smoke test.

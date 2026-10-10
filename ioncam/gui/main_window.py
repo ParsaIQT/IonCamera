@@ -37,6 +37,39 @@ def _row(*widgets):
     return lay
 
 
+# simulator knobs shown in the Simulation tab: (parameter, label, min, max, step, decimals)
+SIM_FIELDS = [
+    ("photon_rate", "ion fluorescence into the camera [photons/s]", 100, 1e6, 1000, 0),
+    ("laser_power", "laser power (relative)", 0.0, 5.0, 0.1, 2),
+    ("psf_sigma", "PSF core sigma [px]", 0.5, 6.0, 0.1, 2),
+    ("psf_halo_fraction", "PSF halo: fraction of the light", 0.0, 0.8, 0.05, 2),
+    ("psf_halo_sigma", "PSF halo sigma [px]", 0.5, 30.0, 0.5, 1),
+    ("length_scale_px", "chain length scale [px]", 1.0, 100.0, 0.2, 2),
+    ("background_rate", "uniform stray light [photons/s/px]", 0.0, 1e4, 1.0, 1),
+    ("scatter_rate", "laser scatter at the beam centre [photons/s/px]", 0.0, 1e5, 5.0, 1),
+    ("scatter_sigma_along", "scatter width along the beam [px]", 1.0, 2000.0, 10.0, 0),
+    ("scatter_sigma_across", "scatter width across the beam [px]", 1.0, 2000.0, 5.0, 0),
+    ("beam_angle_deg", "beam angle [deg]", -180.0, 180.0, 5.0, 0),
+    ("defects", "surface defects / dust grains", 0, 5000, 10, 0),
+    ("defect_rate", "defect brightness [photons/s]", 0.0, 1e6, 500.0, 0),
+    ("defect_max_height_um", "dust up to this high above the surface [um]", 0.0, 500.0, 5.0, 0),
+    ("scratches", "scratches", 0, 100, 1, 0),
+    ("gap_scatter", "electrode-gap scatter [photons/s per px]", 0.0, 1e4, 1.0, 1),
+    ("numerical_aperture", "collection NA", 0.01, 0.95, 0.01, 2),
+    ("ion_height_um", "ion height above the surface [um]", 0.0, 2000.0, 5.0, 0),
+]
+
+
+def _background_text(bg):
+    if not bg:
+        return "background: none learned (surface structure not subtracted)"
+    how = "ions masked ({})".format(bg.get("masked_sites", 0)) if bg.get("mask_ions") \
+        else "ions dark / no ions"
+    return ("background: {} x {:.3g} s at EM gain {}, {}; brightness x{:.2f}".format(
+        bg.get("n_frames"), bg.get("exposure", 0.0), bg.get("em_gain"), how,
+        bg.get("scale", 1.0)))
+
+
 def format_plan(plan):
     if not plan:
         return "No readout plan yet.\n\nPress 'Calibrate + arm' (or call calibrate_readout() " \
@@ -237,17 +270,39 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cmap.addItems(["inferno", "viridis", "magma", "plasma", "CET-L1", "CET-L8"])
         self.cmap.setCurrentText(disp.colormap)
         self.cmap.activated.connect(lambda _: self.image.set_colormap(self.cmap.currentText()))
+        self.view = QtWidgets.QComboBox()
+        self.view.addItems(["raw image", "background removed"])
+        self.view.setToolTip("background removed: what the ion detection sees - the learned "
+                             "static background, the scatter profile and the bias subtracted")
+        self._view = "raw"
+        self.view.activated.connect(lambda i: setattr(self, "_view", ("raw", "corrected")[i]))
         display = _group("Display (orientation is display-only)", [
             _row(self.auto_levels, self.overlays, "colormap", self.cmap),
             _row("rotate (clockwise)", self.rotation, self.flipx, self.flipy),
+            _row("show", self.view),
         ])
         self.hold_btn = QtWidgets.QPushButton("Hold tracking (moving ions)")
         self.hold_btn.setCheckable(True)
         self.hold_btn.toggled.connect(self._hold)
+        self.bg_frames = QtWidgets.QSpinBox()
+        self.bg_frames.setRange(5, 1000)
+        self.bg_frames.setValue(50)
+        self.bg_frames.setToolTip("frames (full sensor, live exposure and gain) - more frames, "
+                                  "less noise in the learned structure")
+        self.bg_dark = QtWidgets.QCheckBox("ions dark / trap empty")
+        self.bg_dark.setToolTip("repumper off (ions shelved, the laser still scatters) or no "
+                                "ions: nothing needs masking - the most complete background. "
+                                "Unchecked: the tracked ions are modelled and masked.")
+        self.bg_label = QtWidgets.QLabel("background: none learned")
+        self.bg_label.setWordWrap(True)
         analysis = _group("Ion detection", [
-            _row(_button("Learn background", lambda: self._cmd("learn_background", 10),
-                         "learn scatter structure / hot pixels (ions are masked)"),
-                 _button("Clear background", lambda: self._cmd("clear_background"))),
+            _row(_button("Learn background", self._learn_background,
+                         "learn the static light of the trap surface - laser scatter, "
+                         "defects and dust (which can look like ions or clouds), hot pixels - "
+                         "and subtract it from now on"),
+                 self.bg_frames, "frames", self.bg_dark),
+            _row(self.bg_label, _button("Clear background",
+                                        lambda: self._cmd("clear_background"))),
             _row(_button("Accept crystal as reference", lambda: self._cmd("relearn")),
                  _button("Forget crystal", lambda: self._cmd("reset_tracking"))),
             self.hold_btn,
@@ -373,12 +428,85 @@ class MainWindow(QtWidgets.QMainWindow):
         lay.addWidget(_group("Lab", [
             _row(_button("Lasers off", lambda: c("sim_set_lasers", False)),
                  _button("Lasers on", lambda: c("sim_set_lasers", True))),
+            _row(_button("Repumper off (ions dark)", lambda: c("sim_set_repumper", False)),
+                 _button("Repumper on", lambda: c("sim_set_repumper", True))),
             _row(_button("Oven on (loading)", lambda: c("sim_set_oven", True, 0.3)),
                  _button("Oven off", lambda: c("sim_set_oven", False))),
+            _row("move camera", _button("+5 px x", lambda: c("sim_move_camera", 5.0, 0.0)),
+                 _button("-5 px x", lambda: c("sim_move_camera", -5.0, 0.0)),
+                 _button("+5 px y", lambda: c("sim_move_camera", 0.0, 5.0))),
             _row(_button("100 external triggers", lambda: c("sim_trigger", 100, 0.005))),
         ]))
+
+        # surface, optics and light: the realism knobs
+        self.sim_preset = QtWidgets.QComboBox()
+        self.sim_preset.addItems(["clean", "typical", "dirty", "horrendous"])
+        self.sim_preset.activated.connect(lambda _: self._set_sim(
+            surface=self.sim_preset.currentText()))
+        self.sim_fields = {}
+        form = QtWidgets.QFormLayout()
+        form.addRow("surface preset", _row(self.sim_preset, _button(
+            "New surface", lambda: self._set_sim(
+                surface_seed=int(self._sim_params.get("surface_seed", 1)) + 1),
+            "same kind of surface, different defects")))
+        for name, label, lo, hi, step, dec in SIM_FIELDS:
+            sp = QtWidgets.QDoubleSpinBox()
+            sp.setRange(lo, hi)
+            sp.setSingleStep(step)
+            sp.setDecimals(dec)
+            sp.setKeyboardTracking(False)
+            sp.editingFinished.connect(lambda n=name, w_=sp: self._set_sim(**{n: w_.value()}))
+            self.sim_fields[name] = sp
+            form.addRow(label, sp)
+        self.sim_offset = []
+        for axis in ("x", "y"):
+            sp = QtWidgets.QDoubleSpinBox()
+            sp.setRange(-500.0, 500.0)
+            sp.setSingleStep(5.0)
+            sp.setDecimals(0)
+            sp.setKeyboardTracking(False)
+            sp.editingFinished.connect(lambda: self._set_sim(scatter_offset=[
+                self.sim_offset[0].value(), self.sim_offset[1].value()]))
+            self.sim_offset.append(sp)
+        form.addRow("scatter centre offset x, y [px]", _row(*self.sim_offset))
+        self.sim_info = QtWidgets.QLabel("")
+        self.sim_info.setWordWrap(True)
+        optics = QtWidgets.QGroupBox("Surface, optics and light")
+        ol = QtWidgets.QVBoxLayout(optics)
+        ol.addLayout(form)
+        ol.addWidget(self.sim_info)
+        lay.addWidget(optics)
         lay.addStretch(1)
-        return w
+        self._sim_params = {}
+        self.backend.call("sim_get_params", callback=self._got_sim_params)
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(w)
+        return scroll
+
+    def _set_sim(self, **params):
+        self._cmd("sim_set_params", callback=self._got_sim_params, **params)
+
+    def _got_sim_params(self, p):
+        self._sim_params = dict(p or {})
+        for name, sp in self.sim_fields.items():
+            if name in p:
+                sp.blockSignals(True)
+                sp.setValue(float(p[name]))
+                sp.blockSignals(False)
+        off = p.get("scatter_offset") or (0.0, 0.0)
+        for sp, v in zip(self.sim_offset, off):
+            sp.blockSignals(True)
+            sp.setValue(float(v))
+            sp.blockSignals(False)
+        if p.get("surface") in [self.sim_preset.itemText(i) for i in range(self.sim_preset.count())]:
+            self.sim_preset.setCurrentText(p["surface"])
+        self.sim_info.setText(
+            "A point on the surface is imaged as a disk of radius {:.1f} px (ions in focus at "
+            "{:.0f} um height, NA {:.2f}); dust closer to focus looks like ions.  After changing "
+            "the surface or moving the camera, learn the background again.".format(
+                p.get("defocus_radius_px", 0.0), p.get("ion_height_um", 0.0),
+                p.get("numerical_aperture", 0.0)))
 
     # ------------------------------------------------------------ actions
     def _cmd(self, name, *args, callback=None, **kwargs):
@@ -394,6 +522,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.msg_label.setText("{} failed: {}".format(name, exc))
         if name != "refresh":
             QtWidgets.QMessageBox.warning(self, "ioncam", "{} failed:\n{}".format(name, exc))
+
+    def _learn_background(self):
+        self._cmd("learn_background", self.bg_frames.value(), not self.bg_dark.isChecked())
 
     def _crop_view(self):
         self._cmd("set_roi", *self.image.visible_sensor_rect())
@@ -465,10 +596,11 @@ class MainWindow(QtWidgets.QMainWindow):
         since, last_ev, want_plan = self._frame_index, self._last_event, self._plan_created
         cur_valid = (self._plan or {}).get("valid")
         rbin = self._remote_bin
+        view = self._view
 
         def job(invoke):
             out = {"status": invoke("get_status"),
-                   "frame": invoke("get_frame", since, rbin),
+                   "frame": invoke("get_frame", since, rbin, None, view),
                    "events": invoke("get_events", last_ev)}
             st = out["status"]
             if st["ions"].get("n_spots") or st["ions"].get("n_clouds"):
@@ -485,6 +617,7 @@ class MainWindow(QtWidgets.QMainWindow):
         st = out["status"]
         self._status = st
         self.banner.update_status(st)
+        self.bg_label.setText(_background_text(st.get("background")))
         fr = out.get("frame")
         if fr is not None:
             self._frame_index = fr["index"]

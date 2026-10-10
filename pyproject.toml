@@ -21,6 +21,8 @@ rpc = ["sipyco @ git+https://github.com/m-labs/sipyco.git"]
 # Any Qt binding supported by pyqtgraph works (PyQt5, PyQt6, PySide6).
 gui = ["pyqtgraph>=0.13", "PyQt6"]
 test = ["pytest>=7"]
+# optional: ~5x faster image filtering (the analysis falls back to scipy)
+fast = ["opencv-python-headless"]
 
 [project.scripts]
 aqctl_ioncam = "ioncam.server:main"

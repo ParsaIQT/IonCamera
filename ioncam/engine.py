@@ -508,6 +508,12 @@ class IonCamEngine:
             self._tracker_cond.notify_all()
         for ev in events:
             self.events.add(ev)
+            sb = self.detector.static_background
+            if ev["kind"] == "chain_moved" and sb is not None and not sb.info.get("moved"):
+                sb.info["moved"] = True
+                self.events.emit("background_check", "The crystal moved in the image: if the "
+                                 "camera / imaging moved (not the ions), learn the background "
+                                 "again - the surface structure moved with it", "info")
             if ev["kind"] in ("ion_lost", "ion_trapped", "chain_reconfigured", "dark_ion_moved",
                               "chain_moved") and self._plan is not None:
                 if self._plan_valid:
@@ -553,6 +559,7 @@ class IonCamEngine:
             "sites": snap.get("sites", []),
             "detection": {k: v for k, v in self._det_summary.items()
                           if k not in ("spots", "clouds")},
+            "background": self.background_info(),
             "readout": {"armed": self._mode == READOUT, "has_plan": plan is not None,
                         "plan_valid": bool(plan is not None and self._plan_valid),
                         "n_ions": plan.n_ions if plan else 0,
@@ -575,6 +582,10 @@ class IonCamEngine:
 
     def detection_summary(self) -> dict:
         return dict(self._det_summary)
+
+    def last_detection(self):
+        """The most recent :class:`DetectionResult` (live frames) or None."""
+        return self._detection
 
     def tracker_snapshot(self) -> dict:
         return dict(self._snapshot)
@@ -1032,7 +1043,7 @@ class IonCamEngine:
 
     # -- background -------------------------------------------------------------------------
 
-    def learn_background(self, n_frames: int = 20, mask_ions: bool = True,
+    def learn_background(self, n_frames: int = 50, mask_ions: bool = True,
                          full_sensor: bool = True, **overrides) -> dict:
         """Learn the static background structure (surface scatter, defects, hot
         pixels): ``n_frames`` with the live settings (plus ``overrides``, e.g.

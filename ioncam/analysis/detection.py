@@ -372,13 +372,28 @@ def _gaussian(img: np.ndarray, sy: float, sx: float) -> np.ndarray:
     return ndimage.gaussian_filter(img, sigma=(sy, sx), mode="constant", truncate=3.5)
 
 
-def _bandpass(img: np.ndarray, s1: Tuple[float, float], s2: Tuple[float, float]) -> np.ndarray:
-    """Difference of Gaussians (linear: unlike median backgrounds it is not
-    biased by skewed noise); edges reflected."""
-    a = np.asarray(img, np.float32)
-    a = a - np.float32(np.median(a[::4, ::4]))
-    return (ndimage.gaussian_filter(a, s1, mode="reflect", truncate=3.5) -
-            ndimage.gaussian_filter(a, s2, mode="reflect", truncate=3.5)).astype(np.float32)
+def _photon_transfer(mean: np.ndarray, var: np.ndarray) -> float:
+    """Slope of the per-pixel variance against the mean (photon transfer
+    curve): counts^2 of noise per count of signal - for an EMCCD the
+    excess-noise factor squared times the counts per electron.  Robust: median
+    variance in bins of the mean, then a straight line."""
+    m = mean.ravel()[::3]
+    v = var.ravel()[::3]
+    lo, hi = np.quantile(m, [0.01, 0.995])
+    if not hi > lo:
+        return 0.0
+    edges = np.linspace(lo, hi, 25)
+    idx = np.digitize(m, edges)
+    xs, ys = [], []
+    for k in range(1, len(edges)):
+        sel = idx == k
+        if np.count_nonzero(sel) >= 50:
+            xs.append(float(np.median(m[sel])))
+            ys.append(float(np.median(v[sel])))
+    if len(xs) < 4 or np.ptp(xs) <= 0:
+        return 0.0
+    slope = float(np.polyfit(xs, ys, 1)[0])
+    return max(slope, 0.0)
 
 
 def _local_maxima(f: np.ndarray, mask: np.ndarray) -> np.ndarray:
@@ -872,12 +887,16 @@ class StaticBackground:
     frame from the structure left in the residual."""
 
     def __init__(self, image: np.ndarray, region, info: Optional[dict] = None,
-                 pixel_noise: float = 0.0):
+                 shot_noise: float = 0.0, shot_gain: float = 1.0):
         self.image = np.asarray(image, np.float32)      # counts / sensor px / gain factor
         self.region = tuple(int(v) for v in region)     # (x0, y0, x1, y1) sensor px
         self.info = dict(info or {})
-        self.pixel_noise = float(pixel_noise)           # noise of the map per sensor px
+        # camera noise law (photon transfer): variance [counts^2] per count of
+        # signal, measured at EM gain ``shot_gain`` (proportional to the gain)
+        self.shot_noise = float(shot_noise)
+        self.shot_gain = float(shot_gain)
         self.scale = 1.0
+        self._structure_px = int(np.count_nonzero(self.image))
         self._cache: dict = {}
 
     def for_frame(self, frame: Frame) -> Optional[np.ndarray]:
@@ -908,24 +927,9 @@ class StaticBackground:
         self._cache[key] = m
         return m
 
-    def bandpass_for_frame(self, frame: Frame, s1: Tuple[float, float],
-                           s2: Tuple[float, float]) -> Optional[np.ndarray]:
-        """:meth:`for_frame` band-passed (difference of Gaussians ``s1`` - ``s2``,
-        (sy, sx) frame px) - the structure the scale is fitted on."""
-        m = self.for_frame(frame)
-        if m is None:
-            return None
-        key = ("bandpass", frame.x0, frame.y0, frame.hbin, frame.vbin, m.shape, s1, s2)
-        out = self._cache.get(key)
-        if out is None:
-            out = _bandpass(m, s1, s2)
-            self._cache[key] = out
-        return out
-
     def summary(self) -> dict:
-        nz = self.image != 0
         return dict(self.info, region=list(self.region), scale=round(float(self.scale), 4),
-                    structure_px=int(nz.sum()))
+                    structure_px=self._structure_px)
 
     # (kept for callers of the old API)
     def matches(self, frame: Frame) -> bool:
@@ -1030,6 +1034,18 @@ class Detector:
         # estimation noise in a tile lower it much
         noise_f_map = sigma_up * np.clip(rel, 0.85, 4.0)
         noise_f = sigma_up
+        if static is not None and sb.shot_noise > 0:
+            # the learned static light was subtracted, its shot noise was not:
+            # where it is brighter than in the rest of its tile (a defect, an
+            # electrode edge) the noise is higher than the tile statistics say
+            g = frame.applied.em_gain if frame.applied.settings.amplifier == "em" else 1
+            b = sb.shot_noise * max(float(g), 1.0) / max(sb.shot_gain, 1.0)
+            var = _gaussian(np.maximum(static, 0.0) * np.float32(b * sb.scale),
+                            sy / math.sqrt(2.0), sx / math.sqrt(2.0)) / \
+                np.float32(4.0 * math.pi * sx * sy)
+            excess = var - _expand(_quantiles_last(_tiles(*_subsample(var, tile)), [0.5])[0],
+                                   var.shape)
+            noise_f_map = np.sqrt(noise_f_map ** 2 + np.maximum(excess, 0.0)).astype(np.float32)
 
         snr_map = filt / noise_f_map
         mask = snr_map > thr_sigma
@@ -1124,8 +1140,8 @@ class Detector:
             # (again: the deblending may have re-introduced lumps of a cloud)
             clouds, spots = _merge_clouds(clouds, spots)
         if static is not None and cfg.static_scale_tracking:
-            self._refine_static_scale(sb, frame, sub, spots + clouds, (u0, v0, u1, v1),
-                                      (sy, sx), gain_factor)
+            self._refine_static_scale(sb, static, sub, spots + clouds, (u0, v0), hb, vb,
+                                      bg_block)
         widths = [s.width for s in spots if s.snr > 2 * thr_sigma]
         focus = float(np.median(widths)) if widths else float("nan")
         return DetectionResult(
@@ -1137,50 +1153,45 @@ class Detector:
 
     # -- static background ----------------------------------------------------------------
 
-    def _refine_static_scale(self, sb: StaticBackground, frame: Frame, sub: np.ndarray,
-                             objects: List[Spot], crop, sf: Tuple[float, float],
-                             gain_factor: float) -> None:
-        """Follow the scale of the static light (laser power, EM gain
-        calibration) from the structure left in (or over-subtracted from) the
-        frame ``sub`` (already corrected with the current scale), slowly
-        averaged over frames.  Fitted on a linear band-pass of frame and map
-        (the median-based background is biased by skewed EMCCD noise, more in
-        bright structure), away from ions, clouds and the frame edges, where
-        the structure is well above the noise of the frame and of the map."""
-        u0, v0, u1, v1 = crop
-        hb, vb = frame.hbin, frame.vbin
-        s1 = (float(sf[0]), float(sf[1]))
-        s2 = (2.5 * s1[0], 2.5 * s1[1])
-        hm = sb.bandpass_for_frame(frame, s1, s2)
-        if hm is None:
-            return
-        hm = hm[v0:v1, u0:u1] * np.float32(gain_factor)
-        hs = _bandpass(sub, s1, s2)
-        h, w = hs.shape
-        noise_h = mad_std(hs[::2, ::2] if hs.size > 20000 else hs)
-        # noise of the band-passed map: pixel noise x |kernel| (isotropic approx.)
-        a2, b2 = s1[0] * s1[1], s2[0] * s2[1]
-        knorm = math.sqrt(max(1.0 / (4 * math.pi * a2) + 1.0 / (4 * math.pi * b2)
-                              - 1.0 / (math.pi * (a2 + b2)), 1e-12))
-        map_noise = sb.pixel_noise * math.sqrt(hb * vb) * gain_factor * knorm
-        sel = np.abs(hm) > max(3.0 * noise_h, 8.0 * map_noise)
-        e = int(math.ceil(3.0 * max(s2)))
-        sel[:e, :] = False
-        sel[h - e:, :] = False
-        sel[:, :e] = False
-        sel[:, w - e:] = False
-        r_obj = 3.0 * max(s2[0] * vb, s2[1] * hb) + 2.0
+    def _refine_static_scale(self, sb: StaticBackground, static: np.ndarray, sub: np.ndarray,
+                             objects: List[Spot], origin, hb: int, vb: int,
+                             block: int) -> None:
+        """Follow the brightness of the static light (laser power, EM gain
+        calibration).  Its largest part, the laser scatter profile, varies over
+        the frame: the tile means of the corrected frame ``sub`` (ions and
+        clouds left out) against those of the subtracted map give the scale
+        error as the slope (the offset is bias and uniform light).  Means, not
+        medians: with skewed EMCCD noise a median shifts with the brightness.
+        Slowly averaged over frames; skipped without enough contrast."""
+        h, w = sub.shape
+        keep = np.ones(sub.shape, bool)
+        u0, v0 = origin
+        r = 3.0 * self.cfg.psf_sigma + 2.0
         for o in objects:
-            rr = max(r_obj, 2.5 * o.width)
+            rr = max(r, 2.5 * o.width)
             cu, cv = o.u - u0, o.v - v0
             ua, ub = int(max(0, cu - rr / hb)), int(min(w, cu + rr / hb + 1))
             va, vb_ = int(max(0, cv - rr / vb)), int(min(h, cv + rr / vb + 1))
-            sel[va:vb_, ua:ub] = False
-        if np.count_nonzero(sel) < 12:
+            keep[va:vb_, ua:ub] = False
+        if min(h, w) < 2 * block:
             return
-        x = hm[sel].astype(np.float64)
-        d = float(np.dot(x, hs[sel]) / max(float(np.dot(x, x)), 1e-12))
-        sb.scale = float(np.clip(sb.scale + 0.3 * np.clip(d, -1.0, 1.0), 0.0, 5.0))
+        kt = _tiles(keep, block)
+        n = kt.sum(axis=2)
+        ok = n >= 0.5 * kt.shape[2]
+        if np.count_nonzero(ok) < 4:
+            return
+        ms = (_tiles(sub, block) * kt).sum(axis=2)[ok] / n[ok]
+        mm = (_tiles(static * np.float32(sb.scale), block) * kt).sum(axis=2)[ok] / n[ok]
+        spread = float(np.std(mm))
+        # contrast: the map's tile means must differ by many times their noise
+        # (pixel noise / sqrt(pixels per tile))
+        noise = mad_std(sub[::2, ::2] if sub.size > 20000 else sub)
+        if spread < 5.0 * noise / math.sqrt(float(np.median(n[ok]))):
+            return
+        a = np.column_stack([np.ones_like(mm), mm])
+        coef = np.linalg.lstsq(a, ms, rcond=None)[0]
+        d = float(np.clip(coef[1], -0.5, 0.5)) * sb.scale
+        sb.scale = float(np.clip(sb.scale + 0.5 * d, 0.0, 5.0))
 
     def learn_static_background(self, frames: Sequence[Frame],
                                 mask_positions: Optional[np.ndarray] = None,
@@ -1204,6 +1215,7 @@ class Detector:
         # hot pixels are high in every frame; one amplified photon (EMCCD) in
         # one frame lifts a pixel of the mean as much - the median is not fooled
         med = np.median(cube, axis=0) if len(frames) >= 3 else stack
+        shot = _photon_transfer(stack, cube.var(axis=0, ddof=1)) if len(frames) >= 8 else 0.0
         del cube
         block = max(4, int(round(self.cfg.background_block / max(hb, vb))))
         c = self.cfg
@@ -1298,8 +1310,9 @@ class Detector:
                 "masked_sites": n_masked, "created": time.time(),
                 "noise_of_mean": float(noise)}
         meta.update(info or {})
-        sb = StaticBackground(image, region, meta,
-                              pixel_noise=noise / (hb * vb * max(f0.applied.gain_factor, 1e-12)))
+        em = f0.applied.em_gain if f0.applied.settings.amplifier == "em" else 1
+        meta["shot_noise"] = round(float(shot), 4)
+        sb = StaticBackground(image, region, meta, shot_noise=shot, shot_gain=max(float(em), 1.0))
         self.static_background = sb
         return sb
 

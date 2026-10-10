@@ -269,7 +269,7 @@ def _best_layout(pos, sx, sy, px, py, hb, vb, sensor_shape, fixed=None, along_x=
 def plan_readout(positions: Sequence[Sequence[float]], sigma: Tuple[float, float],
                  sensor_shape: Tuple[int, int], hbin: int, vbin: int,
                  roi_size: Tuple[int, int] = (0, 0), frame_margin: int = 1,
-                 min_containment: float = 0.8, max_crosstalk: float = 0.05,
+                 min_containment: float = 0.6, max_crosstalk: float = 0.12,
                  max_rois: int = 16, background_roi: bool = True,
                  flip_x: bool = False, flip_y: bool = False, res_width: int = 12,
                  ion_states: Optional[Sequence[str]] = None,

@@ -73,7 +73,7 @@ kinetic_cycle_time = 0.0
 # exposure time [s]
 exposure = 0.5
 # EM gain (in camera.em_gain_mode units); 0 = minimum
-em_gain = 0
+em_gain = 10
 # 'em' or 'conventional' output amplifier
 amplifier = "em"
 # horizontal readout rate [MHz]; nearest available is used
@@ -160,10 +160,10 @@ search_margin = 0
 expected_ions = 0
 # Grabber ROI size per ion in binned pixels [w, h]; [0, 0] = choose automatically
 roi_size = [0, 0]
-# required fraction of each ion's light inside its ROI
-min_containment = 0.8
+# required fraction of each ion's light inside its ROI (PSF halo included: real optics rarely give > 85 %)
+min_containment = 0.6
 # maximum fraction of an ion's light in a neighbour's ROI
-max_crosstalk = 0.05
+max_crosstalk = 0.12
 # binned pixels of margin around the ROIs in the AQROI
 frame_margin = 1
 # add one extra Grabber ROI on empty background
@@ -174,17 +174,25 @@ include_dark_sites = true
 verify = true
 # number of verification frames
 verify_frames = 20
-# minimum (ion ROI - background)/noise in verification
-min_verify_snr = 3.0
+# minimum significance of each ion's mean signal over the verification frames (is it in its ROI?)
+min_verify_snr = 5.0
 # joint 2D Gaussian fit of all ions (sub-pixel positions, PSF)
 fit_psf = true
 
 # Ion spot detection
 [detection]
 # PSF Gaussian sigma [sensor px]; refined by calibration if auto_psf
-psf_sigma = 1.5
-# update psf_sigma from calibration fits
+psf_sigma = 1.8
+# fraction of an ion's light in a broad halo (aberration wings); refined by calibration if auto_psf
+psf_halo_fraction = 0.0
+# halo sigma [sensor px]
+psf_halo_sigma = 0.0
+# update the PSF (core sigma, halo) from calibration fits
 auto_psf = true
+# fit overlapping ions jointly (dense chains of blurred ions)
+deblend = true
+# largest group of overlapping ions fitted jointly
+deblend_max = 24
 # detection threshold in units of the matched-filter noise
 threshold_sigma = 6.0
 # minimum distance between two ions [sensor px]
@@ -197,8 +205,12 @@ background_block = 32
 max_spots = 100
 # a spot wider than this x PSF is reported as an uncrystallised cloud, not an ion
 cloud_width_factor = 2.2
+# threshold for faint, diffuse clouds (light the ions do not explain, filtered at cloud scale); 0 = off
+cloud_threshold_sigma = 6.0
 # maximum full-detection rate (frames beyond are only used for cheap per-ion counts)
 max_rate_hz = 40.0
+# follow the brightness of the learned static background (laser power) frame by frame
+static_scale_tracking = true
 
 # Chain tracking and event classification (trapped / lost / dark)
 [tracker]
@@ -222,6 +234,8 @@ dark_level = 0.25
 bright_level = 0.55
 # total brightness below this fraction (and spots lost) => crystal melted
 melt_level = 0.35
+# light still around a dim crystal (fraction of its normal light, above the usual scatter) that makes it 'melted' rather than 'dark' / 'lasers off'
+melt_diffuse = 0.08
 # seconds without any fluorescence before the ions are presumed lost
 forget_time = 30.0
 # EMA weight used to follow slow drifts
@@ -232,6 +246,8 @@ use_chain_model = true
 max_dark_inferred = 3
 # default maximum duration of hold_tracking() [s]
 hold_timeout = 120.0
+# while the crystal is stable, re-measure it on the average of the frames since the last check every this many seconds (dim or dense chains that single frames cannot resolve); 0 = off
+verify_period = 2.0
 
 # ARTIQ Grabber geometry
 [grabber]
@@ -302,14 +318,64 @@ n_ions = 3
 center = [262.0, 168.0]
 # chain axis angle w.r.t. sensor x [deg]
 axis_angle_deg = 0.0
-# chain length scale l = (e^2/(4 pi eps0 m w^2))^(1/3) in px; 2 ions are 1.26 l apart, 3 ions 1.08 l
-length_scale_px = 7.4
-# PSF sigma [px]
-psf_sigma = 1.3
-# detected photons/s per bright ion
-photon_rate = 400000.0
-# scattered-light photons/s/px (plus a gradient)
-background_rate = 150.0
+# chain length scale l = (e^2/(4 pi eps0 m w_z^2))^(1/3) x M / pixel [px]: 40Ca+ at w_z = 2 pi 1 MHz has l = 4.45 um = 5.6 px at M = 20 and 16 um pixels.  2 ions are 1.26 l apart, 3 ions 1.08 l, 4 ions 0.91 l (inner pair)
+length_scale_px = 5.6
+# photons/s per bright ion reaching the camera
+photon_rate = 13000.0
+# sensor quantum efficiency at the fluorescence wavelength (iXon Ultra 897 BV: ~0.6 at 397 nm)
+quantum_efficiency = 0.6
+# ion image (PSF) core sigma [px]: aberrations, residual motion; much larger than the diffraction limit in practice
+psf_sigma = 1.8
+# fraction of an ion's light in a broad halo (aberration wings) - this is what makes the crosstalk between neighbouring ROIs large
+psf_halo_fraction = 0.15
+# halo sigma [px]
+psf_halo_sigma = 4.5
+# imaging magnification
+magnification = 20.0
+# camera pixel size [um] (iXon Ultra 897: 16)
+pixel_size_um = 16.0
+# collection NA
+numerical_aperture = 0.25
+# ion height above the trap surface [um].  The camera is focused on the ions, so a point on the surface is a blurred disk of radius h tan(asin NA) M / pixel (19 px with the defaults; small NA x h makes surface defects look like ions)
+ion_height_um = 60.0
+# trap surface preset: clean | typical | dirty | horrendous; sets scatter_rate ... hot_pixels below ('' = use those values)
+surface = ""
+# uniform stray light [photons/s/px], also with the lasers off
+background_rate = 2.0
+# laser light scattered by the trap surface at the beam centre [photons/s/px]; visible in long exposures
+scatter_rate = 25.0
+# Gaussian scatter profile: sigma along the beam [px]
+scatter_sigma_along = 150.0
+# sigma across the beam [px] (beam waist / 2 on the camera)
+scatter_sigma_across = 30.0
+# profile centre relative to the initial chain centre [px]
+scatter_offset = [0.0, 0.0]
+# laser beam direction w.r.t. sensor x [deg]
+beam_angle_deg = 45.0
+# scattering defects / dust on the surface, over the whole sensor (only those in the beam are lit)
+defects = 25
+# median photons/s of a defect in the beam centre
+defect_rate = 3000.0
+# log-normal sigma of the defect brightness
+defect_spread = 1.2
+# dust grains stand up to this high above the surface: closer to focus, less blurred
+defect_max_height_um = 0.0
+# scratches (lines of defects)
+scratches = 0
+# light from the electrode gaps along the trap axis at the beam centre [photons/s per px of gap]
+gap_scatter = 4.0
+# distance of the electrode gaps from the trap axis [px]
+gap_offset_px = 45.0
+# hot pixels
+hot_pixels = 8
+# median dark current of a hot pixel [e-/s]
+hot_pixel_rate = 200.0
+# relative cooling/detection laser intensity: the surface scatter scales with it, the fluorescence too (far below saturation)
+laser_power = 1.0
+# laser intensity noise, relative rms per frame
+laser_noise = 0.01
+# seed of the surface layout (defects, scratches, hot pixels)
+surface_seed = 1
 # baseline counts per (binned) pixel
 bias = 100.0
 # read noise [e-] rms

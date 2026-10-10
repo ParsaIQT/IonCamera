@@ -123,6 +123,40 @@ def test_static_background_keeps_ions_and_removes_hot_pixels(setup):
     assert not any(abs(s.x - 100) < 2 and abs(s.y - 100) < 2 for s in r1.spots)
 
 
+@pytest.mark.parametrize("ions_dark", [False, True])
+def test_learned_background_removes_surface_defects(setup, ions_dark):
+    """A dirty surface with dust close to focus: defects that look like ions.
+    The static background, learned once on the full sensor (with the ions
+    masked, or dark - repumper off), removes them in any later ROI and
+    binning; the ions stay."""
+    cfg, cam, det = setup
+    cam.scene.set_params(surface="dirty", defect_max_height_um=40.0, ion_height_um=3.0)
+    live = cfg.live.replace(roi=(150, 90, 380, 250))
+    cam.scene.set_n_ions(0)
+    assert sum(len(det.analyze(f).spots) for f in _grab(cam, live, 5, t0=2000)) >= 20
+    cam.scene.set_n_ions(5)
+    cam.scene.set_scale(7.0)      # resolvable in single frames despite the scatter's noise
+    truth = np.array(cam.scene.state()["positions"])
+    cam.scene.set_repumper(not ions_dark)
+    sb = det.learn_static_background(_grab(cam, cfg.live, 50, t0=3000),
+                                     None if ions_dark else truth)
+    cam.scene.set_repumper(True)
+    assert sb.region == (0, 0, 512, 512)
+    for settings in (live, live.replace(hbin=2, vbin=2)):
+        fp = miss = 0
+        for f in _grab(cam, settings, 5, t0=4000):
+            r = det.analyze(f)
+            _, a, b = _match(r.positions, truth, r=2.0)
+            fp, miss = fp + a, miss + b
+        assert miss == 0 and fp <= 2, (settings.hbin, fp, miss)
+    assert 0.8 < sb.scale < 1.2
+    # the laser 30 % brighter: the subtracted structure follows
+    cam.scene.set_params(laser_power=1.3)
+    for f in _grab(cam, live, 15, t0=5000):
+        det.analyze(f)
+    assert sb.scale == pytest.approx(1.3, abs=0.12)
+
+
 def test_analysis_roi_crop(setup):
     cfg, cam, det = setup
     cam.scene.set_n_ions(3)

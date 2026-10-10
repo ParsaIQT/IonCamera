@@ -116,8 +116,9 @@ class CalibrationConfig:
                                 "ions are found")
     roi_size: Tuple[int, int] = opt((0, 0), "Grabber ROI size per ion in binned pixels "
                                             "[w, h]; [0, 0] = choose automatically")
-    min_containment: float = opt(0.80, "required fraction of each ion's light inside its ROI")
-    max_crosstalk: float = opt(0.05, "maximum fraction of an ion's light in a neighbour's ROI")
+    min_containment: float = opt(0.60, "required fraction of each ion's light inside its ROI "
+                                       "(PSF halo included: real optics rarely give > 85 %)")
+    max_crosstalk: float = opt(0.12, "maximum fraction of an ion's light in a neighbour's ROI")
     frame_margin: int = opt(1, "binned pixels of margin around the ROIs in the AQROI")
     background_roi: bool = opt(True, "add one extra Grabber ROI on empty background")
     include_dark_sites: bool = opt(True, "also give dark ions known to the tracker a ROI")
