@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ioncam"
+version = "1.0.0"
+description = "Ion-trap camera brain: iXon EMCCD control, ion detection/tracking and ARTIQ Grabber readout planning over sipyco RPC"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.22",
+    "scipy>=1.8",
+    "tomli>=2.0; python_version<'3.11'",
+]
+
+[project.optional-dependencies]
+# sipyco is not published on PyPI.  ARTIQ environments already ship it;
+# otherwise install it with:  pip install git+https://github.com/m-labs/sipyco
+rpc = ["sipyco @ git+https://github.com/m-labs/sipyco.git"]
+# Any Qt binding supported by pyqtgraph works (PyQt5, PyQt6, PySide6).
+gui = ["pyqtgraph>=0.13", "PyQt6"]
+test = ["pytest>=7"]
+
+[project.scripts]
+aqctl_ioncam = "ioncam.server:main"
+ioncam_gui = "ioncam.gui.app:main"
+
+[tool.setuptools.packages.find]
+include = ["ioncam*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

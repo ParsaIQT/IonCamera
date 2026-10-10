@@ -1,0 +1,336 @@
+# ioncam configuration
+
+# Camera hardware
+[camera]
+# 'andor' (real iXon via pyAndorSDK2), 'simulator' (physics simulator) or 'fake_sdk' (andor driver on an emulated SDK - for testing the driver itself)
+backend = "andor"
+# directory passed to Initialize(); '' = SDK default
+sdk_dir = ""
+# which camera to use if several are connected
+camera_index = 0
+# sensor set point [deg C]
+target_temperature = -60
+# switch the TEC cooler on at start-up
+cooler_on = true
+# keep the sensor cold after the server exits (SetCoolerMode(1)); avoids thermal cycling
+keep_cooler_on_exit = true
+# 0 = full, 1 = low, 2 = off (only with water cooling!)
+fan_mode = 0
+# EM gain mode: 0 = DAC 0-255, 1 = DAC 0-4095, 2 = linear, 3 = real EM gain (what Solis shows for the iXon Ultra)
+em_gain_mode = 3
+# allow EM gains above 300 (ages the sensor; photon counting only)
+em_advanced = false
+# 'open', 'auto' or 'closed' (external shutter TTL)
+shutter = "open"
+# shutter opens on TTL high
+shutter_ttl_high = true
+# how often to read the temperature [s]
+temperature_poll_s = 2.0
+
+# Live video (trapping, monitoring): settings for internal-trigger video
+[live]
+# exposure time [s]
+exposure = 0.05
+# EM gain (in camera.em_gain_mode units); 0 = minimum
+em_gain = 50
+# 'em' or 'conventional' output amplifier
+amplifier = "em"
+# horizontal readout rate [MHz]; nearest available is used
+hs_speed_mhz = 10.0
+# vertical shift speed [us]; 0 = fastest recommended
+vs_speed_us = 0.0
+# vertical clock voltage: 0 = Normal, 1..4 = +1..+4
+vs_amplitude = 0
+# pre-amp gain index (0-based); Solis 'Gain 3' = 2
+preamp_gain_index = 2
+# keep the baseline (bias) level constant
+baseline_clamp = true
+# horizontal binning
+hbin = 1
+# vertical binning
+vbin = 1
+# acquisition ROI [x0, y0, x1, y1] (0-based, half-open, raw sensor orientation); omit = full sensor
+# roi = 
+# internal | external | external_start | external_exposure | software
+trigger = "internal"
+# single | run_till_abort | accumulate
+acquisition = "run_till_abort"
+# number of accumulations (acquisition = accumulate)
+n_accumulations = 1
+# frame-transfer readout (no dead time between frames)
+frame_transfer = true
+# accept external triggers without finishing a keep-clean cycle
+fast_ext_trigger = false
+# trigger on the falling edge
+trigger_invert = false
+# also stream frames out of the Camera Link port (Grabber)
+camera_link = false
+# frame period for internal trigger [s]; 0 = fastest
+kinetic_cycle_time = 0.0
+
+# Long-exposure, low-gain frames used to locate the ions precisely
+[locate]
+# exposure time [s]
+exposure = 0.5
+# EM gain (in camera.em_gain_mode units); 0 = minimum
+em_gain = 0
+# 'em' or 'conventional' output amplifier
+amplifier = "em"
+# horizontal readout rate [MHz]; nearest available is used
+hs_speed_mhz = 5.0
+# vertical shift speed [us]; 0 = fastest recommended
+vs_speed_us = 0.5
+# vertical clock voltage: 0 = Normal, 1..4 = +1..+4
+vs_amplitude = 0
+# pre-amp gain index (0-based); Solis 'Gain 3' = 2
+preamp_gain_index = 2
+# keep the baseline (bias) level constant
+baseline_clamp = true
+# horizontal binning
+hbin = 1
+# vertical binning
+vbin = 1
+# acquisition ROI [x0, y0, x1, y1] (0-based, half-open, raw sensor orientation); omit = full sensor
+# roi = 
+# internal | external | external_start | external_exposure | software
+trigger = "internal"
+# single | run_till_abort | accumulate
+acquisition = "run_till_abort"
+# number of accumulations (acquisition = accumulate)
+n_accumulations = 1
+# frame-transfer readout (no dead time between frames)
+frame_transfer = true
+# accept external triggers without finishing a keep-clean cycle
+fast_ext_trigger = false
+# trigger on the falling edge
+trigger_invert = false
+# also stream frames out of the Camera Link port (Grabber)
+camera_link = false
+# frame period for internal trigger [s]; 0 = fastest
+kinetic_cycle_time = 0.0
+
+# Grabber readout (external trigger + Camera Link).  AQROI is computed automatically; the roi field here is ignored
+[readout]
+# exposure time [s]
+exposure = 0.0015
+# EM gain (in camera.em_gain_mode units); 0 = minimum
+em_gain = 200
+# 'em' or 'conventional' output amplifier
+amplifier = "em"
+# horizontal readout rate [MHz]; nearest available is used
+hs_speed_mhz = 5.0
+# vertical shift speed [us]; 0 = fastest recommended
+vs_speed_us = 0.5
+# vertical clock voltage: 0 = Normal, 1..4 = +1..+4
+vs_amplitude = 0
+# pre-amp gain index (0-based); Solis 'Gain 3' = 2
+preamp_gain_index = 2
+# keep the baseline (bias) level constant
+baseline_clamp = true
+# horizontal binning
+hbin = 4
+# vertical binning
+vbin = 4
+# acquisition ROI [x0, y0, x1, y1] (0-based, half-open, raw sensor orientation); omit = full sensor
+# roi = 
+# internal | external | external_start | external_exposure | software
+trigger = "external"
+# single | run_till_abort | accumulate
+acquisition = "run_till_abort"
+# number of accumulations (acquisition = accumulate)
+n_accumulations = 1
+# frame-transfer readout (no dead time between frames)
+frame_transfer = false
+# accept external triggers without finishing a keep-clean cycle
+fast_ext_trigger = false
+# trigger on the falling edge
+trigger_invert = false
+# also stream frames out of the Camera Link port (Grabber)
+camera_link = true
+# frame period for internal trigger [s]; 0 = fastest
+kinetic_cycle_time = 0.0
+
+# How the readout calibration (locate -> plan -> verify -> arm) works
+[calibration]
+# long-exposure frames averaged to locate the ions
+n_frames = 2
+# if > 0 and ions are already known, only acquire this many px around them (faster); 0 = full sensor/live ROI
+search_margin = 0
+# if > 0, calibration fails unless exactly this many ions are found
+expected_ions = 0
+# Grabber ROI size per ion in binned pixels [w, h]; [0, 0] = choose automatically
+roi_size = [0, 0]
+# required fraction of each ion's light inside its ROI
+min_containment = 0.8
+# maximum fraction of an ion's light in a neighbour's ROI
+max_crosstalk = 0.05
+# binned pixels of margin around the ROIs in the AQROI
+frame_margin = 1
+# add one extra Grabber ROI on empty background
+background_roi = true
+# also give dark ions known to the tracker a ROI
+include_dark_sites = true
+# take test frames with the final readout settings (internal trigger) and check every ROI before arming
+verify = true
+# number of verification frames
+verify_frames = 20
+# minimum (ion ROI - background)/noise in verification
+min_verify_snr = 3.0
+# joint 2D Gaussian fit of all ions (sub-pixel positions, PSF)
+fit_psf = true
+
+# Ion spot detection
+[detection]
+# PSF Gaussian sigma [sensor px]; refined by calibration if auto_psf
+psf_sigma = 1.5
+# update psf_sigma from calibration fits
+auto_psf = true
+# detection threshold in units of the matched-filter noise
+threshold_sigma = 6.0
+# minimum distance between two ions [sensor px]
+min_separation = 2.5
+# block size for the smooth background map [sensor px]
+background_block = 32
+# only look for ions inside [x0, y0, x1, y1] (sensor px); omit = everywhere
+# analysis_roi = 
+# never report more spots than this
+max_spots = 100
+# a spot wider than this x PSF is reported as an uncrystallised cloud, not an ion
+cloud_width_factor = 2.2
+# maximum full-detection rate (frames beyond are only used for cheap per-ion counts)
+max_rate_hz = 40.0
+
+# Chain tracking and event classification (trapped / lost / dark)
+[tracker]
+# a change must persist this long before it is reported [s]
+confirm_time = 0.5
+# ... and for at least this many analysed frames
+confirm_frames = 3
+# time without changes before the chain counts as stable [s]
+stable_time = 1.0
+# max frame-to-frame motion of one ion after removing the common shift [px]
+match_radius = 2.0
+# largest common translation searched for [px]
+max_global_shift = 25.0
+# ions moving by more than this fraction of the local spacing => chain reconfigured
+reconfig_fraction = 0.25
+# ... but by at least this many px
+reconfig_min_px = 0.8
+# site brightness below this fraction of its reference => dark
+dark_level = 0.25
+# site brightness above this fraction => bright again
+bright_level = 0.55
+# total brightness below this fraction (and spots lost) => crystal melted
+melt_level = 0.35
+# seconds without any fluorescence before the ions are presumed lost
+forget_time = 30.0
+# EMA weight used to follow slow drifts
+position_smoothing = 0.15
+# use the linear-chain equilibrium model to locate dark ions after a reconfiguration
+use_chain_model = true
+# maximum number of hidden dark ions to infer
+max_dark_inferred = 3
+# default maximum duration of hold_tracking() [s]
+hold_timeout = 120.0
+
+# ARTIQ Grabber geometry
+[grabber]
+# Grabber x runs opposite to the SDK image x (set from check_grabber_mapping if needed)
+flip_x = false
+# Grabber y runs opposite to the SDK image y
+flip_y = false
+# ROI engines in the Grabber gateware
+roi_engine_count = 16
+# coordinate width of the Grabber gateware (max 2**12-1)
+res_width = 12
+
+# Sensor protection
+[safety]
+# protect the EMCCD against overexposure at high EM gain
+enabled = true
+# pixel value treated as saturated
+saturation_counts = 60000
+# more saturated pixels than this trips protection
+max_saturated_pixels = 25
+# EM gain applied when protection trips (0 = minimum)
+safe_em_gain = 0
+# legacy rule: if > 0, also trip when more than bright_fraction of all pixels exceed this value
+bright_counts = 0
+# see bright_counts
+bright_fraction = 0.7
+
+# Files
+[storage]
+# where calibrations and the event log are written
+data_dir = "ioncam_data"
+# save every calibration (image, fit, plan)
+save_calibrations = true
+# append all events to <data_dir>/events.jsonl
+event_log = true
+
+# Optional publishing of live numbers to ARTIQ datasets
+[publish]
+# ARTIQ master host to publish ioncam.* datasets to (empty = disabled)
+master = ""
+# ARTIQ master control port
+port = 3251
+# dataset name prefix
+prefix = "ioncam."
+# publish interval [s]
+interval = 1.0
+
+# GUI defaults
+[display]
+# display rotation, degrees clockwise (0, 90, 180, 270); display only - never affects ROIs
+rotation = 90
+# mirror the display horizontally
+flip_x = false
+# mirror the display vertically
+flip_y = false
+# pyqtgraph colormap name
+colormap = "inferno"
+# auto-levels percentiles
+level_percentiles = [1.0, 99.95]
+# GUI refresh limit
+max_fps = 25.0
+
+# Simulated trap + camera (backend = 'simulator' or --simulate)
+[simulator]
+# ions present at start
+n_ions = 3
+# chain centre [sensor px]
+center = [262.0, 168.0]
+# chain axis angle w.r.t. sensor x [deg]
+axis_angle_deg = 0.0
+# chain length scale l = (e^2/(4 pi eps0 m w^2))^(1/3) in px; 2 ions are 1.26 l apart, 3 ions 1.08 l
+length_scale_px = 7.4
+# PSF sigma [px]
+psf_sigma = 1.3
+# detected photons/s per bright ion
+photon_rate = 400000.0
+# scattered-light photons/s/px (plus a gradient)
+background_rate = 150.0
+# baseline counts per (binned) pixel
+bias = 100.0
+# read noise [e-] rms
+read_noise_e = 30.0
+# electrons per count at the output
+sensitivity = 4.0
+# clock-induced charge [e-/px/frame]
+cic = 0.003
+# ions loaded per second while the oven is on
+load_rate = 0.0
+# loss probability per ion per second
+loss_rate = 0.0
+# go-dark probability per bright ion per second
+dark_rate = 0.0
+# return-to-bright probability per dark ion per second
+bright_rate = 0.0
+# crystal melting events per second
+melt_rate = 0.0
+# random-walk drift of the trap centre [px/sqrt(s)]
+drift_px_per_s = 0.0
+# external-trigger rate when nobody triggers (0 = only sim_trigger())
+auto_trigger_hz = 0.0
+# random seed (-1 = random)
+seed = -1

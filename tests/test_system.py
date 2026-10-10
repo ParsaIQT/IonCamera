@@ -1,0 +1,272 @@
+"""End to end: engine + sipyco RPC server + clients (as ARTIQ would use it)."""
+
+import os
+import socket
+import threading
+import time
+
+import numpy as np
+import pytest
+
+sipyco = pytest.importorskip("sipyco")
+from sipyco.pc_rpc import Client  # noqa: E402
+
+from ioncam.config import Config  # noqa: E402
+from ioncam.server import ServerThread, build  # noqa: E402
+
+
+def free_port():
+    s = socket.socket()
+    s.bind(("localhost", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def make_system(tmp_path, backend="simulator", **sim):
+    cfg = Config()
+    cfg.storage.data_dir = str(tmp_path)
+    cfg.camera.backend = backend
+    cfg.simulator.seed = 11
+    cfg.simulator.n_ions = sim.pop("n_ions", 3)
+    for k, v in sim.items():
+        setattr(cfg.simulator, k, v)
+    cfg.tracker.confirm_time = 0.3
+    cfg.live.roi = (160, 100, 360, 240)
+    cfg.live.exposure = 0.03
+    engine, api = build(cfg, simulate=(backend == "simulator"))
+    engine.start()
+    port = free_port()
+    server = ServerThread(api, ["localhost"], port).start()
+    return engine, server, port
+
+
+@pytest.fixture(scope="module")
+def system(tmp_path_factory):
+    engine, server, port = make_system(tmp_path_factory.mktemp("ioncam"))
+    yield engine, port
+    server.stop()
+    engine.shutdown()
+
+
+def client(port):
+    return Client("localhost", port, "ioncam", timeout=60)
+
+
+def test_rpc_introspection_and_basics(system):
+    engine, port = system
+    c = client(port)
+    try:
+        assert c.ping() is True
+        doc = c.get_rpc_method_list()          # must not choke on annotations
+        assert "calibrate_readout" in doc["methods"] and "wait_for_ions" in doc["methods"]
+        info = c.get_info()
+        assert info["simulated"] and info["sensor_shape"] == [512, 512]
+        st = c.get_status()
+        assert st["mode"] == "live"
+        r = c.wait_for_ions(3, timeout=15)
+        assert r["ok"] and r["n_bright"] == 3
+        f = c.get_frame(0)
+        assert f["image"].dtype == np.uint16 and f["roi"] == [160, 100, 360, 240]
+        assert c.get_frame(f["index"]) is None or c.get_frame(f["index"])["index"] > f["index"]
+        assert c.get_frame(0, bin=4)["image"].shape == (35, 50)
+        ions = c.get_ions()
+        assert len(ions) == 3 and all(isinstance(i["x"], float) for i in ions)
+    finally:
+        c.close_rpc()
+
+
+def test_calibrate_arm_trigger_monitor(system):
+    engine, port = system
+    c = client(port)
+    try:
+        assert c.wait_for_ions(3, timeout=15)["ok"]
+        plan = c.calibrate_readout(n_ions=3)
+        assert c.get_status()["mode"] == "readout"
+        assert plan["n_rois"] == 4 and plan["ion_mask"] == 0b111 and plan["full_mask"] == 0b1111
+        for k in ("grabber_x0", "grabber_y0", "grabber_x1", "grabber_y1"):
+            assert all(type(v) is int for v in plan[k])
+        assert plan["verification"]["ok"]
+        a = plan["applied"]
+        assert a["settings"]["trigger"] == "external" and a["settings"]["camera_link"]
+        assert a["exposure"] == pytest.approx(0.0015) and a["em_gain"] == 200
+        assert c.get_grabber_roi_lists() == [plan["grabber_x0"], plan["grabber_y0"],
+                                             plan["grabber_x1"], plan["grabber_y1"]]
+        assert c.sim_trigger(60, 0.004) == 60
+        time.sleep(0.8)
+        counts = c.get_readout_counts(0)
+        assert counts["next_shot"] >= 60
+        assert counts["sums"][-1] == c.sim_grabber_sums()     # USB copy == Grabber view
+        stats = c.get_readout_stats()
+        assert len(stats["rois"]) == 4
+        assert stats["rois"][0]["mean"] > stats["rois"][3]["mean"]   # ion ROI > background
+        assert c.is_readout_valid()
+        c.disarm_readout()
+        assert c.get_status()["mode"] == "live"
+    finally:
+        c.close_rpc()
+
+
+def test_locate_ions_precise(system):
+    engine, port = system
+    c = client(port)
+    try:
+        assert c.wait_for_ions(3, timeout=15)["ok"]
+        res = c.locate_ions(3)
+        truth = np.array(c.sim_state()["positions"])
+        pos = np.array(res["positions"])
+        assert np.abs(pos - truth).max() < 0.05
+        assert res["psf_sigma"][0] == pytest.approx(1.3, abs=0.03)
+        assert c.get_status()["mode"] == "live"      # previous mode restored
+    finally:
+        c.close_rpc()
+
+
+def test_wait_does_not_block_other_clients(system):
+    engine, port = system
+    c1, c2 = client(port), client(port)
+    try:
+        result = {}
+        th = threading.Thread(target=lambda: result.update(
+            ev=c1.wait_for_event(["never_happens"], None, 2.0)))
+        th.start()
+        n = 0
+        t = time.time()
+        while th.is_alive() and time.time() - t < 5:
+            c2.get_status()
+            n += 1
+        th.join()
+        assert result["ev"] is None and n > 20
+    finally:
+        c1.close_rpc()
+        c2.close_rpc()
+
+
+def test_loading_event_and_plan_invalidation(system):
+    engine, port = system
+    c = client(port)
+    try:
+        assert c.wait_for_ions(3, timeout=15)["ok"]
+        last = c.get_last_event_id()
+        c.sim_load_ion(1, 0.3)
+        ev = c.wait_for_event(["ion_trapped"], last, 15)
+        assert ev is not None and ev["n_bright"] == 4
+        assert c.wait_for_ions(4, timeout=10)["ok"]
+        if c.get_readout_plan() is not None:
+            assert not c.is_readout_valid()
+        c.sim_lose_ion(-1)
+        ev = c.wait_for_event(["ion_lost"], ev["id"], 15)
+        assert ev is not None and ev["details"]["after"] == 3
+    finally:
+        c.close_rpc()
+
+
+def test_shuttling_with_hold(system):
+    engine, port = system
+    c = client(port)
+    try:
+        assert c.wait_for_ions(3, timeout=15)["ok"]
+        last = c.get_last_event_id()
+        c.hold_tracking("shuttle to zone B", 30)
+        c.sim_shift(25.0, 0.0)
+        time.sleep(0.5)
+        c.sim_shift(-25.0, 0.0)
+        time.sleep(0.3)
+        c.resume_tracking()
+        ev = c.wait_for_event(["hold_done"], last, 15)
+        assert ev is not None and ev["details"] == {"before": 3, "after": 3}
+        kinds = [e["kind"] for e in c.get_events(last)]
+        assert "ion_lost" not in kinds
+    finally:
+        c.close_rpc()
+
+
+def test_control_lease_and_config(system):
+    engine, port = system
+    c = client(port)
+    try:
+        c.take_control("artiq", "experiment 42", 60)
+        assert c.get_control()["owner"] == "artiq"
+        with pytest.raises(Exception):
+            c.take_control("someone else", "", 60)
+        assert c.release_control("artiq") is True
+        assert c.get_control() is None
+        assert c.set_config("tracker", "confirm_time", 0.3) == 0.3
+        assert c.get_config()["tracker"]["confirm_time"] == 0.3
+    finally:
+        c.close_rpc()
+
+
+def test_overexposure_protection(tmp_path):
+    engine, server, port = make_system(tmp_path, n_ions=2, photon_rate=5e7)
+    c = client(port)
+    try:
+        last = c.get_last_event_id()
+        c.set_live(em_gain=300)
+        ev = c.wait_for_event(["overexposure"], last, 10)
+        assert ev is not None
+        assert c.get_status()["settings"]["em_gain"] <= 1
+    finally:
+        c.close_rpc()
+        server.stop()
+        engine.shutdown()
+
+
+def test_full_stack_on_emulated_andor_sdk(tmp_path):
+    """Same workflow through the real AndorCamera driver (fake SDK underneath)."""
+    engine, server, port = make_system(tmp_path, backend="fake_sdk")
+    c = client(port)
+    try:
+        assert c.get_info()["model"] == "DU897_BV"
+        assert c.wait_for_ions(3, timeout=15)["ok"]
+        plan = c.calibrate_readout(n_ions=3)
+        assert plan["verification"]["ok"]
+        sdk = engine.camera._sdk
+        assert ("SetCameraLinkMode", (1,)) in sdk.calls
+        hb, vb, hs, he, vs, ve = plan["sdk_image"]
+        assert ("SetImage", (hb, vb, hs, he, vs, ve)) in sdk.calls
+        assert sdk.sim.trigger(20, 0.004) == 20
+        time.sleep(0.5)
+        assert c.get_readout_counts(0)["next_shot"] >= 20
+    finally:
+        c.close_rpc()
+        server.stop()
+        engine.shutdown()
+
+
+def test_calibration_files_written(system, tmp_path_factory):
+    engine, port = system
+    d = os.path.join(engine.config.storage.data_dir, "calibrations")
+    assert os.path.isdir(d) and any(f.endswith("_readout_plan.json") for f in os.listdir(d))
+    assert os.path.exists(os.path.join(engine.config.storage.data_dir, "events.jsonl"))
+
+
+def test_gui_smoke(tmp_path):
+    pytest.importorskip("pyqtgraph")
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    try:
+        import pyqtgraph as pg
+        from ioncam.gui.backend import LocalBackend
+        from ioncam.gui.main_window import MainWindow
+        app = pg.mkQApp("ioncam-test")
+    except Exception as e:  # pragma: no cover - no usable Qt
+        pytest.skip("Qt not usable: {}".format(e))
+    engine, server, port = make_system(tmp_path)
+    backend = LocalBackend(server.api, server)
+    try:
+        win = MainWindow(backend, backend.call("get_config").result(10),
+                         backend.call("get_info").result(10))
+        win.show()
+        t = time.time()
+        while time.time() - t < 3.0:
+            app.processEvents()
+            time.sleep(0.01)
+        assert win.image.img.image is not None
+        assert "ion" in win.banner.count.text()
+        x0, y0, x1, y1 = win.image.visible_sensor_rect()
+        assert x0 <= 170 and x1 >= 350          # whole live ROI visible
+        win.close()
+    finally:
+        backend.close()
+        server.stop()
+        engine.shutdown()
