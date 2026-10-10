@@ -931,10 +931,6 @@ class StaticBackground:
         return dict(self.info, region=list(self.region), scale=round(float(self.scale), 4),
                     structure_px=self._structure_px)
 
-    # (kept for callers of the old API)
-    def matches(self, frame: Frame) -> bool:
-        return self.for_frame(frame) is not None
-
 
 class Detector:
     """Per-frame ion detector (configuration: :class:`ioncam.config.DetectionConfig`)."""
