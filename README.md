@@ -44,7 +44,7 @@ pip install git+https://github.com/m-labs/sipyco      # not on PyPI (ARTIQ envs 
 
 ioncam_gui --simulate          # GUI + simulated trap; use the "Simulation" tab to play
 aqctl_ioncam --simulate        # headless RPC server with the simulator
-pytest                         # 78 tests (~45 s), all on the simulator / emulated SDK
+pytest                         # 82 tests (~50 s), all on the simulator / emulated SDK
 ```
 
 With the real camera on the camera PC (Windows):
@@ -286,9 +286,9 @@ These are worth knowing, because several would silently corrupt data:
 
 ## Tests
 
-`pytest` runs 78 tests in under a minute:
+`pytest` runs 82 tests in under a minute:
 - chain physics against James' published values;
-- detector accuracy and false-alarm rates;
+- detector accuracy and false-alarm rates, also with a camera ROI hugging the crystal;
 - the joint fit and its Jacobian;
 - every tracker scenario (load via cloud, dark vs lost at every chain position, loss with
   a dark ion present, melting, lasers off, rigid moves, shuttling with hold, a quiet
