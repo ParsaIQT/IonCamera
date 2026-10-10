@@ -7,9 +7,12 @@ typical analysis ROI):
    scatter features, hot pixels), scaled with exposure x gain;
 2. smooth background from tile medians, bilinearly interpolated with cached
    separable interpolation matrices (follows drifting scatter and blobs);
+   in small frames the ions are masked out of the tile medians;
 3. a *noise map* from tile-wise MAD of the residual: EMCCD noise grows with
    the background, so a single global noise figure would under-threshold
-   bright scatter regions;
+   bright scatter regions.  Its scale comes from the upper tail of the
+   pixels away from the ions (:func:`filtered_noise_scale`), so a camera ROI
+   hugging the crystal works too;
 4. matched filter (Gaussian, ``filter_scale`` x PSF so that dense chains stay
    resolved at ~90 % of the optimal SNR) and local maxima above
    ``threshold_sigma`` x local filtered noise;
@@ -182,10 +185,26 @@ def _subsample(img: np.ndarray, block: int):
     return img, block
 
 
-def block_background(img: np.ndarray, block: int) -> np.ndarray:
-    """Smooth background: medians of ~``block``-sized tiles, bilinearly interpolated."""
+def block_background(img: np.ndarray, block: int,
+                     exclude: Optional[np.ndarray] = None) -> np.ndarray:
+    """Smooth background: medians of ~``block``-sized tiles, bilinearly interpolated.
+
+    Pixels flagged in ``exclude`` (objects) are left out; a tile with too few
+    remaining pixels takes the median of the other tiles."""
     sub, b = _subsample(img, block)
-    return _expand(np.median(_tiles(sub, b), axis=2), img.shape)
+    t = _tiles(sub, b)
+    if exclude is None:
+        return _expand(np.median(t, axis=2), img.shape)
+    keep = ~_tiles(*_subsample(exclude, block))
+    ok = keep.sum(axis=2) >= max(8, t.shape[2] // 5)
+    if not ok.any():
+        rest = t[keep]
+        return np.full(img.shape, np.median(rest if rest.size else t), np.float32)
+    med = np.empty(t.shape[:2], np.float32)
+    for iy, ix in zip(*np.nonzero(ok)):
+        med[iy, ix] = np.median(t[iy, ix][keep[iy, ix]])
+    med[~ok] = np.median(med[ok])
+    return _expand(med, img.shape)
 
 
 def block_noise(res: np.ndarray, block: int) -> np.ndarray:
@@ -194,6 +213,84 @@ def block_noise(res: np.ndarray, block: int) -> np.ndarray:
     t = _tiles(sub, b)
     med = np.median(t, axis=2, keepdims=True)
     return _expand(1.4826 * np.median(np.abs(t - med), axis=2), res.shape)
+
+
+def filtered_noise_scale(filt: np.ndarray, tile: int, spot_sigma: Tuple[float, float],
+                         significant: float = 6.0,
+                         levels: Sequence[float] = (0.995, 0.98, 0.95)) -> float:
+    """Noise scale of the matched-filtered image, for the detection threshold.
+
+    EMCCD noise is strongly right-skewed at low light (single amplified
+    photons), so the scale comes from the upper quantile, (q99.5 - q50) /
+    2.576: exact for Gaussian noise, conservative for skewed noise.  Bright
+    objects must not inflate it:
+
+    * tiles with an outlying scale (clouds, scatter, a chain) are excluded and
+      the quantile is taken over the pooled pixels of the clean tiles;
+    * a tight ROI around a crystal is a single tile in which the ions *are*
+      the upper tail.  So objects are masked in two passes: the first masks
+      everything above a high quantile (``levels``, tried in turn, for
+      crystals covering more of the frame), grown by 3 ``spot_sigma`` (the
+      (x, y) width of a spot in ``filt``) to include the wings of very bright
+      ions; the second, using the scale of the rest, only pixels above
+      ``significant`` times that scale, grown by the 1.5 widths in which a
+      spot falls from there to the noise.  So in pure noise the tail that
+      defines the scale stays (almost) intact.  The masked estimate is
+      adopted only if it is substantially lower;
+    * the lower-tail scale, which positive objects cannot inflate, is a floor.
+    """
+    sub, b = _subsample(filt, tile)
+    step = tile // b
+    tl = _tiles(sub, b)
+    tq = np.quantile(tl, [0.5, 0.995], axis=2)
+    ts = tq[1] - tq[0]
+    clean = ts <= 2.0 * float(np.median(ts))
+    if not np.any(clean):
+        clean[...] = True
+    vals = tl[clean]
+    q005, q50, q995 = np.quantile(vals, [0.005, 0.5, 0.995])
+    s_all = float(q995 - q50) / 2.576
+    s_low = float(q50 - q005) / 2.576
+    if clean.size >= 9 and s_all <= 4.0 * s_low:
+        # enough tiles for the clean-tile selection to work, and no more
+        # skew than EMCCD noise has: nothing left to mask (saves time)
+        return max(s_all, mad_std(vals[:, ::4]), 1e-6)
+    min_rest = max(64, vals.size // 10)
+
+    def unmasked(level, widths):
+        """Pixels farther than ``widths`` spot widths from any pixel above
+        ``level`` (None: there is no such pixel)."""
+        hot = sub > level
+        if not hot.any():
+            return None
+        size = tuple(2 * int(math.ceil((widths * t + 1.0) / step)) + 1
+                     for t in (spot_sigma[1], spot_sigma[0]))
+        grown = ndimage.maximum_filter(hot, size=size, mode="constant")
+        return vals[~_tiles(grown, b)[clean]]
+
+    def upper_scale(x):
+        r50, r995 = np.quantile(x, [0.5, 0.995])
+        return float(r50), float(r995 - r50) / 2.576
+
+    # each level gives a candidate; a level that masked only part of the
+    # crystal still gives an inflated one, so the smallest candidate wins
+    scale, rest = s_all, vals
+    for p in levels:
+        first = unmasked(float(np.quantile(vals, p)), 3.0)
+        if first is None or first.size < min_rest:
+            break                                  # nothing would be left
+        r50, s_first = upper_scale(first)
+        second = unmasked(r50 + significant * s_first, 1.5)
+        if second is None:
+            continue                               # nothing significant (yet)
+        if second.size >= min_rest:
+            cand, cand_rest, limit = upper_scale(second)[1], second, 0.75
+        else:
+            # the crystal fills the frame: only the first pass can be used
+            cand, cand_rest, limit = s_first, first, 0.5
+        if cand < limit * s_all and cand < scale:
+            scale, rest = cand, cand_rest
+    return max(scale, s_low, mad_std(rest), 1e-6)
 
 
 def _gaussian(img: np.ndarray, sy: float, sx: float) -> np.ndarray:
@@ -341,31 +438,37 @@ class Detector:
         sb = self.static_background
         if sb is not None and sb.matches(frame):
             sub -= sb.image[v0:v1, u0:u1] * (gain_factor / max(sb.gain_factor, 1e-12))
-        bg = block_background(sub, block_px)
+        # small frames (tight camera ROI): at least two background tiles per
+        # axis, so a scattered-light gradient is modelled instead of left in
+        # the residual (where it would inflate the noise scale)
+        floor = max(4, int(round(16 / max(hb, vb))))
+        bg_block = min(block_px, max(floor, min(sub.shape) // 2))
+        bg = block_background(sub, bg_block)
         res = sub - bg
-        background = float(np.median(bg))
-        stride = 2 if res.size > 20000 else 1
-        noise = mad_std(res[::2 * stride, ::2 * stride] if res.size > 20000 else res)
-
         filt = _gaussian(res, sy, sx)
-        # Noise of the filtered image.  EMCCD noise is strongly right-skewed at
-        # low light (single amplified photons), so the scale comes from the
-        # upper quantile (exact for Gaussian noise, conservative for skewed
-        # noise, insensitive to ions which cover << 0.5 % of the pixels); the
-        # spatial variation (scatter blobs, gradients) from tile-wise MAD.
-        # Tiles dominated by bright objects (clouds, chains) are identified by an
-        # outlying per-tile scale and excluded; the quantile is then taken over
-        # the pooled pixels of the clean tiles (unbiased, unlike a median of
-        # per-tile extreme-quantile estimates).
+        psf_x = math.sqrt((psf / hb) ** 2 + 1.0 / 12.0)   # source sigma, frame px
+        psf_y = math.sqrt((psf / vb) ** 2 + 1.0 / 12.0)
+        tpx = math.sqrt(psf_x ** 2 + sx ** 2)              # spot sigma in `filt`
+        tpy = math.sqrt(psf_y ** 2 + sy ** 2)
+        # Noise of the filtered image: the scale from the upper tail with
+        # bright objects excluded (see filtered_noise_scale), the spatial
+        # variation (scatter blobs, gradients) from tile-wise MAD.
         tile = max(2 * block_px, 32)
-        sub_f, b_f = _subsample(filt, tile)
-        tl = _tiles(sub_f, b_f)
-        tq = np.quantile(tl, [0.5, 0.995], axis=2)
-        ts = tq[1] - tq[0]
-        clean = ts <= 2.0 * float(np.median(ts))
-        pooled = tl[clean].ravel() if np.any(clean) else tl.ravel()
-        q50, q995 = np.quantile(pooled, [0.5, 0.995])
-        sigma_up = max(float(q995 - q50) / 2.576, mad_std(filt[::stride, ::stride]), 1e-6)
+        sigma_up = filtered_noise_scale(filt, tile, (tpx, tpy))
+        if sub.size <= 128 * 128:
+            # A crystal filling a good part of a small frame biases the tile
+            # medians of the background, and with them the residual and its
+            # noise: redo the background without the ions.  (In large frames
+            # the bias is diluted to a fraction of the noise.)
+            reach = (2 * int(math.ceil(1.5 * tpy + 1)) + 1, 2 * int(math.ceil(1.5 * tpx + 1)) + 1)
+            objects = ndimage.maximum_filter(filt > 4.0 * sigma_up, size=reach, mode="constant")
+            if _tiles(*_subsample(objects, bg_block)).mean(axis=2).max() > 0.1:
+                bg = block_background(sub, bg_block, exclude=objects)
+                res = sub - bg
+                filt = _gaussian(res, sy, sx)
+                sigma_up = filtered_noise_scale(filt, tile, (tpx, tpy))
+        background = float(np.median(bg))
+        noise = mad_std(res[::4, ::4] if res.size > 20000 else res)
         mad_map = block_noise(filt, tile)
         rel = mad_map / max(float(np.median(mad_map)), 1e-9)
         # the map's job is to raise the threshold on bright scatter; never let
@@ -388,13 +491,9 @@ class Detector:
         sep_v = cfg.min_separation / vb
         if cand.size:
             cand = cand[np.argsort(filt.ravel()[cand])[::-1][: 4 * cfg.max_spots]]
-            psf_x = math.sqrt((psf / hb) ** 2 + 1.0 / 12.0)   # source sigma, frame px
-            psf_y = math.sqrt((psf / vb) ** 2 + 1.0 / 12.0)
             resolved = min(psf_x, psf_y) >= 0.7               # can widths be measured?
             spike_limit = max(4.0, 0.6 * 2.0 * math.pi * sx * sy)
             # broadness probe: ring at 2.5 point-source widths of the filtered image
-            tpx = math.sqrt(psf_x ** 2 + sx ** 2)
-            tpy = math.sqrt(psf_y ** 2 + sy ** 2)
             ring = _RING * np.array([2.5 * tpx, 2.5 * tpy])
             k = cfg.cloud_width_factor
             cloud_ratio = 0.85 * math.exp(-3.125 / (k * k))   # 0.85: noise-boosted peaks

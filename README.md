@@ -145,6 +145,9 @@ gives clean fingerprints:
 
 The detector uses a matched filter with a robust spatial noise map; EMCCD noise is skewed
 at low light, so the threshold comes from upper quantiles, not from a Gaussian assumption.
+The ions are masked out of the noise and background statistics, so a camera ROI that
+hugs the crystal works as well as the full frame. (`locate_ions` still pads its ROI to
+at least 64 × 64 px, so the fit always has background around the ions.)
 It measures each spot's width from the log-curvature of the filtered peak, which
 separates ions from clouds (wider) and from single-pixel spikes (narrower). Measured on
 the simulator: about 0.02 px position error for separated ions, about 1 false spot per

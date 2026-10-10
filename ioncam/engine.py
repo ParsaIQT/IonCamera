@@ -69,6 +69,17 @@ def _rebaseline_needed(old: Optional[AppliedSettings], new: AppliedSettings) -> 
             (b.hbin, b.vbin, b.amplifier, b.preamp_gain_index, new.hs_speed_mhz))
 
 
+def _pad_roi(roi, min_size: int, sensor_shape) -> tuple:
+    """``roi`` (x0, y0, x1, y1) grown symmetrically to at least ``min_size``
+    pixels per axis, kept on the sensor."""
+    out = []
+    for lo, hi, n in ((roi[0], roi[2], sensor_shape[1]), (roi[1], roi[3], sensor_shape[0])):
+        size = min(max(hi - lo, min_size), n)
+        lo = min(max(0, lo - (size - (hi - lo)) // 2), n - size)
+        out.append((lo, lo + size))
+    return (out[0][0], out[1][0], out[0][1], out[1][1])
+
+
 class ReadoutMonitor:
     """Per-ROI sums of every readout frame + health checks."""
 
@@ -693,6 +704,9 @@ class IonCamEngine:
             else:
                 roi = self._live.roi
             s = s.replace(roi=roi)
+        if s.roi is not None:
+            # background and noise statistics need some space around the crystal
+            s = s.replace(roi=_pad_roi(s.roi, 64, self.camera.sensor_shape))
         if "hbin" not in overrides and "vbin" not in overrides:
             s = s.replace(hbin=1, vbin=1)
         self._step("locate: {} x {:.3g} s exposure(s), EM gain {}".format(n_frames, s.exposure,

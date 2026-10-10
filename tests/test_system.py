@@ -118,6 +118,11 @@ def test_locate_ions_precise(system):
         assert np.abs(pos - truth).max() < 0.05
         assert res["psf_sigma"][0] == pytest.approx(1.3, abs=0.03)
         assert c.get_status()["mode"] == "live"      # previous mode restored
+        # a camera ROI hugging the crystal works just as well (it is padded)
+        x0, y0 = np.floor(truth.min(axis=0)).astype(int) - 4
+        x1, y1 = np.ceil(truth.max(axis=0)).astype(int) + 5
+        res = c.locate_ions(3, roi=[int(x0), int(y0), int(x1), int(y1)])
+        assert np.abs(np.array(res["positions"]) - truth).max() < 0.05
     finally:
         c.close_rpc()
 

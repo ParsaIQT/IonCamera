@@ -109,6 +109,44 @@ def test_analysis_roi_crop(setup):
     assert len(r.spots) == 1
 
 
+@pytest.mark.parametrize("n_ions", [4, 9])
+@pytest.mark.parametrize("mode", ["live", "locate"])
+def test_tight_camera_roi(setup, n_ions, mode):
+    """A camera ROI hugging the crystal: the ions are a large part of the
+    frame (and the whole upper tail of its pixel distribution) - they must
+    not inflate the noise estimate and hide themselves."""
+    cfg, cam, det = setup
+    cam.scene.set_n_ions(n_ions)
+    cam.scene.set_scale(6.0)
+    truth = np.array(cam.scene.state()["positions"])
+    settings = getattr(cfg, mode)
+    full = det.analyze(_grab(cam, settings, 1)[0])
+    x0, y0 = np.floor(truth.min(axis=0)).astype(int) - 8
+    x1, y1 = np.ceil(truth.max(axis=0)).astype(int) + 9
+    # crystal +- 8 px: the ions fill the frame (the noise is then overestimated,
+    # there is hardly any background left to measure it on)
+    for f in _grab(cam, settings.replace(roi=(x0, y0, x1, y1)), 3):
+        r = det.analyze(f)
+        _, fp, miss = _match(r.positions, truth)
+        assert fp == 0 and miss == 0, len(r.spots)
+    # (few pixels: single-frame noise estimates scatter by ~10 %)
+    roi = (x0 - 20, y0 - 12, x1 + 20, y1 + 12)
+    noise = []
+    for f in _grab(cam, settings.replace(roi=roi), 5):
+        r = det.analyze(f)
+        _, fp, miss = _match(r.positions, truth)
+        assert fp == 0 and miss == 0, len(r.spots)
+        noise.append(r.noise_f)
+    assert np.median(noise) < 1.3 * full.noise_f
+    cam.scene.set_n_ions(0)
+    noise = []
+    for f in _grab(cam, settings.replace(roi=(x0, y0, x1, y1)), 5):
+        r = det.analyze(f)
+        assert len(r.spots) == 0
+        noise.append(r.noise_f)
+    assert np.median(noise) < 1.3 * full.noise_f
+
+
 def test_joint_fit_dense_chain():
     cfg = Config()
     cfg.simulator.seed = 5
