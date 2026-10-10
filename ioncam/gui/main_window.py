@@ -53,21 +53,37 @@ def format_plan(plan):
         ", ".join(str(v) for v in plan["aqroi_solis"])))
     lines.append("SDK SetImage{}".format(tuple(plan["sdk_image"])))
     lines.append("")
-    lines.append(" ROI    x0  y0  x1  y1   contain  crosstalk")
+    lines.append(" ROI    x0  y0  x1  y1   contain  crosstalk   ion - ROI centre [px]")
+    ax0, ay0 = plan["aqroi"][:2]
+    hb, vb = plan["binning"]
     for i, r in enumerate(plan["grabber_rois"]):
         if i < plan["n_ions"]:
-            lines.append(" ion{:<3d}{:3d} {:3d} {:3d} {:3d}   {:6.1%}   {:6.1%}{}".format(
-                i, *r, plan["containment"][i], plan["crosstalk"][i],
+            u0, v0, u1, v1 = plan["ion_rois"][i]
+            px, py = plan["positions"][i]
+            dx = px - (ax0 + 0.5 * (u0 + u1) * hb - 0.5)
+            dy = py - (ay0 + 0.5 * (v0 + v1) * vb - 0.5)
+            lines.append(" ion{:<3d}{:3d} {:3d} {:3d} {:3d}   {:6.1%}   {:6.1%}     {:+5.1f} {:+5.1f}{}".format(
+                i, *r, plan["containment"][i], plan["crosstalk"][i], dx, dy,
                 "  (dark)" if plan["ion_states"][i] == "dark" else ""))
         else:
             lines.append(" bg    {:3d} {:3d} {:3d} {:3d}   ({:.2%} of an ion's light)".format(
                 *r, plan["background_contamination"]))
     lines.append("masks: ions {}  all {}".format(bin(plan["ion_mask"]), bin(plan["full_mask"])))
+    lines.append("(ROI edges lie on the {}x{} binning grid - dotted lines - so ions are only as "
+                 "centred as the grid allows; the layout maximises the light in each ROI)".format(
+                     hb, vb))
     v = plan.get("verification")
     if v:
         lines.append("")
-        lines.append("verification: {}  SNR {}".format(
-            "OK" if v.get("ok") else "FAILED", [i["snr"] for i in v.get("ions", [])]))
+        ions_v = v.get("ions", [])
+        lines.append("verification: {}  ({} frames)".format("OK" if v.get("ok") else "FAILED",
+                                                             v.get("n_frames", "?")))
+        if ions_v:
+            lines.append("  single-shot SNR   {}".format(
+                [i.get("snr_single_shot", i["snr"]) for i in ions_v]))
+            if "discrimination_error" in ions_v[0]:
+                lines.append("  est. bright/dark error per shot {}".format(
+                    ["{:.1%}".format(i["discrimination_error"]) for i in ions_v]))
         for p in v.get("problems", []):
             lines.append("  ! " + p)
     a = plan.get("applied")

@@ -8,9 +8,11 @@ Grabber receives over Camera Link.  Each ion gets its own rectangular ROI of
 binned pixels (sizes may differ between ions).  Where the ion sits relative to the binning grid matters: an ion on a
 super-pixel boundary splits its light.  The grid *phase* is set by the
 AQROI origin, so the planner tries every phase (``hbin x vbin`` choices) and
-every ROI size, computing for each ion the exact fraction of its (Gaussian,
-fitted) PSF inside its own ROI (*containment*) and inside every other ROI
-(*crosstalk*), and keeps the placement with the best worst-case containment
+every ROI size, computing for each ion the exact fraction of its fitted PSF
+(Gaussian core plus, if measured, the broad halo of aberration wings that
+dominates the crosstalk of real imaging systems) inside its own ROI
+(*containment*) and inside every other ROI (*crosstalk*), and keeps the
+placement with the best worst-case containment
 (smallest ROIs first among those meeting ``min_containment``).  The AQROI is
 then the bounding box of all ROIs plus a symmetric margin, i.e. centred on
 the crystal.
@@ -63,6 +65,7 @@ class ReadoutPlan:
     background_contamination: float           # ion light in the background ROI (in ions)
     flip_x: bool = False
     flip_y: bool = False
+    psf_halo: Tuple[float, float] = (0.0, 0.0)  # (fraction, sigma [sensor px]) of the halo
     warnings: List[str] = field(default_factory=list)
     created: float = field(default_factory=time.time)
     verification: Optional[dict] = None
@@ -111,6 +114,7 @@ class ReadoutPlan:
             "positions": [[round(float(x), 3), round(float(y), 3)] for x, y in self.positions],
             "ion_states": list(self.ion_states),
             "psf_sigma": [round(float(s), 4) for s in self.psf_sigma],
+            "psf_halo": [round(float(s), 4) for s in self.psf_halo],
             "binning": [self.hbin, self.vbin],
             "aqroi": [x0, y0, x1, y1],
             "aqroi_solis": [x0 + 1, x1, y0 + 1, y1],    # Left, Right, Bottom, Top
@@ -146,24 +150,34 @@ def _frac(a, b, mu, sigma):
     return ndtr((b - mu) / sigma) - ndtr((a - mu) / sigma)
 
 
-def _light_matrix(ax, bx, ay, by, pos, sx, sy) -> np.ndarray:
-    """F[i, j] = fraction of ion j's light inside rectangle i (sensor coords)."""
-    fx = _frac(np.asarray(ax)[:, None], np.asarray(bx)[:, None], pos[None, :, 0], sx)
-    fy = _frac(np.asarray(ay)[:, None], np.asarray(by)[:, None], pos[None, :, 1], sy)
-    return fx * fy
+def _light_matrix(ax, bx, ay, by, pos, sx, sy, halo=(0.0, 0.0)) -> np.ndarray:
+    """F[i, j] = fraction of ion j's light inside rectangle i (sensor coords);
+    PSF: Gaussian core (sx, sy) plus a fraction ``halo[0]`` in an isotropic
+    Gaussian halo of sigma ``halo[1]``."""
+    ax, bx = np.asarray(ax)[:, None], np.asarray(bx)[:, None]
+    ay, by = np.asarray(ay)[:, None], np.asarray(by)[:, None]
+    out = _frac(ax, bx, pos[None, :, 0], sx) * _frac(ay, by, pos[None, :, 1], sy)
+    f, sh = float(halo[0]), float(halo[1])
+    if f > 0 and sh > 0:
+        out = (1.0 - f) * out + f * (_frac(ax, bx, pos[None, :, 0], sh) *
+                                     _frac(ay, by, pos[None, :, 1], sh))
+    return out
 
 
 AREA_PENALTY = 0.005       # score cost per binned pixel of ROI (background/noise)
 CROSSTALK_WEIGHT = 2.0     # score cost per unit of foreign ion light in a ROI
 
 
-def _ion_candidates(i, pos, sx, sy, px, py, hb, vb, sw, sh, max_w, max_h, fixed=None):
+def _ion_candidates(i, pos, sx, sy, px, py, hb, vb, sw, sh, max_w, max_h, fixed=None,
+                    halo=(0.0, 0.0)):
     """All ROIs (superpixel rects) containing ion i's superpixel, with scores."""
     x, y = pos[i]
     ci = int(math.floor((x + 0.5 - px) / hb))
     ri = int(math.floor((y + 0.5 - py) / vb))
     widths = [fixed[0]] if fixed else range(1, max_w + 1)
     heights = [fixed[1]] if fixed else range(1, max_h + 1)
+    f, s_h = float(halo[0]), float(halo[1])
+    use_halo = f > 0 and s_h > 0
     out = []
     others = np.delete(pos, i, axis=0)
     for w in widths:
@@ -171,24 +185,34 @@ def _ion_candidates(i, pos, sx, sy, px, py, hb, vb, sw, sh, max_w, max_h, fixed=
             x0 = px + a * hb
             if x0 < 0 or x0 + w * hb > sw:
                 continue
-            fx_i = float(_frac(x0 - 0.5, x0 + w * hb - 0.5, x, sx))
-            fx_o = _frac(x0 - 0.5, x0 + w * hb - 0.5, others[:, 0], sx) if len(others) else None
+            xa, xb = x0 - 0.5, x0 + w * hb - 0.5
+            fx_i = float(_frac(xa, xb, x, sx))
+            fx_o = _frac(xa, xb, others[:, 0], sx) if len(others) else None
+            if use_halo:
+                hx_i = float(_frac(xa, xb, x, s_h))
+                hx_o = _frac(xa, xb, others[:, 0], s_h) if len(others) else None
             for h in heights:
                 for r in range(ri - h + 1, ri + 1):
                     y0 = py + r * vb
                     if y0 < 0 or y0 + h * vb > sh:
                         continue
-                    cont = fx_i * float(_frac(y0 - 0.5, y0 + h * vb - 0.5, y, sy))
+                    ya, yb = y0 - 0.5, y0 + h * vb - 0.5
+                    cont = fx_i * float(_frac(ya, yb, y, sy))
+                    if use_halo:
+                        cont = (1.0 - f) * cont + f * hx_i * float(_frac(ya, yb, y, s_h))
                     xt = 0.0
                     if fx_o is not None:
-                        xt = float(np.max(fx_o * _frac(y0 - 0.5, y0 + h * vb - 0.5,
-                                                       others[:, 1], sy)))
+                        lx = fx_o * _frac(ya, yb, others[:, 1], sy)
+                        if use_halo:
+                            lx = (1.0 - f) * lx + f * hx_o * _frac(ya, yb, others[:, 1], s_h)
+                        xt = float(np.max(lx))
                     score = cont - CROSSTALK_WEIGHT * xt - AREA_PENALTY * w * h
                     out.append((score, a, r, w, h, cont, xt))
     return out
 
 
-def _best_layout(pos, sx, sy, px, py, hb, vb, sensor_shape, fixed=None, along_x=None):
+def _best_layout(pos, sx, sy, px, py, hb, vb, sensor_shape, fixed=None, along_x=None,
+                 halo=(0.0, 0.0)):
     """Per-ion ROIs for one grid phase: maximise the worst ion score, no overlaps.
 
     Ions are processed along the dominant chain axis; a bottleneck dynamic
@@ -204,7 +228,8 @@ def _best_layout(pos, sx, sy, px, py, hb, vb, sensor_shape, fixed=None, along_x=
     order = np.argsort(pos[:, 0] if along_x else pos[:, 1], kind="stable")
     cands = []
     for i in order:
-        c = _ion_candidates(i, pos, sx, sy, px, py, hb, vb, sw, sh, max_w, max_h, fixed)
+        c = _ion_candidates(i, pos, sx, sy, px, py, hb, vb, sw, sh, max_w, max_h, fixed,
+                            halo)
         if not c:
             return None
         cands.append(c)
@@ -247,12 +272,14 @@ def plan_readout(positions: Sequence[Sequence[float]], sigma: Tuple[float, float
                  min_containment: float = 0.8, max_crosstalk: float = 0.05,
                  max_rois: int = 16, background_roi: bool = True,
                  flip_x: bool = False, flip_y: bool = False, res_width: int = 12,
-                 ion_states: Optional[Sequence[str]] = None) -> ReadoutPlan:
+                 ion_states: Optional[Sequence[str]] = None,
+                 halo: Tuple[float, float] = (0.0, 0.0)) -> ReadoutPlan:
     """Plan the AQROI and the per-ion Grabber ROIs (see module docstring).
 
     ``roi_size = (0, 0)`` lets every ion get its own optimal ROI size (an ion
     centred in a super-pixel needs one, an ion on a boundary two); a fixed
-    ``(ru, rv)`` forces the same size for all."""
+    ``(ru, rv)`` forces the same size for all.  ``halo = (fraction, sigma)``
+    adds the PSF's broad wings (sensor px) to the containment/crosstalk."""
     pos = np.asarray(positions, float).reshape(-1, 2)
     n = len(pos)
     if n == 0:
@@ -275,7 +302,7 @@ def plan_readout(positions: Sequence[Sequence[float]], sigma: Tuple[float, float
         for px in range(hbin):
             for py in range(vbin):
                 res = _best_layout(pos, sx, sy, px, py, hbin, vbin, sensor_shape, fixed,
-                                   along_x)
+                                   along_x, halo)
                 if res is not None:
                     layouts.append((px, py, res))
         if layouts:
@@ -285,7 +312,7 @@ def plan_readout(positions: Sequence[Sequence[float]], sigma: Tuple[float, float
         ys0 = np.array([py + p[2] * vbin for p in picks])
         xs1 = xs0 + np.array([p[3] for p in picks]) * hbin
         ys1 = ys0 + np.array([p[4] for p in picks]) * vbin
-        f = _light_matrix(xs0 - 0.5, xs1 - 0.5, ys0 - 0.5, ys1 - 0.5, pos, sx, sy)
+        f = _light_matrix(xs0 - 0.5, xs1 - 0.5, ys0 - 0.5, ys1 - 0.5, pos, sx, sy, halo)
         cont = np.diag(f).copy()
         xt = f.copy()
         np.fill_diagonal(xt, 0.0)
@@ -344,7 +371,7 @@ def plan_readout(positions: Sequence[Sequence[float]], sigma: Tuple[float, float
             b_x = aq[0] + rect[2] * hbin - 0.5
             a_y = aq[1] + rect[1] * vbin - 0.5
             b_y = aq[1] + rect[3] * vbin - 0.5
-            c = float(_light_matrix([a_x], [b_x], [a_y], [b_y], pos, sx, sy).sum())
+            c = float(_light_matrix([a_x], [b_x], [a_y], [b_y], pos, sx, sy, halo).sum())
             cands.append((c, rect))
         if cands:
             bg_cont, bg_rect = min(cands)
@@ -371,7 +398,8 @@ def plan_readout(positions: Sequence[Sequence[float]], sigma: Tuple[float, float
         background_roi=bg_rect, grabber_rois=grabber,
         containment=[float(c) for c in cont], crosstalk=[float(c) for c in crosstalk],
         crosstalk_matrix=[[float(v) for v in row] for row in f],
-        background_contamination=bg_cont, flip_x=flip_x, flip_y=flip_y, warnings=warnings)
+        background_contamination=bg_cont, flip_x=flip_x, flip_y=flip_y,
+        psf_halo=(float(halo[0]), float(halo[1])), warnings=warnings)
 
 
 def _overlap(a: Rect, b: Rect) -> bool:
@@ -473,15 +501,24 @@ def verify_plan(plan: ReadoutPlan, frames: Sequence[np.ndarray], min_snr: float 
         bg_level, bg_noise = float(np.median(border)), float(border.std())
     ions = []
     nets = []
+    n_f = len(sums)
     for i in range(n):
         s = sums[:, i]
         net = s - area[i] * bg_level
         std = float(s.std(ddof=1)) if len(s) > 1 else 0.0
         noise = max(std, math.sqrt(area[i]) * max(bg_noise, 1.0))
-        snr = float(net.mean()) / noise if noise > 0 else float("inf")
+        shot = float(net.mean()) / noise if noise > 0 else float("inf")
+        # is the ion in its ROI?  judged on the mean of all frames: with ~10-20
+        # photons per shot a single shot is legitimately noisy
+        snr = shot * math.sqrt(n_f)
+        # rough single-shot bright/dark error: dark = background scaled to the ROI
+        dark_sd = math.sqrt(area[i]) * max(bg_noise, 1e-9)
+        err = _gauss_overlap(float(net.mean()), std, 0.0, dark_sd)
         nets.append(float(net.mean()))
         ions.append({"mean": round(float(s.mean()), 1), "std": round(std, 1),
-                     "net": round(float(net.mean()), 1), "snr": round(snr, 2)})
+                     "net": round(float(net.mean()), 1), "snr": round(snr, 1),
+                     "snr_single_shot": round(shot, 2),
+                     "discrimination_error": round(err, 4)})
         if plan.ion_states[i] == "bright" and snr < min_snr:
             problems.append("ion {}: SNR {:.1f} < {} - not in its ROI?".format(i, snr, min_snr))
     bright = [nets[i] for i in range(n) if plan.ion_states[i] == "bright"]
@@ -494,6 +531,16 @@ def verify_plan(plan: ReadoutPlan, frames: Sequence[np.ndarray], min_snr: float 
     return {"ok": not problems, "problems": problems, "n_frames": int(f.shape[0]),
             "background_per_pixel": round(bg_level, 2), "background_noise": round(bg_noise, 2),
             "ions": ions, "max_count": int(f.max())}
+
+
+def _gauss_overlap(mu_b: float, sd_b: float, mu_d: float, sd_d: float) -> float:
+    """Mean error of the best threshold between two Gaussians (bright, dark)."""
+    if mu_b <= mu_d:
+        return 0.5
+    sd_b, sd_d = max(sd_b, 1e-9), max(sd_d, 1e-9)
+    xs = np.linspace(mu_d, mu_b, 201)
+    err = 0.5 * (ndtr((mu_d - xs) / sd_d) + ndtr((xs - mu_b) / sd_b))
+    return float(err.min())
 
 
 def fit_threshold(counts: Sequence[float]) -> dict:

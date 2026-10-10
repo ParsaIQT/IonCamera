@@ -90,6 +90,33 @@ def test_errors():
         plan_readout(chain(17, 10.0), (1.3, 1.3), SENSOR, 1, 1, max_rois=16)
 
 
+def test_halo_light_matrix_matches_simulated_image():
+    """Containment and crosstalk with the PSF's halo are exactly what the
+    simulated camera puts into each ROI (noise-free), and the halo is what
+    makes the crosstalk between neighbouring ROIs large."""
+    cfg = Config()
+    cfg.simulator.seed = 1
+    cam = SimulatedCamera(cfg.simulator)
+    sc = cam.scene
+    sc.set_n_ions(3)
+    sc.set_params(scatter_rate=0.0, background_rate=0.0, defects=0, gap_scatter=0.0,
+                  hot_pixels=0, scratches=0, laser_noise=0.0)
+    pos = np.array(sc.state()["positions"])
+    sim = cfg.simulator
+    halo = (sim.psf_halo_fraction, sim.psf_halo_sigma)
+    plan = plan_readout(pos, (sim.psf_sigma,) * 2, SENSOR, 4, 4, halo=halo)
+    img = sc.expected_electrons((0, 0, 512, 512), 1, 1, 1.0, now=1000.0)
+    per_ion = img.sum() / 3
+    x0, y0 = plan.roi[:2]
+    sums = [img[y0 + v0 * 4:y0 + v1 * 4, x0 + u0 * 4:x0 + u1 * 4].sum() / per_ion
+            for (u0, v0, u1, v1) in plan.ion_rois]
+    assert np.allclose(sums, np.sum(plan.crosstalk_matrix, axis=1), atol=1e-3)
+    assert plan.to_dict()["psf_halo"] == [round(halo[0], 4), round(halo[1], 4)]
+    bare = plan_readout(pos, (sim.psf_sigma,) * 2, SENSOR, 4, 4)
+    assert max(plan.crosstalk) > max(bare.crosstalk) + 0.01
+    assert min(plan.containment) < min(bare.containment)
+
+
 def _sim_frames(n_ions=5, n_frames=20, roi=None, plan_kw=None):
     cfg = Config()
     cfg.simulator.seed = 4

@@ -98,6 +98,7 @@ class ImagePanel(QtWidgets.QWidget):
         self._geometry = None
         self._last = None
         self.set_orientation(display_cfg.rotation, display_cfg.flip_x, display_cfg.flip_y)
+        self.vb.sigResized.connect(self._update_limits)
         self.plot.scene().sigMouseMoved.connect(self._mouse_moved)
 
     # -- appearance --------------------------------------------------------------------
@@ -117,7 +118,23 @@ class ImagePanel(QtWidgets.QWidget):
         self.rotation, self.flip_x, self.flip_y = rotation, flip_x, flip_y
         for label in getattr(self, "_labels", []):
             label.setAnchor(self._label_anchor())
+        self._update_limits()
         self.vb.autoRange()
+
+    def _update_limits(self, *_):
+        """Zooming out and panning stay around the image (at most ~1.3x the
+        view that just fits it, for the widget's current aspect ratio)."""
+        rect = self.group.boundingRect()
+        if rect.isEmpty():
+            return
+        r = self.group.mapRectToParent(rect)          # view coordinates (display transform)
+        vw, vh = max(self.vb.width(), 1.0), max(self.vb.height(), 1.0)
+        per_px = 1.3 * max(r.width() / vw, r.height() / vh)
+        xr, yr = per_px * vw + 8.0, per_px * vh + 8.0
+        c = r.center()
+        self.vb.setLimits(xMin=c.x() - xr / 2, xMax=c.x() + xr / 2, yMin=c.y() - yr / 2,
+                          yMax=c.y() + yr / 2, maxXRange=xr, maxYRange=yr,
+                          minXRange=4.0, minYRange=4.0)
 
     # -- data ------------------------------------------------------------------------------
     def set_frame(self, image, roi, hbin, vbin):
@@ -138,6 +155,7 @@ class ImagePanel(QtWidgets.QWidget):
                                  img.shape[0] * vbin)
             self.img.setRect(rect)
             self.group.set_rect(rect)
+            self._update_limits()
             if self._geometry is None or geom[0] != self._geometry[0]:
                 self.vb.autoRange(padding=0.02)
             self._geometry = geom
@@ -180,6 +198,21 @@ class ImagePanel(QtWidgets.QWidget):
             return
         x0, y0, x1, y1 = plan["aqroi"]
         hb, vb = plan["binning"]
+        # the binning grid: Grabber ROI edges can only lie on these lines, which
+        # is why an ion is generally not in the middle of its ROI
+        w, h = (x1 - x0) // hb, (y1 - y0) // vb
+        if 1 < max(w, h) <= 128:
+            path = QtGui.QPainterPath()
+            for k in range(1, w):
+                path.moveTo(x0 + k * hb - 0.5, y0 - 0.5)
+                path.lineTo(x0 + k * hb - 0.5, y1 - 0.5)
+            for k in range(1, h):
+                path.moveTo(x0 - 0.5, y0 + k * vb - 0.5)
+                path.lineTo(x1 - 0.5, y0 + k * vb - 0.5)
+            grid = QtWidgets.QGraphicsPathItem(path)
+            grid.setPen(_pen((42, 212, 255, 90), 1.0, QtCore.Qt.PenStyle.DotLine))
+            grid.setParentItem(self.group)
+            self._rects.append(grid)
         self._add_rect(x0 - 0.5, y0 - 0.5, x1 - x0, y1 - y0, "#2ad4ff",
                        QtCore.Qt.PenStyle.DashLine)
         rois = plan["ion_rois"] + ([plan["background_roi"]] if plan.get("background_roi") else [])

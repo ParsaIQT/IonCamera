@@ -350,10 +350,25 @@ class IonCamAPI:
 
     # --------------------------------------------------------------- background
 
-    async def learn_background(self, n_frames=10):
-        """Learn the static background (scatter structure, hot pixels) from live
-        frames; ion sites are masked so ions may stay in the trap."""
-        return _plain(await self._run(self._engine.learn_background, int(n_frames)))
+    async def learn_background(self, n_frames=20, mask_ions=True, full_sensor=True,
+                               **settings):
+        """Learn the static background - laser scatter from surface defects,
+        dust and electrode edges (which can look like ions or clouds), hot
+        pixels - from ``n_frames`` with the live settings (``settings``
+        override them, e.g. ``exposure=0.2``), of the full sensor without
+        binning by default so it applies to every later ROI and binning.
+
+        ``mask_ions``: leave the tracked ion sites out (ions may stay in the
+        trap).  Best: switch the repumper off (dark ions scatter nothing, the
+        laser still does) or empty the trap, and pass ``mask_ions=False``.
+        Used for detection from then on (subtracted, scaled with exposure x
+        EM gain and the laser power); returns a summary."""
+        return _plain(await self._run(self._engine.learn_background, int(n_frames),
+                                      bool(mask_ions), bool(full_sensor), **_settings(settings)))
+
+    def get_background(self):
+        """Summary of the learned static background (None if there is none)."""
+        return _plain(self._engine.background_info())
 
     def clear_background(self):
         """Forget the learned static background."""

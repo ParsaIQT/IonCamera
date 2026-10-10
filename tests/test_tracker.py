@@ -12,7 +12,7 @@ def kinds(events):
 
 def settle(n=5, **kw):
     sc = Scenario(n_ions=n, **kw)
-    sc.run(1.5)
+    sc.run(2.5)
     ev = sc.take()
     assert kinds(ev) == ["ions_detected"], ev
     assert sc.tracker.n_bright == n and sc.tracker.is_stable()

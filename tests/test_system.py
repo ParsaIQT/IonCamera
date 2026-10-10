@@ -115,14 +115,22 @@ def test_locate_ions_precise(system):
         res = c.locate_ions(3)
         truth = np.array(c.sim_state()["positions"])
         pos = np.array(res["positions"])
-        assert np.abs(pos - truth).max() < 0.05
-        assert res["psf_sigma"][0] == pytest.approx(1.3, abs=0.03)
+        # photon limited: 2 x 0.5 s of 13k photons/s per ion, PSF 1.8 px + halo
+        err = np.array(res["position_errors"])
+        assert np.abs(pos - truth).max() < 0.2
+        assert np.all(np.abs(pos - truth) < 4 * err + 0.02)
+        assert res["psf_sigma"][0] == pytest.approx(1.8, abs=0.1)
+        frac, sigma = res["psf_halo"]
+        assert 0.05 < frac < 0.3 and 3.0 < sigma < 7.0
+        # the PSF is used from now on (auto_psf): detection and readout planning
+        cfg = c.get_config()["detection"]
+        assert cfg["psf_halo_fraction"] == pytest.approx(frac, abs=1e-3)
         assert c.get_status()["mode"] == "live"      # previous mode restored
         # a camera ROI hugging the crystal works just as well (it is padded)
         x0, y0 = np.floor(truth.min(axis=0)).astype(int) - 4
         x1, y1 = np.ceil(truth.max(axis=0)).astype(int) + 5
         res = c.locate_ions(3, roi=[int(x0), int(y0), int(x1), int(y1)])
-        assert np.abs(np.array(res["positions"]) - truth).max() < 0.05
+        assert np.abs(np.array(res["positions"]) - truth).max() < 0.2
     finally:
         c.close_rpc()
 

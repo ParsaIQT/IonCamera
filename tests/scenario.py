@@ -46,7 +46,7 @@ class Scenario:
             self.index += 1
             img = self.cam._render(self.applied, self.clock.t)
             frame = Frame(img, self.index, self.clock.t, self.applied)
-            det = self.detector.analyze(frame)
+            det = self.detector.analyze(frame, prior=self.tracker.prior())
             self.events += self.tracker.update(det, self.clock.t)
         return self
 

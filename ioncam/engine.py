@@ -488,7 +488,9 @@ class IonCamEngine:
             return
         self._last_analysis = now
         frame = live[-1]
-        det = self.detector.analyze(frame)
+        with self._tracker_lock:
+            prior = self.tracker.prior()
+        det = self.detector.analyze(frame, prior=prior)
         with self._tracker_lock:
             events = self.tracker.update(det, frame.timestamp)
             snap = self.tracker.snapshot()
@@ -731,13 +733,19 @@ class IonCamEngine:
         cu, cv = det.to_crop(guesses[:, 0], guesses[:, 1])
         psf = cfg.detection.psf_sigma
         quality: Dict[str, Any] = {"detected": n_det}
+        halo = (0.0, 0.0)
         if cal.fit_psf:
+            # core + halo (the halo - aberration wings - is isotropic in sensor px,
+            # so only fitted without binning or with square binning)
             fit = fit_gaussians(det.residual, np.column_stack([cu, cv]),
-                                sigma0=psf / math.sqrt(hb * vb), fit_offset=True)
+                                sigma0=psf / math.sqrt(hb * vb), fit_offset=True,
+                                halo=hb == vb)
             px = (fit.positions[:, 0] + det.crop[0]) * hb + applied.x0 + 0.5 * (hb - 1)
             py = (fit.positions[:, 1] + det.crop[1]) * vb + applied.y0 + 0.5 * (vb - 1)
             pos = np.column_stack([px, py])
             sigma = (fit.sigma[0] * hb, fit.sigma[1] * vb)
+            if fit.halo_fraction > 0:
+                halo = (fit.halo_fraction, fit.halo_sigma * hb)
             flux = fit.flux
             errors = fit.position_errors * np.array([hb, vb])
             quality.update(reduced_chi2=round(fit.reduced_chi2, 3), success=fit.success)
@@ -776,6 +784,11 @@ class IonCamEngine:
         states = [states[i] for i in order]
         if cfg.detection.auto_psf and cal.fit_psf and 0.5 < sigma[0] < 6 and 0.5 < sigma[1] < 6:
             cfg.detection.psf_sigma = round(float(math.sqrt(sigma[0] * sigma[1])), 4)
+            if halo[0] > 0:
+                # (a fit without a significant halo - e.g. read-noise limited -
+                # leaves a halo measured before in place)
+                cfg.detection.psf_halo_fraction = round(float(halo[0]), 4)
+                cfg.detection.psf_halo_sigma = round(float(halo[1]), 4)
         result = {
             "n_ions": int(len(pos)),
             "n_bright": int(sum(1 for s_ in states if s_ == "bright")),
@@ -784,6 +797,7 @@ class IonCamEngine:
             "states": states,
             "flux": [round(float(f), 1) for f in flux],
             "psf_sigma": [round(float(sigma[0]), 4), round(float(sigma[1]), 4)],
+            "psf_halo": [round(float(halo[0]), 4), round(float(halo[1]), 4)],
             "chain": chain,
             "quality": quality,
             "exposure": applied.exposure,
@@ -798,8 +812,11 @@ class IonCamEngine:
                                                      "locate exposure or EM gain")
         self._last_locate = result
         self._save("locate", result, image=mean)
-        self.events.emit("ions_located", "Located {} ion(s), PSF sigma {:.2f} x {:.2f} px".format(
-            result["n_ions"], sigma[0], sigma[1]), "info", n_ions=result["n_ions"])
+        msg = "Located {} ion(s), PSF sigma {:.2f} x {:.2f} px".format(result["n_ions"], sigma[0],
+                                                                    sigma[1])
+        if halo[0] > 0:
+            msg += " + {:.0%} of the light in a halo of sigma {:.1f} px".format(*halo)
+        self.events.emit("ions_located", msg, "info", n_ions=result["n_ions"])
         return result
 
     def _chain_guesses(self, positions: np.ndarray, n: int) -> np.ndarray:
@@ -842,10 +859,13 @@ class IonCamEngine:
         hb, vb = int(hbin or rs.hbin), int(vbin or rs.vbin)
         pos = np.array(loc["positions"], float)
         sigma = tuple(loc["psf_sigma"])
+        # the PSF halo (wings) sets the crosstalk: as just measured, else as known
+        halo = tuple(loc["psf_halo"]) if loc.get("psf_halo", (0, 0))[0] > 0 else \
+            (cfg.detection.psf_halo_fraction, cfg.detection.psf_halo_sigma)
         kw = dict(roi_size=tuple(roi_size) if roi_size else tuple(cal.roi_size),
                   frame_margin=cal.frame_margin, min_containment=cal.min_containment,
                   max_crosstalk=cal.max_crosstalk, max_rois=cfg.grabber.roi_engine_count,
-                  background_roi=cal.background_roi)
+                  background_roi=cal.background_roi, halo=halo)
         self._step("plan: {} ions, {}x{} binning".format(len(pos), hb, vb))
         advice = binning_advice(pos, sigma, self.camera.sensor_shape, **kw)
         if auto_binning:
@@ -1012,32 +1032,54 @@ class IonCamEngine:
 
     # -- background -------------------------------------------------------------------------
 
-    def learn_background(self, n_frames: int = 10, timeout: float = 30.0) -> dict:
-        """Average ``n_frames`` live frames into the static background (ions masked)."""
-        if self._mode != LIVE:
-            raise ProcedureError("learn_background needs live mode")
-        frames: List[Frame] = []
-        last = self._frame_index
-        deadline = time.monotonic() + timeout
-        while len(frames) < n_frames and time.monotonic() < deadline:
-            f = self.latest_frame(last, timeout=1.0)
-            if f is not None and f.tag == "live":
-                frames.append(f)
-                last = f.index
-        if not frames:
-            raise ProcedureError("no live frames")
-        geom = (frames[-1].applied.roi, frames[-1].hbin, frames[-1].vbin)
-        frames = [f for f in frames if (f.applied.roi, f.hbin, f.vbin) == geom]
-        with self._tracker_lock:
-            mask = self.tracker.positions(include_dark=True)
-        self.detector.learn_static_background(frames, mask, mask_radius=4 *
-                                              self.config.detection.psf_sigma)
-        self.events.emit("background_learned", "Static background learned from {} frames "
-                         "({} ion sites masked)".format(len(frames), len(mask)))
-        return {"n_frames": len(frames), "masked_sites": int(len(mask))}
+    def learn_background(self, n_frames: int = 20, mask_ions: bool = True,
+                         full_sensor: bool = True, **overrides) -> dict:
+        """Learn the static background structure (surface scatter, defects, hot
+        pixels): ``n_frames`` with the live settings (plus ``overrides``, e.g.
+        a longer exposure), by default of the full sensor without binning so
+        the result applies to any later ROI and binning.
+
+        ``mask_ions``: leave out the tracked ion sites (ions may stay trapped).
+        Even better: learn with the ions dark (repumper off) or without ions,
+        and ``mask_ions=False``."""
+        def proc():
+            s = self._live.replace(**overrides) if overrides else self._live
+            if full_sensor:
+                s = s.replace(roi=None, hbin=1, vbin=1)
+            self._step("background: {} frame(s)".format(n_frames))
+            applied = self._apply(s, "background")
+            self.camera.start()
+            frames = self._collect(int(n_frames),
+                                   timeout=n_frames * (applied.kinetic_cycle * 3 + 1) + 10)
+            self.camera.stop()
+            with self._tracker_lock:
+                mask = self.tracker.positions(include_dark=True) if mask_ions else None
+                n_clouds = self.tracker.n_clouds
+            sb = self.detector.learn_static_background(
+                frames, mask, info={"mask_ions": bool(mask_ions)})
+            with self._tracker_lock:
+                self.tracker.background_changed()
+            info = sb.summary()
+            msg = "Static background learned from {} frame(s) of {:.3g} s ({} px of structure" \
+                  "{})".format(len(frames), applied.exposure, info["structure_px"],
+                               ", {} ion sites masked".format(info["masked_sites"])
+                               if mask_ions else "")
+            self.events.emit("background_learned", msg + ")", "info")
+            if n_clouds:
+                self.events.emit("background_warning", "A cloud was present while learning the "
+                                 "background - it may have been learned as background",
+                                 "warning")
+            return info, True
+        return self._procedure_run("learn_background", proc)
+
+    def background_info(self) -> Optional[dict]:
+        sb = self.detector.static_background
+        return sb.summary() if sb is not None else None
 
     def clear_background(self) -> None:
         self.detector.clear_static_background()
+        with self._tracker_lock:
+            self.tracker.background_changed()
 
     # -- control lease ---------------------------------------------------------------------
 

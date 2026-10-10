@@ -25,20 +25,27 @@ def _match(found, truth, r=1.5):
 
 @pytest.fixture
 def setup():
+    """Realistic simulator (13k photons/s per ion, blurred PSF with a halo,
+    laser scatter, surface defects); the detector knows the PSF as a
+    calibration (locate) would have measured it."""
     cfg = Config()
     cfg.simulator.seed = 3
-    cfg.detection.psf_sigma = 1.3
+    cfg.detection.psf_sigma = cfg.simulator.psf_sigma
+    cfg.detection.psf_halo_fraction = cfg.simulator.psf_halo_fraction
+    cfg.detection.psf_halo_sigma = cfg.simulator.psf_halo_sigma
     cam = SimulatedCamera(cfg.simulator)
     return cfg, cam, Detector(cfg.detection)
 
 
 def test_positions_accurate_and_complete(setup):
+    """~470 photo-electrons per ion and frame: every ion found, positions at
+    the photon limit (a few tenths of a pixel for a 1.8 px PSF)."""
     cfg, cam, det = setup
     cam.scene.set_n_ions(4)
     cam.scene.set_scale(7.0)
     truth = np.array(cam.scene.state()["positions"])
     errs, fp, miss = [], 0, 0
-    for f in _grab(cam, cfg.live.replace(exposure=0.05, em_gain=3), 10):
+    for f in _grab(cam, cfg.live.replace(exposure=0.05, em_gain=100), 10):
         r = det.analyze(f)
         e, a, b = _match(r.positions, truth)
         errs.append(e)
@@ -46,9 +53,9 @@ def test_positions_accurate_and_complete(setup):
         miss += b
     e = np.vstack(errs)
     assert fp == 0 and miss == 0
-    assert np.sqrt((e ** 2).mean()) < 0.05
+    assert np.sqrt((e ** 2).mean()) < 0.25
     r = det.analyze(_grab(cam, cfg.live, 1)[0])
-    assert r.focus == pytest.approx(np.sqrt(1.3 ** 2 + 1 / 12), abs=0.08)
+    assert r.focus == pytest.approx(np.sqrt(1.8 ** 2 + 1 / 12), abs=0.2)
 
 
 @pytest.mark.parametrize("gain", [1, 50, 300])
@@ -62,13 +69,29 @@ def test_false_alarm_rate_on_empty_frames(setup, gain):
     assert n <= 2          # a few isolated noise peaks at most; the tracker debounces them
 
 
-def test_cloud_vs_ion(setup):
+@pytest.mark.parametrize("seed", [3, 4, 5])
+def test_cloud_vs_ion(setup, seed):
+    """A hot, uncrystallised ion is one broad cloud - not a cluster of faint
+    'ions' (shot-noise lumps) - and an ion next to it stays an ion.  (A single
+    hot ion is only ~30 photons/s/px: visible per frame in a long exposure; in
+    short frames the tracker's temporal integration finds it.)"""
     cfg, cam, det = setup
-    cam.scene.set_n_ions(0)
+    cam.scene.set_params(surface="clean", surface_seed=seed)
+    cam.scene.set_n_ions(1)
+    ion = np.array(cam.scene.state()["positions"])
     cam.scene.load_ion(1, cloud_time=1e9)
-    r = det.analyze(_grab(cam, cfg.live.replace(exposure=0.05, em_gain=50), 1)[0])
-    assert len(r.clouds) == 1 and len(r.spots) == 0
-    assert r.clouds[0].width > 3.0
+    cloud = np.array(cam.scene.state()["clouds"])[0]
+    # (around the trap: elsewhere defocused surface defects are broad blobs
+    # too in such a long exposure - always the same ones, which the tracker and
+    # the learned background take care of)
+    x, y = ion[0]
+    trap = (int(x) - 40, int(y) - 40, int(x) + 40, int(y) + 40)
+    for f in _grab(cam, cfg.live.replace(exposure=0.5, em_gain=50), 3, t0=1000.0 + seed):
+        r = det.analyze(f, analysis_roi=trap)
+        assert len(r.clouds) == 1 and len(r.spots) == 1, (len(r.clouds), len(r.spots))
+        c = r.clouds[0]
+        assert c.width > 3.0 and np.hypot(c.x - cloud[0], c.y - cloud[1]) < 2 * c.width
+        assert np.hypot(*(r.positions[0] - ion[0])) < 1.0
 
 
 def test_single_pixel_spike_rejected(setup):
@@ -109,77 +132,102 @@ def test_analysis_roi_crop(setup):
     assert len(r.spots) == 1
 
 
-@pytest.mark.parametrize("n_ions", [4, 9])
+@pytest.mark.parametrize("n_ions, scale", [(4, 6.0), (7, 8.0)])
 @pytest.mark.parametrize("mode", ["live", "locate"])
-def test_tight_camera_roi(setup, n_ions, mode):
-    """A camera ROI hugging the crystal: the ions are a large part of the
-    frame (and the whole upper tail of its pixel distribution) - they must
-    not inflate the noise estimate and hide themselves."""
+@pytest.mark.parametrize("gain", [None, 300])
+def test_tight_camera_roi(setup, n_ions, scale, mode, gain):
+    """A camera ROI hugging the crystal: the blurred ions fill the frame (and
+    the whole upper tail of its pixel distribution) - they must not inflate
+    the noise estimate and hide themselves, nor may a photon-counting frame
+    (EM gain 300: just as skewed) be taken for one full of ions."""
+    if gain and mode == "locate":
+        pytest.skip("locate is a low-gain mode")
     cfg, cam, det = setup
+    cam.scene.set_params(surface="clean")     # (surface defects: see test_learned_background)
     cam.scene.set_n_ions(n_ions)
-    cam.scene.set_scale(6.0)
+    cam.scene.set_scale(scale)
     truth = np.array(cam.scene.state()["positions"])
     settings = getattr(cfg, mode)
+    if gain:
+        settings = settings.replace(em_gain=gain)
     full = det.analyze(_grab(cam, settings, 1)[0])
+    # the noise where the crystal is (the laser scatter is brightest there)
+    cu, cv = full.to_crop(truth[:, 0], truth[:, 1])
+    local = float(np.median(full.noise_f_map[np.round(cv).astype(int),
+                                             np.round(cu).astype(int)]))
     x0, y0 = np.floor(truth.min(axis=0)).astype(int) - 8
     x1, y1 = np.ceil(truth.max(axis=0)).astype(int) + 9
     # crystal +- 8 px: the ions fill the frame (the noise is then overestimated,
-    # there is hardly any background left to measure it on)
-    for f in _grab(cam, settings.replace(roi=(x0, y0, x1, y1)), 3):
-        r = det.analyze(f)
-        _, fp, miss = _match(r.positions, truth)
-        assert fp == 0 and miss == 0, len(r.spots)
-    # (few pixels: single-frame noise estimates scatter by ~10 %)
-    roi = (x0 - 20, y0 - 12, x1 + 20, y1 + 12)
-    noise = []
-    for f in _grab(cam, settings.replace(roi=roi), 5):
-        r = det.analyze(f)
-        _, fp, miss = _match(r.positions, truth)
-        assert fp == 0 and miss == 0, len(r.spots)
-        noise.append(r.noise_f)
-    assert np.median(noise) < 1.3 * full.noise_f
+    # there is hardly any background left to measure it on); a crystal +- 20 px.
+    # A dense chain may show one extra component in an odd frame (the tracker
+    # needs persistence) - never a missing ion.
+    extra, noise = 0, []
+    for roi, n in (((x0, y0, x1, y1), 3), ((x0 - 20, y0 - 12, x1 + 20, y1 + 12), 5)):
+        for f in _grab(cam, settings.replace(roi=roi), n):
+            r = det.analyze(f)
+            _, fp, miss = _match(r.positions, truth)
+            assert miss == 0, len(r.spots)
+            extra += fp
+            if n == 5:
+                noise.append(r.noise_f)
+    assert extra <= 1
+    assert np.median(noise) < 1.3 * local
     cam.scene.set_n_ions(0)
-    noise = []
+    noise, spots = [], 0
     for f in _grab(cam, settings.replace(roi=(x0, y0, x1, y1)), 5):
         r = det.analyze(f)
-        assert len(r.spots) == 0
+        spots += len(r.spots)
         noise.append(r.noise_f)
-    assert np.median(noise) < 1.3 * full.noise_f
+    assert spots <= (1 if gain else 0)
+    assert np.median(noise) < 1.3 * local
 
 
 def test_joint_fit_dense_chain():
+    """Joint core + halo fit of a chain denser than the PSF (3.3 px spacing,
+    1.8 sigma): unbiased positions and the true PSF, given enough light."""
     cfg = Config()
     cfg.simulator.seed = 5
+    cfg.simulator.photon_rate = 2.0e5         # test the model, not the noise
     cam = SimulatedCamera(cfg.simulator)
     cam.scene.set_n_ions(9)
-    cam.scene.set_scale(5.5)        # 3.3 px minimum spacing (2.5 sigma)
+    cam.scene.set_scale(5.5)
     truth = np.array(cam.scene.state()["positions"])
     applied = cam.configure(cfg.locate, "locate")
-    img = np.mean([cam._render(applied, 100.0 + k).astype(float) for k in range(2)], axis=0)
+    img = np.mean([cam._render(applied, 100.0 + k).astype(float) for k in range(4)], axis=0)
     guesses = truth + np.random.default_rng(0).normal(0, 0.4, truth.shape)
-    fit = fit_gaussians(img, guesses, 1.4)
+    fit = fit_gaussians(img, guesses, 1.8, halo=True)
     assert fit.success
     order = np.argsort(fit.positions[:, 0])
-    assert np.abs(fit.positions[order] - truth).max() < 0.03
-    assert fit.sigma == pytest.approx((1.3, 1.3), abs=0.01)
+    # so dense that neighbours trade light: ~0.08 px along the chain even with
+    # 240k photo-electrons per ion (noise-free images fit to < 0.001 px)
+    assert np.abs(fit.positions[order] - truth).max() < 0.35
+    # ... and the reported uncertainties say so (EMCCD noise law, sandwich)
+    pulls = (fit.positions[order] - truth) / fit.position_errors[order]
+    assert 0.6 < np.sqrt(np.mean(pulls ** 2)) < 1.6
+    assert fit.sigma == pytest.approx((1.8, 1.8), abs=0.03)
+    assert fit.halo_fraction == pytest.approx(0.15, abs=0.01)
+    assert fit.halo_sigma == pytest.approx(4.5, abs=0.15)
 
 
-def test_fit_jacobian_matches_numeric():
+@pytest.mark.parametrize("halo", [False, True])
+def test_fit_jacobian_matches_numeric(halo):
     import ioncam.analysis.fitting as F
     captured = {}
     orig = F.least_squares
 
     def spy(fun, x0, jac=None, **kw):
-        captured.update(fun=fun, jac=jac, x0=x0)
+        if not captured:                  # the first (core + halo) fit
+            captured.update(fun=fun, jac=jac, x0=x0)
         return orig(fun, x0, jac=jac, **kw)
 
     F.least_squares = spy
     try:
-        img = np.random.default_rng(0).normal(100, 3, (20, 30))
-        F.fit_gaussians(img, [(10.3, 9.7), (15.1, 10.2)], 1.3)
+        img = np.random.default_rng(0).normal(100, 3, (24, 34))
+        F.fit_gaussians(img, [(12.3, 11.7), (17.1, 12.2)], 1.3, halo=halo)
     finally:
         F.least_squares = orig
-    x0 = captured["x0"] + np.r_[0, 0.1, -0.1, 50, 70, 0.2, -0.3, 0.1, 0.2]
+    x0 = captured["x0"] + np.r_[0, 0.1, -0.1, 50, 70, 0.2, -0.3, 0.1, 0.2,
+                                [0.05, 0.4][:2 * halo]]
     ja = captured["jac"](x0)
     eps = 1e-6
     jn = np.column_stack([(captured["fun"](x0 + eps * e) - captured["fun"](x0 - eps * e)) / (2 * eps)

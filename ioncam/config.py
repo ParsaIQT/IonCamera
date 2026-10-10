@@ -64,8 +64,10 @@ def _live_defaults() -> AcquisitionSettings:
 
 
 def _locate_defaults() -> AcquisitionSettings:
-    # Long exposure, low gain: precise positions without saturating.
-    return AcquisitionSettings(exposure=0.5, em_gain=0, hs_speed_mhz=5.0,
+    # Long exposure, low gain: precise positions without saturating.  A little EM
+    # gain (not none) keeps the read noise (tens of e-) below the shot noise of
+    # ~10^4 photons/s ions - without it the fit is read-noise limited.
+    return AcquisitionSettings(exposure=0.5, em_gain=10, hs_speed_mhz=5.0,
                                vs_speed_us=0.5, preamp_gain_index=2,
                                frame_transfer=True, trigger="internal",
                                acquisition="run_till_abort")
@@ -122,15 +124,22 @@ class CalibrationConfig:
     verify: bool = opt(True, "take test frames with the final readout settings "
                              "(internal trigger) and check every ROI before arming")
     verify_frames: int = opt(20, "number of verification frames")
-    min_verify_snr: float = opt(3.0, "minimum (ion ROI - background)/noise in verification")
+    min_verify_snr: float = opt(5.0, "minimum significance of each ion's mean signal over "
+                                     "the verification frames (is it in its ROI?)")
     fit_psf: bool = opt(True, "joint 2D Gaussian fit of all ions (sub-pixel positions, PSF)")
 
 
 @dataclass
 class DetectionConfig:
-    psf_sigma: float = opt(1.5, "PSF Gaussian sigma [sensor px]; refined by calibration "
+    psf_sigma: float = opt(1.8, "PSF Gaussian sigma [sensor px]; refined by calibration "
                                 "if auto_psf")
-    auto_psf: bool = opt(True, "update psf_sigma from calibration fits")
+    psf_halo_fraction: float = opt(0.0, "fraction of an ion's light in a broad halo "
+                                         "(aberration wings); refined by calibration if "
+                                         "auto_psf")
+    psf_halo_sigma: float = opt(0.0, "halo sigma [sensor px]")
+    auto_psf: bool = opt(True, "update the PSF (core sigma, halo) from calibration fits")
+    deblend: bool = opt(True, "fit overlapping ions jointly (dense chains of blurred ions)")
+    deblend_max: int = opt(24, "largest group of overlapping ions fitted jointly")
     threshold_sigma: float = opt(6.0, "detection threshold in units of the matched-filter "
                                       "noise")
     min_separation: float = opt(2.5, "minimum distance between two ions [sensor px]")
@@ -140,8 +149,13 @@ class DetectionConfig:
     max_spots: int = opt(100, "never report more spots than this")
     cloud_width_factor: float = opt(2.2, "a spot wider than this x PSF is reported as an "
                                          "uncrystallised cloud, not an ion")
+    cloud_threshold_sigma: float = opt(6.0, "threshold for faint, diffuse clouds (light the "
+                                            "ions do not explain, filtered at cloud scale); "
+                                            "0 = off")
     max_rate_hz: float = opt(40.0, "maximum full-detection rate (frames beyond are only "
                                    "used for cheap per-ion counts)")
+    static_scale_tracking: bool = opt(True, "follow the brightness of the learned static "
+                                            "background (laser power) frame by frame")
 
 
 @dataclass
@@ -160,6 +174,9 @@ class TrackerConfig:
     bright_level: float = opt(0.55, "site brightness above this fraction => bright again")
     melt_level: float = opt(0.35, "total brightness below this fraction (and spots lost) "
                                   "=> crystal melted")
+    melt_diffuse: float = opt(0.08, "light still around a dim crystal (fraction of its "
+                                    "normal light, above the usual scatter) that makes it "
+                                    "'melted' rather than 'dark' / 'lasers off'")
     forget_time: float = opt(30.0, "seconds without any fluorescence before the ions are "
                                    "presumed lost")
     position_smoothing: float = opt(0.15, "EMA weight used to follow slow drifts")
@@ -167,6 +184,10 @@ class TrackerConfig:
                                       "dark ions after a reconfiguration")
     max_dark_inferred: int = opt(3, "maximum number of hidden dark ions to infer")
     hold_timeout: float = opt(120.0, "default maximum duration of hold_tracking() [s]")
+    verify_period: float = opt(2.0, "while the crystal is stable, re-measure it on the "
+                                    "average of the frames since the last check every "
+                                    "this many seconds (dim or dense chains that single "
+                                    "frames cannot resolve); 0 = off")
 
 
 @dataclass
@@ -221,15 +242,66 @@ class SimulatorConfig:
     n_ions: int = opt(3, "ions present at start")
     center: Tuple[float, float] = opt((262.0, 168.0), "chain centre [sensor px]")
     axis_angle_deg: float = opt(0.0, "chain axis angle w.r.t. sensor x [deg]")
-    length_scale_px: float = opt(7.4, "chain length scale l = (e^2/(4 pi eps0 m w^2))^(1/3) "
-                                      "in px; 2 ions are 1.26 l apart, 3 ions 1.08 l")
-    psf_sigma: float = opt(1.3, "PSF sigma [px]")
-    photon_rate: float = opt(4.0e5, "detected photons/s per bright ion")
-    background_rate: float = opt(150.0, "scattered-light photons/s/px (plus a gradient)")
+    length_scale_px: float = opt(5.6, "chain length scale l = (e^2/(4 pi eps0 m w_z^2))^(1/3) "
+                                      "x M / pixel [px]: 40Ca+ at w_z = 2 pi 1 MHz has l = "
+                                      "4.45 um = 5.6 px at M = 20 and 16 um pixels.  2 ions are "
+                                      "1.26 l apart, 3 ions 1.08 l, 4 ions 0.91 l (inner pair)")
+    # -- ions -----------------------------------------------------------------------
+    photon_rate: float = opt(13000.0, "photons/s per bright ion reaching the camera")
+    quantum_efficiency: float = opt(0.6, "sensor quantum efficiency at the fluorescence "
+                                         "wavelength (iXon Ultra 897 BV: ~0.6 at 397 nm)")
+    psf_sigma: float = opt(1.8, "ion image (PSF) core sigma [px]: aberrations, residual "
+                                "motion; much larger than the diffraction limit in practice")
+    psf_halo_fraction: float = opt(0.15, "fraction of an ion's light in a broad halo "
+                                         "(aberration wings) - this is what makes the "
+                                         "crosstalk between neighbouring ROIs large")
+    psf_halo_sigma: float = opt(4.5, "halo sigma [px]")
+    # -- imaging of the trap surface ---------------------------------------------------
+    magnification: float = opt(20.0, "imaging magnification")
+    pixel_size_um: float = opt(16.0, "camera pixel size [um] (iXon Ultra 897: 16)")
+    numerical_aperture: float = opt(0.25, "collection NA")
+    ion_height_um: float = opt(60.0, "ion height above the trap surface [um].  The camera "
+                                     "is focused on the ions, so a point on the surface is "
+                                     "a blurred disk of radius h tan(asin NA) M / pixel "
+                                     "(19 px with the defaults; small NA x h makes surface "
+                                     "defects look like ions)")
+    # -- light that does not come from ions ----------------------------------------------
+    surface: str = opt("", "trap surface preset: clean | typical | dirty | horrendous; "
+                           "sets scatter_rate ... hot_pixels below ('' = use those values)")
+    background_rate: float = opt(2.0, "uniform stray light [photons/s/px], also with the "
+                                      "lasers off")
+    scatter_rate: float = opt(25.0, "laser light scattered by the trap surface at the beam "
+                                    "centre [photons/s/px]; visible in long exposures")
+    scatter_sigma_along: float = opt(150.0, "Gaussian scatter profile: sigma along the "
+                                            "beam [px]")
+    scatter_sigma_across: float = opt(30.0, "sigma across the beam [px] (beam waist / 2 "
+                                            "on the camera)")
+    scatter_offset: Tuple[float, float] = opt((0.0, 0.0), "profile centre relative to the "
+                                                          "initial chain centre [px]")
+    beam_angle_deg: float = opt(45.0, "laser beam direction w.r.t. sensor x [deg]")
+    defects: int = opt(25, "scattering defects / dust on the surface, over the whole sensor "
+                           "(only those in the beam are lit)")
+    defect_rate: float = opt(3000.0, "median photons/s of a defect in the beam centre")
+    defect_spread: float = opt(1.2, "log-normal sigma of the defect brightness")
+    defect_max_height_um: float = opt(0.0, "dust grains stand up to this high above the "
+                                           "surface: closer to focus, less blurred")
+    scratches: int = opt(0, "scratches (lines of defects)")
+    gap_scatter: float = opt(4.0, "light from the electrode gaps along the trap axis at "
+                                  "the beam centre [photons/s per px of gap]")
+    gap_offset_px: float = opt(45.0, "distance of the electrode gaps from the trap axis [px]")
+    hot_pixels: int = opt(8, "hot pixels")
+    hot_pixel_rate: float = opt(200.0, "median dark current of a hot pixel [e-/s]")
+    laser_power: float = opt(1.0, "relative cooling/detection laser intensity: the "
+                                  "surface scatter scales with it, the fluorescence too "
+                                  "(far below saturation)")
+    laser_noise: float = opt(0.01, "laser intensity noise, relative rms per frame")
+    surface_seed: int = opt(1, "seed of the surface layout (defects, scratches, hot pixels)")
+    # -- camera ---------------------------------------------------------------------
     bias: float = opt(100.0, "baseline counts per (binned) pixel")
     read_noise_e: float = opt(30.0, "read noise [e-] rms")
     sensitivity: float = opt(4.0, "electrons per count at the output")
     cic: float = opt(0.003, "clock-induced charge [e-/px/frame]")
+    # -- what happens on its own -------------------------------------------------------
     load_rate: float = opt(0.0, "ions loaded per second while the oven is on")
     loss_rate: float = opt(0.0, "loss probability per ion per second")
     dark_rate: float = opt(0.0, "go-dark probability per bright ion per second")
