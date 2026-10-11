@@ -185,3 +185,49 @@ def test_single_ion_dark_is_ambiguous():
     sc.scene.set_dark(0, False)
     sc.run(1.5)
     assert kinds(sc.take()) == ["fluorescence_restored"]
+
+
+# A tight trap like the lab's: PSF core 1.2 px, chain length scale 3.4 px - two
+# ions 4.3 px apart, so single frames often show them as one spot.
+TIGHT = dict(psf_sigma=1.2, scale=3.4, exposure=0.05)
+
+
+@pytest.mark.parametrize("n,site", [(2, 0), (2, 1), (3, 0), (3, 1)])
+def test_tight_chain_dark_then_lost(n, site):
+    """Dark: the rest stays where it was.  Lost: the rest re-centres (in a tight
+    chain much like two ions seen as one) - decided on the averaged frames."""
+    sc = settle(n, **TIGHT)
+    sc.scene.set_dark(site, True)
+    sc.run(2.5)
+    assert kinds(sc.take()) == ["ion_dark"]
+    sc.scene.set_dark(site, False)
+    sc.run(2.5)
+    assert kinds(sc.take()) == ["ion_bright"]
+    sc.scene.lose_ion(site)
+    sc.run(3.0)
+    ev = sc.take()
+    assert kinds(ev) == ["ion_lost"], ev
+    assert (sc.tracker.n_bright, sc.tracker.n_dark) == (n - 1, 0)
+
+
+def test_tight_chain_psf_is_learned_from_the_crystal():
+    """Detection starts with the default PSF (1.8 px); the tracker measures the
+    real one (1.2 px) on averaged frames and hands it to the detector."""
+    sc = settle(2, **TIGHT)
+    sc.run(5.0)
+    assert sc.take() == []
+    assert any(sc.psf_messages)
+    assert abs(sc.cfg.detection.psf_sigma - 1.2) < 0.15
+
+
+def test_full_sensor_start():
+    """The whole 512 x 512 sensor: the faint-ion integrator learns the static
+    background instead of reporting its noise as ions."""
+    sc = Scenario(n_ions=3)
+    sc.settings = sc.settings.replace(roi=None)
+    sc.applied = sc.cam.configure(sc.settings, "live")
+    sc.run(4.0)
+    assert kinds(sc.take()) == ["ions_detected"]
+    assert sc.tracker.n_bright == 3
+    sc.run(4.0)
+    assert sc.take() == []

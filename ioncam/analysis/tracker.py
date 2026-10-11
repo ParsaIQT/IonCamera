@@ -88,6 +88,10 @@ class _Pending:
     avg_noise2: float = 0.0
     avg_sq: Optional[np.ndarray] = None
     misses: int = 0                        # consecutive frames showing something else
+    site_pos: Optional[np.ndarray] = None  # the sites when the change began
+    dark_votes: Optional[dict] = None      # frames read as "these sites went dark"
+    checked_n: int = 0                     # avg_n when the average was last checked
+    looks_same: bool = False               # ... and still showed the old crystal
 
     def __post_init__(self):
         if self.positions is not None and self.hits is None:
@@ -109,6 +113,45 @@ class _Pending:
         if new:
             self.positions = np.vstack([pos, spots[new]])
             self.hits = np.concatenate([self.hits, np.ones(len(new))])
+
+
+def adopt_learned_psf(tracker: "ChainTracker", detection_cfg) -> Optional[str]:
+    """Use the PSF the tracker measured on averaged frames of the live crystal
+    for the per-frame detection too (``detection.auto_psf``): the detector then
+    works with the real ion image without a calibration.  Returns a message
+    when the detection PSF changed, else None."""
+    e = tracker.psf_estimate
+    if not detection_cfg.auto_psf or e is None or e is tracker._psf_adopted:
+        return None
+    tracker._psf_adopted = e
+    sx, sy = e["sigma"]
+    sigma = math.sqrt(sx * sy)
+    if not 0.5 < sigma < 6.0:
+        return None
+    f = float(min(max(e["halo_fraction"], 0.0), 0.5))
+    hs = float(e["halo_sigma"]) if f > 0 else 0.0
+    d = detection_cfg
+    if abs(sigma - d.psf_sigma) < 0.04 * d.psf_sigma and abs(f - d.psf_halo_fraction) < 0.03:
+        return None
+    old = PSF.from_sensor(d.psf_sigma, d.psf_halo_fraction, d.psf_halo_sigma)
+    d.psf_sigma = round(sigma, 4)
+    d.psf_halo_fraction = round(f, 4)
+    d.psf_halo_sigma = round(hs, 4)
+    tracker.psf_changed(old, PSF.from_sensor(d.psf_sigma, d.psf_halo_fraction, d.psf_halo_sigma))
+    msg = "PSF measured on the live crystal: sigma {:.2f} px".format(sigma)
+    if f > 0:
+        msg += " + {:.0%} of the light in a halo of sigma {:.1f} px".format(f, hs)
+    return msg + " - used for detection from now on"
+
+
+def photometry_scale(model: PSF, true: PSF) -> float:
+    """What least-squares photometry with PSF ``model`` reads for an isolated
+    source of unit flux whose image is ``true`` (both unit-flux sums of
+    Gaussians, so the overlaps are analytic)."""
+    def overlap(a, b):
+        return sum(wa * wb / (2.0 * math.pi * math.sqrt((ax * ax + bx * bx) * (ay * ay + by * by)))
+                   for wa, ax, ay in a.parts() for wb, bx, by in b.parts())
+    return overlap(model, true) / overlap(model, model)
 
 
 def align(a: np.ndarray, b: np.ndarray, gate: float, max_shift: float):
@@ -153,11 +196,17 @@ def _variance_of_mean(mean: np.ndarray, sum_sq: np.ndarray, n: int) -> np.ndarra
     sig = np.maximum(mean, 0.0).ravel()
     v = sample.ravel()
     keep = np.ones(v.size, bool)
-    a, b = float(np.median(v)), 0.0
+    # the background noise (half the pixels with the least light) bounds the
+    # law from below: with few frames, a fit pulled by the bright pixels could
+    # otherwise put the background variance at ~0 and give those pixels all
+    # the weight
+    low = sig <= np.median(sig)
+    a0 = float(np.median(v[low])) if np.any(low) else float(np.median(v))
+    a, b = a0, 0.0
     for _ in range(3):
         A = np.column_stack([np.ones(keep.sum()), sig[keep]])
         (a, b), *_ = np.linalg.lstsq(A, v[keep], rcond=None)
-        a, b = max(a, 1e-12), max(b, 0.0)
+        a, b = max(a, 0.5 * a0, 1e-12), max(b, 0.0)
         pred = a + b * sig
         keep = np.abs(v - pred) < 4.0 * pred * math.sqrt(2.0 / max(n - 1, 1)) + 1e-12
         if keep.sum() < 10:
@@ -181,7 +230,7 @@ def _same_configuration(p: np.ndarray, q: np.ndarray, gate: float) -> bool:
     n = max(len(p), len(q))
     if n == 0:
         return True
-    allowed = 1 if n >= 6 else 0
+    allowed = 1 if n >= 3 else 0
     if abs(len(p) - len(q)) > allowed:
         return False
     return len(_assign(p, q, gate)) >= n - allowed
@@ -213,6 +262,7 @@ class ChainTracker:
         self._after_hold: Optional[dict] = None
         self._region_ref: Optional[float] = None
         self._diffuse_ref: Optional[float] = None
+        self._region_var: Optional[float] = None   # its frame-to-frame scatter
         self._moved_accum = np.zeros(2)
         self._dim = False
         self.fluorescence_level = float("nan")
@@ -227,6 +277,8 @@ class ChainTracker:
         self._fi: Optional[dict] = None   # faint-ion integrator (see _faint_ions)
         self._last_resid: List[float] = []
         self.psf_estimate: Optional[dict] = None   # PSF learned from averaged frames
+        self._psf_adopted: Optional[dict] = None   # the estimate last given to detection
+        self._budget_var: Optional[float] = None   # scatter of the crystal's light budget
         self._avg_reset()
 
     @property
@@ -245,9 +297,12 @@ class ChainTracker:
                 self._stable_since is not None and t - self._stable_since >= st)
 
     def _pending_significant(self, t: float) -> bool:
-        """Has the pending hypothesis lasted long enough to mean something?"""
+        """Has the pending hypothesis lasted long enough to mean something?  (A
+        change of the crystal also has to show on the average of its frames.)"""
         p = self._pending
-        return p is not None and p.frames >= 2 and t - p.t0 >= 0.5 * self.cfg.confirm_time
+        if p is None or p.frames < 2 or t - p.t0 < 0.5 * self.cfg.confirm_time:
+            return False
+        return p.key != ("CHANGE",) or (p.checked_n > 0 and not p.looks_same)
 
     def prior(self) -> Optional[np.ndarray]:
         """Where bright ions are expected in the next frame (for the detector's
@@ -341,6 +396,24 @@ class ChainTracker:
         for s in self.sites:
             s.ref = None
 
+    def psf_changed(self, old: PSF, new: PSF) -> None:
+        """The detection PSF changed (``old`` -> ``new``, sensor px): photometry
+        with it reads a different number for the same ion (a too-wide model
+        without halo reads ~20 % more), so the brightness references are
+        rescaled - with the best PSF known (learned, else ``new``) as the
+        truth - and the light references that depend on them start afresh."""
+        e = self.psf_estimate
+        true = new if e is None else PSF.from_sensor(e["sigma"], e["halo_fraction"],
+                                                     e["halo_sigma"])
+        r = photometry_scale(new, true) / max(photometry_scale(old, true), 1e-12)
+        for s in self.sites:
+            if s.ref:
+                s.ref *= r
+        self._region_ref = None
+        self._diffuse_ref = None
+        self._region_var = None
+        self._budget_var = None
+
     def background_changed(self) -> None:
         """The background model changed (static background learned / cleared):
         brightness references, the diffuse-light reference and the cloud
@@ -348,6 +421,7 @@ class ChainTracker:
         self.rebaseline()
         self._region_ref = None
         self._diffuse_ref = None
+        self._region_var = None
         self._cl = None
         self._pending = None
         self._avg_reset()
@@ -403,11 +477,20 @@ class ChainTracker:
         a_f = max(min(1.0, dt / 0.5), 1.0 / c["n"])
         a_s = max(min(1.0, dt / 30.0), 1.0 / c["n"])
         c["fast"] += a_f * (f - c["fast"])
+        if c["n"] * min(1.0, dt / 0.5) < 3.0:
+            # warming up: the reference is no older than the fast average yet
+            # (the noise estimate below assumes it is) - learn, report nothing
+            c["slow"] += a_s * (f - c["slow"])
+            return np.zeros((0, 2))
         excess = c["fast"] - c["slow"]
         sig = det.noise_f_map * math.sqrt(a_f / (2.0 - a_f) + a_s / (2.0 - a_s))
         mask = excess > 6.0 * sig
+        # the reference learns the usual image everywhere except where light
+        # is (becoming) significantly new - updating it only in frames where
+        # nothing stands out would freeze it on the first, noisy frames of a
+        # large image, and its noise would then pass for faint ions
+        c["slow"] += a_s * np.where(excess < 3.0 * sig, f - c["slow"], 0.0)
         if not np.any(mask):
-            c["slow"] += a_s * (f - c["slow"])
             return np.zeros((0, 2))
         from ioncam.analysis.detection import _local_maxima
         idx = _local_maxima(excess, mask)
@@ -440,6 +523,7 @@ class ChainTracker:
         if committed:
             p = self._pending
             self._pending = None
+            self._learn_psf_on(p, det)
             found = self._average_fit(p, det, (p.reliable(),))
             self._adopt(found if found is not None and len(found) else p.reliable(), [], det, t)
             n = len(self.sites)
@@ -479,7 +563,7 @@ class ChainTracker:
         dark_idx = [k for k, s in enumerate(self.sites) if s.state == DARK]
         shift, pairs, miss_b, extra = align(pos[bright_idx], spots, cfg.match_radius,
                                             cfg.max_global_shift)
-        region = self._region_flux(det, pos)
+        region, region_noise = self._region_flux(det, pos)
         # light around the crystal that the sites do not explain: scatter structure
         # (constant) plus, when melted, the smeared-out fluorescence
         explained = float(np.sum(np.clip(np.where(inside, vals, 0.0), 0.0, None))) / \
@@ -497,10 +581,25 @@ class ChainTracker:
             fitted = self._fit_sites(det, inside)
         pairs = [(bright_idx[i], j) for i, j in pairs]
         missing = [bright_idx[i] for i in miss_b]
+        # A spot next to an expected ion without a spot of its own may be the
+        # two seen as one, pulled in between: the common motion is measured on
+        # the other ions when there are enough of them ("clean" shift)
+        near, clean_shift = set(), not missing
+        if missing and pairs:
+            sp = self._local_spacing(pos)
+            near = {k for k, _ in pairs
+                    if min(np.hypot(*(pos[m] - pos[k])) for m in missing) < 1.3 * sp[k]}
+            clean = [(k, j) for k, j in pairs if k not in near]
+            if len(clean) >= 2:
+                disp = np.array([spots[j] - pos[k] for k, j in clean])
+                shift = np.median(disp, axis=0) if len(clean) >= 3 else disp.mean(axis=0)
+                clean_shift = True
         return {"pos": pos, "vals": vals, "noise": noise, "norm": norm, "levels": levels,
                 "inside": inside, "bright_idx": bright_idx, "dark_idx": dark_idx,
                 "shift": shift, "pairs": pairs, "missing": missing, "extra": extra,
-                "default_ref": default_ref, "region": region, "diffuse": diffuse,
+                "near_missing": near, "clean_shift": clean_shift,
+                "default_ref": default_ref, "region": region, "region_noise": region_noise,
+                "diffuse": diffuse,
                 "fitted": fitted}
 
     def _fit_sites(self, det: DetectionResult, inside) -> Optional[np.ndarray]:
@@ -531,14 +630,15 @@ class ChainTracker:
                           (v + det.crop[1]) * vb_ + det.y0 + 0.5 * (vb_ - 1))
         return out
 
-    def _region_flux(self, det: DetectionResult, pos: np.ndarray) -> Optional[float]:
-        """Background-subtracted light in a box around the crystal (normalised).
+    def _region_flux(self, det: DetectionResult, pos: np.ndarray):
+        """Background-subtracted light in a box around the crystal and its
+        noise (normalised), or (None, None).
 
         Tells a melted crystal (light still there, just diffuse) from lasers
         off / ions gone (no light at all)."""
         res = det.residual
         if len(pos) == 0 or res.size == 0:
-            return None
+            return None, None
         cu, cv = det.to_crop(pos[:, 0], pos[:, 1])
         mu = 3.0 * self.cfg.match_radius / det.hbin + 2.0
         mv = 3.0 * self.cfg.match_radius / det.vbin + 2.0
@@ -548,8 +648,10 @@ class ChainTracker:
         v0 = int(max(0, math.floor(np.min(cv) - mv)))
         v1 = int(min(h, math.ceil(np.max(cv) + mv) + 1))
         if u1 <= u0 or v1 <= v0:
-            return None
-        return float(res[v0:v1, u0:u1].sum()) / max(det.gain_factor, 1e-12)
+            return None, None
+        g = max(det.gain_factor, 1e-12)
+        n = (v1 - v0) * (u1 - u0)
+        return float(res[v0:v1, u0:u1].sum()) / g, float(det.noise) * math.sqrt(n) / g
 
     def _local_spacing(self, pos: np.ndarray) -> np.ndarray:
         if len(pos) < 2:
@@ -577,19 +679,44 @@ class ChainTracker:
             cfg.reconfig_min_px, 0.5 * float(np.min(tol)) if len(tol) else 1.0,
             4.0 * self._shift_noise)
 
+        # Light budget, in single-ion units: two ions the detector saw as one
+        # keep the crystal's light, a lost ion takes one ion's worth with it.
+        # Joint photometry at the sites shares the light out among them, so the
+        # sum keeps the total wherever the ions sit.  (Single spots are too
+        # noisy at low light to tell a merged pair by its brightness; the
+        # deficit is compared with the scatter of the total.)
+        light_short = False
+        bidx = [k for k in obs["bright_idx"] if inside[k]]
+        lvb = levels[bidx] if bidx else np.zeros(0)
+        if len(bidx) >= 2 and np.all(np.isfinite(lvb)):
+            total = float(np.sum(lvb))
+            refs = np.array([self.sites[k].ref or np.nan for k in bidx], float)
+            nz = np.asarray(obs["noise"], float)[bidx] / max(det.gain_factor, 1e-12) / refs
+            sig = math.sqrt(float(np.nansum(nz ** 2))) if np.any(np.isfinite(nz)) else 0.3
+            if self._budget_var:
+                sig = max(sig, math.sqrt(self._budget_var))
+            light_short = len(bidx) - total > max(0.6, 3.0 * sig)
+            if not obs["missing"] and not obs["extra"]:
+                dev = (total - len(bidx)) ** 2
+                self._budget_var = dev if self._budget_var is None else \
+                    0.95 * self._budget_var + 0.05 * dev
+
         # residual motion of matched ions after the common shift
         reconf = False
         resid = []
         for k, j in obs["pairs"]:
             d = spots[j] - (pos[k] + shift)
-            resid.append(float(np.hypot(*d)))
+            if k not in obs["near_missing"]:
+                resid.append(float(np.hypot(*d)))     # (position noise estimate)
             if float(np.hypot(*d)) > tol[k]:
                 # a spot pulled towards a missing neighbour is two ions seen as one
-                # (whatever that neighbour's brightness reads), not motion
+                # (whatever that neighbour's brightness reads), not motion - unless
+                # light is missing: a tight chain that lost an ion re-centres its
+                # ions towards the gap too
                 toward = [m for m in obs["missing"]
                           if np.hypot(*(pos[m] - pos[k])) < 1.3 * spacing[k] and
                           float(np.dot(d, pos[m] - pos[k])) > 0]
-                if toward:
+                if toward and not light_short:
                     continue
                 reconf = True
         self._last_resid = resid
@@ -603,8 +730,15 @@ class ChainTracker:
         diffuse = False
         if obs["region"] is not None and self._region_ref and self._diffuse_ref is not None:
             crystal_light = max(self._region_ref - self._diffuse_ref, 1e-12)
-            light = (obs["region"] - self._diffuse_ref) / crystal_light
-            diffuse = light >= cfg.melt_diffuse
+            excess = obs["region"] - self._diffuse_ref
+            # ... and by more than that light scatters from frame to frame
+            # (around a single dark ion the background alone often makes 8 % of
+            # its light; residual background errors are correlated, so the
+            # scatter of the sum is measured, the pixel noise only bounds it)
+            noise = obs["region_noise"] or 0.0
+            if self._region_var is not None:
+                noise = max(noise, math.sqrt(self._region_var))
+            diffuse = excess >= cfg.melt_diffuse * crystal_light and excess > 3.0 * noise
         matched_frac = len(obs["pairs"]) / max(1, len(bright_obs))
         # melted: sites dim, but the light is still there - spread out
         if bright_obs and lv.size and med_level < cfg.melt_level and matched_frac < 0.5 and \
@@ -615,7 +749,7 @@ class ChainTracker:
                 (not lv.size or np.all(lv < cfg.dark_level)):
             return ("ALL_DARK",)
 
-        newly_dark, ambiguous = [], False
+        newly_dark, ambiguous, unaccounted = [], False, False
         for k in obs["missing"]:
             if not inside[k]:
                 continue
@@ -624,6 +758,10 @@ class ChainTracker:
                 newly_dark.append(k)
             elif lvk < cfg.bright_level:
                 ambiguous = True
+            elif light_short:
+                # light at the site, but the crystal as a whole is an ion short:
+                # not a merged pair - it changed
+                unaccounted = True
             # else: still bright, the detector merged it with a neighbour
         newly_bright, unexplained = [], []
         dark_pos = pos[obs["dark_idx"]] + shift if obs["dark_idx"] else np.zeros((0, 2))
@@ -645,7 +783,7 @@ class ChainTracker:
         # A missing ion together with a common shift means the chain re-centred:
         # that is a loss, never "an end ion went dark".  A rigid move is only
         # accepted when every ion is accounted for.
-        if reconf or unexplained or (obs["missing"] and not small_shift):
+        if reconf or unexplained or unaccounted or (obs["missing"] and not small_shift):
             return ("RECONFIG",)
         if ambiguous:
             return None
@@ -669,8 +807,20 @@ class ChainTracker:
                 return
             moved = True
         if kind in ("STABLE", "MOVED"):
+            # an expected ion without its own spot (merged with a neighbour - or
+            # a change under way): such a frame neither confirms nor cancels a
+            # pending change, and must not drag the sites (nor the noise
+            # estimates, nor the averaged image) along
+            ambiguous = bool(obs["missing"]) and not moved
+            p_ = self._pending
+            if ambiguous and p_ is not None and not p_.looks_same:
+                return
+            if p_ is not None and p_.looks_same:
+                self._avg_merge(p_)      # (see _avg_merge)
             self._pending = None
-            if kind == "STABLE":
+            if kind == "STABLE" and obs["clean_shift"]:
+                # (frames with a merged pair count too - measured on the other
+                # ions: frames where every ion has its spot are the bright ones)
                 sh = float(np.hypot(*obs["shift"]))
                 self._shift_noise = math.sqrt(0.95 * self._shift_noise ** 2 + 0.05 * sh * sh)
                 r = getattr(self, "_last_resid", [])
@@ -678,10 +828,12 @@ class ChainTracker:
                     # 2D displacement -> per-axis rms
                     ms = float(np.median(np.square(r))) / 1.386
                     self._pos_noise = math.sqrt(0.95 * self._pos_noise ** 2 + 0.05 * ms)
-            self._apply_tracking(obs, spots, t, full=moved)
+            if not ambiguous:
+                self._apply_tracking(obs, spots, t, full=moved)
             if moved:
                 self._avg_reset()
             else:
+                # (merged or not, the frame shows the crystal as it is)
                 self._avg_add(det, t, events)
             if moved or np.hypot(*self._moved_accum) > 3.0:
                 acc = obs["shift"] if moved else self._moved_accum
@@ -691,16 +843,44 @@ class ChainTracker:
                     "Crystal moved rigidly by ({:+.1f}, {:+.1f}) px".format(*acc), t,
                     shift=[float(acc[0]), float(acc[1])]))
             if self.state != STABLE:
-                # a persistent-but-unconfirmed change faded away: stable again from now
+                # a persistent-but-unconfirmed change faded away: stable again from
+                # now - unless its average showed the old crystal (noise: nothing
+                # happened)
                 self._set_state(STABLE, t)
-                self._stable_since = t
+                if moved or p_ is None or not p_.looks_same:
+                    self._stable_since = t
             if self._stable_since is None:
                 self._stable_since = t
             self._check_dim(t, events)
             return
+        # An ion missing from its site: single frames of a tight crystal cannot
+        # always tell "it went dark, the rest stayed" from "it was lost, the rest
+        # re-arranged" - one change, decided on the average of its frames
+        dark_cand = None
+        if kind == "SITES" and hyp[1] and not hyp[2]:
+            dark_cand = hyp[1]
+            hyp = ("CHANGE",)
+        elif kind == "RECONFIG":
+            hyp = ("CHANGE",)
+        kind = hyp[0]
         committed = self._advance(hyp, t, spots)
-        if kind == "RECONFIG" and self._pending is not None:
-            self._pending_average(self._pending, det)
+        p_ = self._pending
+        if kind in ("CHANGE", "SITES") and p_ is not None and p_.misses == 0:
+            # the frames that show the change are its evidence (an odd frame that
+            # showed something else must not be mixed in)
+            self._pending_average(p_, det)
+            if dark_cand is not None:
+                p_.dark_votes = p_.dark_votes or {}
+                p_.dark_votes[dark_cand] = p_.dark_votes.get(dark_cand, 0) + 1
+            if kind == "CHANGE" and p_.avg is not None and p_.avg_n >= 4 and \
+                    p_.avg_n >= 1.5 * p_.checked_n:
+                # (decided as at the end: until the average shows the change, it
+                # is not under way, and frames of the old crystal end it)
+                p_.checked_n = p_.avg_n
+                p_.looks_same = self._decide_change(p_, det)[0] == "same"
+        if committed and kind == "CHANGE" and p_ is not None and \
+                (p_.avg is None or p_.avg_n < 4):
+            committed = False      # decided on the average of >= 4 frames
         # a few odd frames (noise, cosmic rays, dim ions) are not instability; only
         # a hypothesis that persists makes the crystal "changing"
         if self.state == STABLE and self._pending_significant(t):
@@ -711,10 +891,17 @@ class ChainTracker:
         self._pending = None
         if kind == "SITES":
             self._commit_sites(hyp[1], hyp[2], obs, t, events)
-        elif kind == "RECONFIG":
-            verdict, new_pos = self._confirm_on_average(p, det)
+        elif kind == "CHANGE":
+            verdict, new_pos = self._decide_change(p, det)
+            if verdict == "dark":
+                # dark: the rest of the crystal is exactly where it was
+                self._commit_sites(new_pos, (), obs, t, events)
+                self._set_state(STABLE, t)
+                self._stable_since = t
+                return
             if verdict == "same":
                 # the averaged frames still show the old crystal: single-frame noise
+                self._avg_merge(p)
                 self._set_state(STABLE, t)
                 return
             if verdict == "hidden":
@@ -977,6 +1164,7 @@ class ChainTracker:
         self.sites = sites
         self._region_ref = None
         self._diffuse_ref = None
+        self._region_var = None
         self._avg_reset()
         self._update_chain_fit()
 
@@ -1048,7 +1236,10 @@ class ChainTracker:
                 self._region_ref = region
                 self._diffuse_ref = obs["diffuse"]
             else:
-                self._region_ref += 0.05 * (region - self._region_ref)
+                dev = region - self._region_ref
+                self._region_var = dev * dev if self._region_var is None else \
+                    0.95 * self._region_var + 0.05 * dev * dev
+                self._region_ref += 0.05 * dev
                 self._diffuse_ref += 0.05 * (obs["diffuse"] - self._diffuse_ref)
         if self._chain is not None:
             scale, center, axis = self._chain
@@ -1103,6 +1294,25 @@ class ChainTracker:
         if t - self._avg_t0 >= cfg.verify_period and self._avg_n >= 10:
             self._verify(det, t, events)
             self._avg_reset()
+
+    def _avg_merge(self, p: "_Pending") -> None:
+        """The frames of a change that did not happen show the stable crystal:
+        add them to its average.  Picked for looking different, they are a
+        biased sample on their own - together with the frames that did not
+        look different they are all frames again."""
+        if p.avg is None or self._avg is None or p.avg_key is None:
+            return
+        crop, x0, y0, hb, vb, (pa, pb, pc, pd) = p.avg_key
+        if (crop, x0, y0, hb, vb, len(self.sites)) != self._avg_key:
+            return
+        ua, va, ub, vb_ = self._avg_box
+        if ua < pa or va < pb or ub > pc or vb_ > pd:
+            return
+        sl = (slice(va - pb, vb_ - pb), slice(ua - pa, ub - pa))
+        self._avg += p.avg[sl]
+        self._avg_sq += p.avg_sq[sl]
+        self._avg_n += p.avg_n
+        self._avg_noise += p.avg_noise2
 
     def _psf_for(self, det: DetectionResult) -> PSF:
         """The PSF for analyses of averaged frames: learned if available."""
@@ -1232,6 +1442,28 @@ class ChainTracker:
         p.avg_n += 1
         p.avg_noise2 += float(det.noise_f) ** 2
 
+    def _learn_psf_on(self, p: "_Pending", det: DetectionResult) -> None:
+        """Measure the PSF on the averaged frames of a new crystal before its
+        ions are counted: a detector still assuming the wrong PSF merges and
+        splits ions in tight chains.  (Accepted only if the fit explains the
+        average - see _learn_psf.)"""
+        if p.avg is None or p.avg_n < 4 or det.psf is None:
+            return
+        n = p.avg_n
+        mean = p.avg / n
+        var_mean = _variance_of_mean(mean, p.avg_sq, n)
+        crop, x0, y0, hb, vb, box = p.avg_key
+        ua, va = box[:2]
+        for start in (p.reliable(), p.positions):
+            if start is None or len(start) == 0:
+                continue
+            g = np.column_stack([(start[:, 0] - x0 - 0.5 * (hb - 1)) / hb - crop[0] - ua,
+                                 (start[:, 1] - y0 - 0.5 * (vb - 1)) / vb - crop[1] - va])
+            before = self.psf_estimate
+            self._learn_psf(mean, g, det, var_mean)
+            if self.psf_estimate is not before:
+                return
+
     def _average_fit(self, p: "_Pending", det: DetectionResult, starts):
         """Analyse the average of the frames that supported ``p``, starting from each
         position set in ``starts`` (sensor px); the best explanation wins (every
@@ -1270,6 +1502,89 @@ class ChainTracker:
         return np.column_stack([(f[:, 0] + crop[0]) * hb + x0 + 0.5 * (hb - 1),
                                 (f[:, 1] + crop[1]) * vb + y0 + 0.5 * (vb - 1)])
 
+    def _avg_costs(self, p: "_Pending", det: DetectionResult, configs):
+        """Chi-square of the averaged frames of ``p`` for each ``(positions,
+        max_move)`` (sensor px; one fixed-PSF fit each), or None."""
+        if p.avg is None or p.avg_n < 4 or det.psf is None:
+            return None
+        n = p.avg_n
+        mean = p.avg / n
+        var_mean = _variance_of_mean(mean, p.avg_sq, n)
+        crop, x0, y0, hb, vb, box = p.avg_key
+        ua, va = box[:2]
+        out = []
+        for pos_, max_move in configs:
+            if len(pos_) == 0:
+                out.append(float(np.sum(mean ** 2 / var_mean)))
+                continue
+            g = np.column_stack([(pos_[:, 0] - x0 - 0.5 * (hb - 1)) / hb - crop[0] - ua,
+                                 (pos_[:, 1] - y0 - 0.5 * (vb - 1)) / vb - crop[1] - va])
+            try:
+                out.append(fit_fixed_psf(mean, g, self._psf_for(det), max_move=max_move,
+                                         var=var_mean).cost)
+            except (ValueError, np.linalg.LinAlgError):  # pragma: no cover
+                return None
+        return out
+
+    def _clearly_better(self, p: "_Pending", det: DetectionResult, old: np.ndarray,
+                        new: np.ndarray, move: float = 0.5) -> bool:
+        """Does configuration ``new`` explain the averaged frames of ``p``
+        clearly better than ``old`` (chi-square lower by more than the usual
+        penalty per ion of difference, at least one)?  Both are fitted with
+        their own number of ions, ``old``'s ions free to move by ``move`` px
+        (little when the counts differ: two ions pulled together would imitate
+        one)."""
+        if len(old) == 0:
+            return True
+        c = self._avg_costs(p, det, ((old, move), (new, 0.5)))
+        if c is None:
+            return True
+        return c[0] - c[1] > 25.0 * max(1, abs(len(new) - len(old)))
+
+    def _decide_change(self, p: "_Pending", det: DetectionResult):
+        """What the averaged frames of a pending change show: ("dark", sites)
+        if the rest of the crystal stayed exactly where it was, else the
+        verdict of _confirm_on_average ("same", "hidden" or "changed" with
+        positions)."""
+        dark = max(p.dark_votes, key=p.dark_votes.get) if p.dark_votes else None
+        if dark is not None and self._rest_moved(p, det, dark) == "unmoved":
+            return "dark", dark
+        return self._confirm_on_average(p, det)
+
+    def _rest_moved(self, p: "_Pending", det: DetectionResult, newly_dark) -> str:
+        """An ion that goes dark leaves the rest of the crystal exactly where
+        it was (and its site dark); a lost ion makes the rest re-arrange.  In a
+        tight chain the re-centred ions can still look like the old sites
+        minus one (each pulled towards the gap, as if merged with a neighbour),
+        so check on the average of the frames that showed the change, fitted
+        from the remaining bright sites as they were before: "unmoved",
+        "moved" or "unknown"."""
+        rest = [k for k, s_ in enumerate(self.sites)
+                if s_.state == BRIGHT and k not in set(newly_dark)]
+        if not rest:
+            return "unknown"
+        allpos = self.positions()
+        if p.site_pos is not None and len(p.site_pos) == len(allpos):
+            allpos = p.site_pos                 # where they were before the change
+        old = allpos[rest]
+        found = self._average_fit(p, det, (old,))
+        if found is None or len(found) == 0:
+            return "unknown"
+        if len(found) > len(old):
+            return "unknown"                    # light where the 'dark' ion was
+        pairs = _assign(old, found, 2.0 * self.cfg.match_radius)
+        if len(found) < len(old) or len(pairs) < len(found):
+            return "moved"
+        d = max(float(np.hypot(*(found[j] - old[i]))) for i, j in pairs)
+        if len(allpos) >= 2:
+            dd = np.hypot(allpos[:, None, 0] - allpos[None, :, 0],
+                          allpos[:, None, 1] - allpos[None, :, 1])
+            np.fill_diagonal(dd, np.inf)
+            spacing = float(dd.min())
+        else:
+            spacing = 10.0
+        return "moved" if d > max(0.4, 0.15 * spacing) else "unmoved"
+
     def _confirm_on_average(self, p: "_Pending", det: DetectionResult):
         """Check a re-configuration on the average of the frames that showed it.
 
@@ -1294,6 +1609,16 @@ class ChainTracker:
         # an ion that was hidden all along leaves the others exactly where they
         # were; a chain that gained or lost an ion re-centres and re-spaces
         shifted = float(np.hypot(*shift)) > max(cfg.reconfig_min_px, 3.0 * self._shift_noise)
+        # The old crystal may move by up to the motion threshold when the
+        # counts agree: on a short average of dim, blended ions the free fit
+        # always finds positions that explain the noise a little better
+        move = float(np.min(tol)) if len(found) == len(old) and len(tol) else 0.5
+        if (miss or moved or shifted or extra) and \
+                not self._clearly_better(p, det, old, found, move):
+            # the crystal as it was explains the averaged frames as well: keep it
+            # (single frames of a dim, dense chain change their mind; a real
+            # change shows on the average)
+            return "same", old
         if miss or moved or shifted:
             return "changed", found
         if extra:
@@ -1303,11 +1628,11 @@ class ChainTracker:
             if all(np.min(np.hypot(*(old - found[j]).T)) < res for j in extra):
                 return "hidden", found
             return "changed", found
-        # same ions: keep them, a little more precisely placed
-        bright = [s_ for s_ in self.sites if s_.state == BRIGHT]
-        for i, j in pairs:
-            bright[i].x, bright[i].y = map(float, found[j])
-        return "same", found
+        # Same ions.  The sites stay where they are: these frames were picked
+        # for looking different, so their average is no unbiased measurement
+        # of a crystal that did not change (the stable average re-measures it,
+        # see _verify)
+        return "same", old
 
     def _check_dim(self, t, events) -> None:
         lv = [s.level for s in self.sites if s.state == BRIGHT and np.isfinite(s.level)]
@@ -1332,7 +1657,7 @@ class ChainTracker:
         """Debounce: True once ``key`` has persisted long enough (same configuration)."""
         cfg = self.cfg
         p = self._pending
-        config_key = key[0] in ("RECONFIG", "APPEAR", "REFORM", "RESTORE", "AFTER_HOLD")
+        config_key = key[0] in ("CHANGE", "APPEAR", "REFORM", "RESTORE", "AFTER_HOLD")
         same = p is not None and p.key == key
         if same and config_key:
             if _same_configuration(p.reliable(), spots, 1.5 * cfg.match_radius):
@@ -1345,7 +1670,8 @@ class ChainTracker:
                 p.misses += 1
                 same = p.frames >= 2 and p.misses < 2
         if not same:
-            self._pending = _Pending(key, t, 1, spots.copy())
+            self._pending = _Pending(key, t, 1, spots.copy(),
+                                     site_pos=self.positions().copy() if self.sites else None)
             return cfg.confirm_frames <= 1 and cfg.confirm_time <= 0
         p.frames += 1
         if config_key:
@@ -1372,6 +1698,11 @@ class ChainTracker:
         a_f = max(min(1.0, dt / 0.3), 1.0 / c["n"])
         a_s = max(min(1.0, dt / 30.0), 1.0 / c["n"])
         c["fast"] += a_f * (f2 - c["fast"])
+        if c["n"] * min(1.0, dt / 0.3) < 3.0:
+            # warming up (see _faint_ions)
+            c["slow"] += a_s * (f2 - c["slow"])
+            c["active"] = []
+            return []
         excess = c["fast"] - c["slow"]
         sig = np.broadcast_to(np.asarray(noise, np.float64), excess.shape) * \
             math.sqrt(a_f / (2.0 - a_f) + a_s / (2.0 - a_s))

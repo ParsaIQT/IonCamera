@@ -36,11 +36,11 @@ import numpy as np
 from ioncam import __version__
 from ioncam.analysis.chain import equilibrium_positions, fit_chain
 from ioncam.analysis.detection import DetectionResult, Detector
-from ioncam.analysis.fitting import fit_gaussians
+from ioncam.analysis.fitting import PSF, fit_gaussians
 from ioncam.analysis.readout import (PlanError, ReadoutPlan, binning_advice,
                                      compare_grabber_frame, fit_threshold, plan_readout,
                                      verify_plan)
-from ioncam.analysis.tracker import ChainTracker, align
+from ioncam.analysis.tracker import ChainTracker, adopt_learned_psf, align
 from ioncam.camera.base import (AcquisitionSettings, AppliedSettings, CameraBase, CameraError,
                                 Frame)
 from ioncam.config import Config
@@ -494,6 +494,9 @@ class IonCamEngine:
         with self._tracker_lock:
             events = self.tracker.update(det, frame.timestamp)
             snap = self.tracker.snapshot()
+            psf_msg = adopt_learned_psf(self.tracker, self.config.detection)
+        if psf_msg:
+            self.events.emit("psf_updated", psf_msg, "info")
         self._detection = det
         self._det_summary = {
             "frame_index": frame.index, "n_spots": len(det.spots), "n_clouds": len(det.clouds),
@@ -794,12 +797,17 @@ class IonCamEngine:
         pos, flux, errors = pos[order], flux[order], errors[order]
         states = [states[i] for i in order]
         if cfg.detection.auto_psf and cal.fit_psf and 0.5 < sigma[0] < 6 and 0.5 < sigma[1] < 6:
-            cfg.detection.psf_sigma = round(float(math.sqrt(sigma[0] * sigma[1])), 4)
+            d = cfg.detection
+            old_psf = PSF.from_sensor(d.psf_sigma, d.psf_halo_fraction, d.psf_halo_sigma)
+            d.psf_sigma = round(float(math.sqrt(sigma[0] * sigma[1])), 4)
             if halo[0] > 0:
                 # (a fit without a significant halo - e.g. read-noise limited -
                 # leaves a halo measured before in place)
-                cfg.detection.psf_halo_fraction = round(float(halo[0]), 4)
-                cfg.detection.psf_halo_sigma = round(float(halo[1]), 4)
+                d.psf_halo_fraction = round(float(halo[0]), 4)
+                d.psf_halo_sigma = round(float(halo[1]), 4)
+            with self._tracker_lock:
+                self.tracker.psf_changed(old_psf, PSF.from_sensor(
+                    d.psf_sigma, d.psf_halo_fraction, d.psf_halo_sigma))
         result = {
             "n_ions": int(len(pos)),
             "n_bright": int(sum(1 for s_ in states if s_ == "bright")),
