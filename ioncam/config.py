@@ -477,6 +477,18 @@ class Config:
         return "\n".join(lines)
 
 
+def config_help() -> Dict[str, Dict[str, str]]:
+    """{section: {key: help}} for every option; the section's description under ""."""
+    out = {}
+    for name, cls in SECTIONS.items():
+        d = {"": SECTION_HELP.get(name, name)}
+        for f in dataclasses.fields(cls):
+            d[f.name] = f.metadata.get("help") or (
+                ACQ_HELP.get(f.name, "") if cls is AcquisitionSettings else "")
+        out[name] = d
+    return out
+
+
 # --------------------------------------------------------------------------
 # helpers
 # --------------------------------------------------------------------------

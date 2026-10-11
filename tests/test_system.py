@@ -382,7 +382,7 @@ def test_gui_smoke(tmp_path):
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     try:
         import pyqtgraph as pg
-        from pyqtgraph.Qt import QtWidgets
+        from pyqtgraph.Qt import QtCore, QtWidgets
         from ioncam.gui.backend import LocalBackend
         from ioncam.gui.main_window import MainWindow
         app = pg.mkQApp("ioncam-test")
@@ -451,6 +451,44 @@ def test_gui_smoke(tmp_path):
             app.processEvents()
             time.sleep(0.01)
         assert engine.sim_scene().cfg.trap_angle_deg == 45.0
+        # overlays one kind at a time: the ROIs go, the ion markers stay
+        win._set_overlay("rois", False)
+        assert not win.image._rects and not win.overlay_buttons["rois"].isChecked()
+        win._set_overlay("rois", True)
+        assert any(isinstance(it, pg.TextItem) for it in win.image._rects)
+        # what can run now: nothing to abort while idle
+        assert win.act["live"].isEnabled() and not win.act["abort"].isEnabled()
+        # the event log filtered by severity and text
+        win.events.add_events([{"id": 10 ** 6, "time": "x 12:00:00", "kind": "k1",
+                                "severity": "alarm", "message": "boom"},
+                               {"id": 10 ** 6 + 1, "time": "x 12:00:01", "kind": "k2",
+                                "severity": "info", "message": "fine"}])
+        win.events.set_filter(min_severity=2)
+        assert all("boom" in win.events.item(i).text() for i in range(win.events.count()))
+        win.events.set_filter(min_severity=0, text="fine")
+        assert win.events.count() == 1
+        # the image on screen, saved with its geometry and settings
+        path = win.save_image(tmp_path / "frame.npy")
+        assert np.load(path).shape == win.image._last[0].shape
+        assert (tmp_path / "frame.json").exists()
+        # light and dark theme
+        win.set_theme("light")
+        win.set_theme("dark")
+        # the settings dialog changes an option at run time
+        from ioncam.gui.main_window import ConfigDialog
+        dlg = ConfigDialog(win, backend.call("get_config").result(10),
+                           backend.call("get_config_help").result(10))
+        items = dlg.tree.findItems("verify_frames", QtCore.Qt.MatchFlag.MatchExactly |
+                                   QtCore.Qt.MatchFlag.MatchRecursive, 0)
+        assert items and items[0].toolTip(1)
+        items[0].setText(1, "150")
+        dlg._apply()
+        t = time.time()
+        while time.time() - t < 5.0 and engine.config.calibration.verify_frames != 150:
+            app.processEvents()
+            time.sleep(0.01)
+        assert engine.config.calibration.verify_frames == 150
+        dlg.close()
         win.close()
     finally:
         backend.close()

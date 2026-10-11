@@ -56,8 +56,37 @@ aqctl_ioncam --simulate        # headless RPC server with the simulator
 pytest                         # 124 tests (~3 min), all on the simulator / emulated SDK
 ```
 
-In the GUI the image brightness follows every frame (**Auto** under the histogram). Drag
-the histogram's level handles - or untick Auto, or right-click the histogram → *Auto
+### The GUI
+
+On top, the crystal status in big colour-coded letters (green stable, orange changing,
+red melted or no light, blue tracking on hold), with chips for the camera mode (or the
+step of a running procedure), the sensor temperature, the frame rate and who has
+control. On the left the image over each ion's brightness trace; on the right the tabs,
+in the order of the work:
+
+| tab | what is there |
+|---|---|
+| **Live** | start / stop, exposure, EM gain, binning, **Snap** (average N frames and save them), the camera ROI (crop to the view, around the ions with a margin, full sensor), display (colormap, levels, orientation) and the live readout electronics (amplifier, horizontal and vertical speed, pre-amp, frame transfer) |
+| **Ions** | the crystal at a glance (bright, dark, state, chain scale and angle, PSF σ, noise), every site, tracking (accept as reference, forget, hold, locate), the learned background, a loading alert |
+| **Readout** | state chips (plan valid or outdated, armed, shots, verified); calibrate and run (Arm, Disarm); adjust by hand; the results: shot histograms with the fidelity estimate, the plan, the ARTIQ snippet |
+| **Events** | the event log, filtered by severity or text; save it to a file |
+| **Camera** | cooling, the control lease, configuration (**Settings...**: every option with its help, changed at run time; **Save configuration...**), camera information |
+| **Simulation** | (simulated camera) ions, the lab (lasers, repumper, oven, camera moves, triggers) and the realism knobs |
+
+The toolbar holds what is needed from everywhere - Live, Stop, Snap, Learn background,
+Hold, Locate, Calibrate + arm, Verify, Arm, Disarm, Abort, and save image, settings and
+the dark / light theme - with what cannot run now greyed out (Abort only while a
+procedure runs). The bar above the image: fit, zoom to the ions, what to show (raw,
+background removed, the learned background), which overlays (markers, numbers, ROIs,
+detected spots) and save the image (the raw data as `.npy` / `.csv` with a `.json` of
+its geometry and camera settings, or the view as `.png`). Keyboard shortcuts (**F1**
+lists them): F5 live, F6 stop, Ctrl+K calibrate + arm, Ctrl+L locate, Ctrl+Shift+V
+verify, Ctrl+R arm, Ctrl+D disarm, Esc abort, Ctrl+B learn background, Ctrl+H hold,
+Ctrl+S save image, Ctrl+0 fit, Ctrl+I zoom to the ions, Ctrl+T theme, Ctrl+, settings.
+The theme and the window layout are kept between sessions.
+
+The image brightness follows every frame (**Auto** under the histogram). Drag the
+histogram's level handles - or untick Auto, or right-click the histogram → *Auto
 levels* - and the levels stay exactly where you put them; **Fit** sets them to the
 current frame once.
 
@@ -133,8 +162,9 @@ with their docstrings):
 | `hold_tracking(reason, timeout)` / `resume_tracking()` | "ions will move on purpose" (shuttling, camera) |
 | `take_control(owner, reason, timeout)` / `release_control(owner)` | advisory lease shown in all GUIs |
 | `start_live(**settings)` / `set_live(...)` / `set_exposure` / `set_em_gain` / `set_roi` / `stop()` | live video |
-| `get_frame(since_index, bin, roi, view)` | newest image (raw orientation); `view="corrected"`: background removed, as the detector sees it |
+| `get_frame(since_index, bin, roi, view)` | newest image (raw orientation); `view="corrected"`: background removed, as the detector sees it; `view="background"`: the learned background |
 | `learn_background(n, mask_ions)` / `get_background()` / `clear_background()` | learn / inspect / forget the static surface light (see below) |
+| `get_config()` / `get_config_help()` / `set_config(section, key, value)` / `save_config(path)` | every option, what it means, change it at run time, write a commented file |
 | `sim_*` | drive the simulated trap: ions, lasers, repumper, oven, camera moves, triggers; `sim_set_params()` for surface, optics and light |
 
 Long calls run as coroutines on the server (`allow_parallel`), so one client waiting for
@@ -281,6 +311,7 @@ re-computes containment and crosstalk at once:
   ROI with it - on screen, through the display rotation. The Grabber ROI numbers stay
   the same (they are frame coordinates); the ions shift the other way inside them, at
   4×4 binning by a quarter super-pixel per step. An armed readout is re-armed.
+* **Undo moves**: back to where the plan put the AQROI.
 * **Re-plan**: plan again with the binning set above, without a new locate.
 * **Use this AQROI**: place the ROIs inside an AQROI you type in (sensor px, `x1`/`y1`
   exclusive, its size a multiple of the binning).
@@ -508,4 +539,6 @@ per ion, blurred PSF with halo, laser scatter, surface defects):
 - the Andor driver's exact SDK call sequence on the emulated SDK;
 - a full stack over real sipyco RPC with concurrent clients;
 - a headless GUI test (levels set by hand stay put, the D-pad direction through the
-  display rotation, ROI labels, the shot histograms, the trap-rotation buttons).
+  display rotation, ROI labels, the shot histograms, the trap-rotation buttons, the
+  overlays one kind at a time, the actions that can run, the event filter, saving the
+  image, both themes, an option changed in the settings dialog).

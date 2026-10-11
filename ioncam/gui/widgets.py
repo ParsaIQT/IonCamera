@@ -8,15 +8,17 @@ import numpy as np
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
+from ioncam.gui import style
+
 pg.setConfigOptions(imageAxisOrder="row-major", antialias=True)
 
 STATE_COLORS = {
-    "stable": "#1b8a3a", "empty": "#555555", "changing": "#c77700", "melted": "#b03a2e",
-    "no_fluorescence": "#b03a2e", "hold": "#2e5fa8",
+    "stable": "#1d8a4b", "empty": "#4a515e", "changing": "#c27a0e", "melted": "#bf3a30",
+    "no_fluorescence": "#bf3a30", "hold": "#2f62b0",
 }
-SEVERITY_COLORS = {"info": "#1b6b2f", "warning": "#a65f00", "alarm": "#b0201a"}
-TEMP_COLORS = {"stabilized": "#1b8a3a", "not_stabilized": "#c77700", "not_reached": "#c77700",
-               "drift": "#c77700", "off": "#777777"}
+SEVERITY_ORDER = {"info": 0, "warning": 1, "alarm": 2}
+TEMP_TONES = {"stabilized": "good", "not_stabilized": "warn", "not_reached": "warn",
+              "drift": "warn", "off": ""}
 ION_COLORS = [(31, 119, 180), (255, 127, 14), (44, 160, 44), (214, 39, 40), (148, 103, 189),
               (140, 86, 75), (227, 119, 194), (127, 127, 127), (188, 189, 34), (23, 190, 207)]
 
@@ -68,7 +70,7 @@ class ImagePanel(QtWidgets.QWidget):
         self.cfg = display_cfg
         lay = QtWidgets.QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
-        self.plot = pg.PlotWidget()
+        self.plot = pg.PlotWidget(background=style.current()["canvas"])
         self.plot.setAspectLocked(True)
         self.plot.setMenuEnabled(True)
         self.plot.hideAxis("left")
@@ -81,6 +83,7 @@ class ImagePanel(QtWidgets.QWidget):
         self.img.setParentItem(self.group)
         self.hist = pg.HistogramLUTWidget(image=self.img)
         self.hist.setMaximumWidth(110)
+        self.hist.setBackground(style.current()["canvas"])
         lay.addWidget(self.plot, 1)
         # brightness levels: automatic (follow every frame) or set by hand -
         # dragging the histogram handles switches to "by hand" and the levels
@@ -136,8 +139,10 @@ class ImagePanel(QtWidgets.QWidget):
         self._rects = []
         self._roi_items = []
         self._plan = None
+        self._sites = ([], (), (), None)
         self.auto_levels = True
-        self.show_overlays = True
+        self.show_overlays = True          # all overlays (each kind also on its own:)
+        self.show = {"markers": True, "labels": True, "spots": True, "rois": True}
         self._geometry = None
         self._last = None
         self.set_orientation(display_cfg.rotation, display_cfg.flip_x, display_cfg.flip_y)
@@ -145,6 +150,32 @@ class ImagePanel(QtWidgets.QWidget):
         self.plot.scene().sigMouseMoved.connect(self._mouse_moved)
 
     # -- appearance --------------------------------------------------------------------
+    def apply_theme(self):
+        bg = style.current()["canvas"]
+        self.plot.setBackground(bg)
+        self.hist.setBackground(bg)
+
+    def set_overlay(self, what, on):
+        """Show or hide one kind of overlay: markers, labels, spots or rois."""
+        self.show[what] = bool(on)
+        self.set_sites(*self._sites)
+        self.set_plan(self._plan)
+
+    def fit_view(self):
+        """Zoom out to the whole image."""
+        self.vb.autoRange(padding=0.02)
+
+    def zoom_to(self, points, margin=12.0):
+        """Zoom to the sensor points ``[(x, y), ...]`` plus ``margin`` px."""
+        pts = np.asarray(points, float).reshape(-1, 2)
+        if not len(pts):
+            return False
+        x0, y0 = pts.min(axis=0) - margin
+        x1, y1 = pts.max(axis=0) + margin
+        r = self.group.mapRectToParent(QtCore.QRectF(x0, y0, x1 - x0, y1 - y0))
+        self.vb.setRange(rect=r, padding=0.0)
+        return True
+
     def set_colormap(self, name):
         try:
             cmap = pg.colormap.get(name)
@@ -256,7 +287,8 @@ class ImagePanel(QtWidgets.QWidget):
     def set_sites(self, sites, spots=(), clouds=(), marker_radius=None):
         """Ion markers: circles holding ``marker_radius``'s share of each ion's
         light (radius in sensor px, from the server; fixed screen size without)."""
-        vis = self.show_overlays
+        self._sites = (sites, spots, clouds, marker_radius)
+        vis = self.show_overlays and self.show["markers"]
         b = [(s["x"], s["y"]) for s in sites if s["state"] == "bright"]
         d = [(s["x"], s["y"]) for s in sites if s["state"] != "bright"]
         size = dict(size=2.0 * float(marker_radius), pxMode=False) if marker_radius else \
@@ -265,10 +297,12 @@ class ImagePanel(QtWidgets.QWidget):
                                **size)
         self.sc_dark.setData(pos=np.array(d).reshape(-1, 2) if vis else np.zeros((0, 2)),
                              **size)
+        vis_spots = self.show_overlays and self.show["spots"]
         self.sc_spots.setData(pos=np.array([(s["x"], s["y"]) for s in spots]).reshape(-1, 2)
-                              if vis else np.zeros((0, 2)))
+                              if vis_spots else np.zeros((0, 2)))
         self.sc_clouds.setData(pos=np.array([(s["x"], s["y"]) for s in clouds]).reshape(-1, 2)
-                               if vis else np.zeros((0, 2)))
+                               if vis_spots else np.zeros((0, 2)))
+        vis = self.show_overlays and self.show["labels"]
         n = len(sites) if vis and len(sites) <= 40 else 0
         while len(self._labels) < n:
             t = pg.TextItem("", color="#e8ffe8", anchor=self._label_anchor())
@@ -293,7 +327,7 @@ class ImagePanel(QtWidgets.QWidget):
             if r.scene() is not None:
                 r.scene().removeItem(r)
         self._rects = []
-        if not plan or not self.show_overlays:
+        if not plan or not self.show_overlays or not self.show["rois"]:
             return
         x0, y0, x1, y1 = plan["aqroi"]
         hb, vb = plan["binning"]
@@ -401,15 +435,19 @@ class ImagePanel(QtWidgets.QWidget):
 
 
 class StatusBanner(QtWidgets.QFrame):
-    """Big, colour-coded crystal status for across-the-lab readability."""
+    """Big, colour-coded crystal status for across-the-lab readability, with
+    chips for the camera mode (and the procedure step), the sensor
+    temperature, the frame rate and the control lease."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFrameShape(QtWidgets.QFrame.Shape.StyledPanel)
+        self.setObjectName("banner")
         lay = QtWidgets.QHBoxLayout(self)
+        lay.setContentsMargins(18, 8, 14, 8)
+        lay.setSpacing(8)
         self.count = QtWidgets.QLabel("- ions")
         f = self.count.font()
-        f.setPointSize(26)
+        f.setPointSize(24)
         f.setBold(True)
         self.count.setFont(f)
         self.state = QtWidgets.QLabel("")
@@ -421,15 +459,29 @@ class StatusBanner(QtWidgets.QFrame):
         self.fps = QtWidgets.QLabel("")
         self.control = QtWidgets.QLabel("")
         lay.addWidget(self.count)
-        lay.addSpacing(12)
+        lay.addSpacing(14)
         lay.addWidget(self.state, 1)
-        right = QtWidgets.QVBoxLayout()
         for w in (self.mode, self.temp, self.fps, self.control):
-            w.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
-            right.addWidget(w)
-        lay.addLayout(right)
+            w.setProperty("role", "bchip")
+            w.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            lay.addWidget(w)
+        self.control.hide()
         self._flash_until = 0.0
-        self._color = "#555555"
+        self._color = None
+        self._paint("#4a515e")
+
+    def _paint(self, color):
+        if color == self._color:
+            return
+        self._color = color
+        c = QtGui.QColor(color)
+        self.setStyleSheet(
+            "QFrame#banner {{ border-radius: 10px; background: qlineargradient(x1:0, y1:0, "
+            "x2:1, y2:0, stop:0 {}, stop:1 {}); }}"
+            "QFrame#banner QLabel {{ color: white; background: transparent; }}"
+            "QFrame#banner QLabel[role=\"bchip\"] {{ background: rgba(255, 255, 255, 38); "
+            "border: 1px solid rgba(255, 255, 255, 60); border-radius: 11px; "
+            "padding: 2px 10px; }}".format(c.lighter(112).name(), c.darker(108).name()))
 
     def flash(self, seconds=6.0):
         self._flash_until = time.time() + seconds
@@ -448,29 +500,47 @@ class StatusBanner(QtWidgets.QFrame):
         if ions.get("stable") and state == "stable":
             desc += " ({:.0f} s)".format(ions.get("stable_for") or 0)
         if ions.get("n_clouds"):
-            desc += "  + hot cloud"
+            desc += "  ·  hot cloud"
         lvl = ions.get("fluorescence_level")
         if lvl is not None and state == "stable":
-            desc += "  |  fluorescence {:.0%}".format(lvl)
+            desc += "  ·  fluorescence {:.0%}".format(lvl)
         self.state.setText(desc)
-        color = STATE_COLORS.get(state, "#555555")
+        color = STATE_COLORS.get(state, "#4a515e")
         if time.time() < self._flash_until:
             color = "#d0211a"
-        if color != self._color:
-            self.setStyleSheet("StatusBanner {{ background: {}; }} QLabel {{ color: white; }}"
-                               .format(color))
-            self._color = color
+        self._paint(color)
         proc = st.get("procedure")
         mode = (st.get("mode") or "").upper()
         if proc:
             mode += ": " + proc.get("step", proc.get("name", ""))
         self.mode.setText(mode)
         t, ts = st.get("temperature"), st.get("temperature_status", "")
-        self.temp.setText("{} C  ({})".format("--" if t is None else "{:.1f}".format(t),
+        self.temp.setText("{} °C · {}".format("--" if t is None else "{:.1f}".format(t),
                                               ts.replace("_", " ")))
-        self.fps.setText("{:.1f} fps  frame {}".format(st.get("fps") or 0, st.get("frame_index")))
+        self.fps.setText("{:.0f} fps · #{}".format(st.get("fps") or 0, st.get("frame_index")))
         c = st.get("control")
         self.control.setText("controlled by {}".format(c["owner"]) if c else "")
+        self.control.setVisible(bool(c))
+
+
+class StatTile(QtWidgets.QFrame):
+    """A number with a caption (crystal summary)."""
+
+    def __init__(self, caption, parent=None):
+        super().__init__(parent)
+        self.setProperty("role", "tile")
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(10, 6, 10, 6)
+        lay.setSpacing(0)
+        self.value = QtWidgets.QLabel("-")
+        self.value.setProperty("role", "tile-value")
+        self.caption = QtWidgets.QLabel(caption)
+        self.caption.setProperty("role", "tile-label")
+        lay.addWidget(self.value)
+        lay.addWidget(self.caption)
+
+    def set(self, value):
+        self.value.setText(str(value))
 
 
 class TracePlot(pg.PlotWidget):
@@ -479,19 +549,29 @@ class TracePlot(pg.PlotWidget):
     def __init__(self, seconds=120.0, parent=None):
         super().__init__(parent)
         self.seconds = seconds
+        self.paused = False
         self.setLabel("left", "ion brightness (rel.)")
         self.setLabel("bottom", "time [s]")
-        self.showGrid(x=True, y=True, alpha=0.3)
+        self.showGrid(x=True, y=True, alpha=0.25)
         self.addLegend(offset=(5, 5))
-        self.hist = deque(maxlen=20000)
+        self.hist = deque(maxlen=50000)
         self.curves = []
         self.setYRange(-0.1, 1.6)
+        style.style_plot(self)
+
+    def apply_theme(self):
+        style.style_plot(self)
 
     def add(self, t, sites):
         self.hist.append((t, [s.get("level", 0.0) for s in sites]))
 
+    def clear_history(self):
+        self.hist.clear()
+        for c in self.curves:
+            c.setData([], [])
+
     def redraw(self):
-        if not self.hist:
+        if not self.hist or self.paused:
             return
         t_end = self.hist[-1][0]
         pts = [(t - t_end, lv) for t, lv in self.hist if t > t_end - self.seconds]
@@ -508,21 +588,64 @@ class TracePlot(pg.PlotWidget):
 
 
 class EventList(QtWidgets.QListWidget):
+    """The event stream, newest first; shows the events at or above a severity
+    that contain a text."""
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAlternatingRowColors(True)
         self.setWordWrap(True)
+        self.events = deque(maxlen=5000)
+        self.min_severity = 0
+        self.text = ""
+
+    @staticmethod
+    def _line(e):
+        return "{}  {}".format(e.get("time", "")[-8:], e.get("message", e.get("kind")))
+
+    def _shown(self, e):
+        return SEVERITY_ORDER.get(e.get("severity"), 0) >= self.min_severity and (
+            not self.text or self.text.lower() in self._line(e).lower() or
+            self.text.lower() in str(e.get("kind", "")).lower())
+
+    def _item(self, e):
+        t = style.current()
+        item = QtWidgets.QListWidgetItem(self._line(e))
+        color = {"info": t["text"], "warning": t["warning"], "alarm": t["danger"]}.get(
+            e.get("severity"), t["text"])
+        item.setForeground(QtGui.QBrush(QtGui.QColor(color)))
+        item.setToolTip("{} ({})".format(e.get("kind"), e.get("severity")))
+        return item
 
     def add_events(self, events):
         for e in events:
-            item = QtWidgets.QListWidgetItem("{}  {}".format(e.get("time", "")[-8:],
-                                                             e.get("message", e.get("kind"))))
-            item.setForeground(QtGui.QBrush(QtGui.QColor(
-                SEVERITY_COLORS.get(e.get("severity"), "#000000"))))
-            item.setToolTip("{} ({})".format(e.get("kind"), e.get("severity")))
-            self.insertItem(0, item)
+            self.events.append(e)
+            if self._shown(e):
+                self.insertItem(0, self._item(e))
         while self.count() > 1000:
             self.takeItem(self.count() - 1)
+
+    def set_filter(self, min_severity=None, text=None):
+        if min_severity is not None:
+            self.min_severity = int(min_severity)
+        if text is not None:
+            self.text = str(text)
+        self.refill()
+
+    def refill(self):
+        self.clear()
+        shown = [e for e in self.events if self._shown(e)][-1000:]
+        for e in shown:
+            self.insertItem(0, self._item(e))
+
+    def clear_all(self):
+        self.events.clear()
+        self.clear()
+
+    def as_text(self):
+        return "\n".join("{}  [{}] {}: {}".format(e.get("time", ""), e.get("severity", ""),
+                                                  e.get("kind", ""), e.get("message", ""))
+                         for e in self.events)
 
 
 class SiteTable(QtWidgets.QTableWidget):
@@ -532,10 +655,13 @@ class SiteTable(QtWidgets.QTableWidget):
         super().__init__(0, len(self.COLS), parent)
         self.setHorizontalHeaderLabels(self.COLS)
         self.verticalHeader().setVisible(False)
+        self.setAlternatingRowColors(True)
+        self.setShowGrid(False)
         self.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         self.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
 
     def set_sites(self, sites):
+        t = style.current()
         self.setRowCount(len(sites))
         for r, s in enumerate(sites):
             vals = [s["index"], "{:.2f}".format(s["x"]), "{:.2f}".format(s["y"]),
@@ -545,7 +671,10 @@ class SiteTable(QtWidgets.QTableWidget):
                 it = QtWidgets.QTableWidgetItem(str(v))
                 if c == 3:
                     it.setForeground(QtGui.QBrush(QtGui.QColor(
-                        "#1b8a3a" if s["state"] == "bright" else "#b0201a")))
+                        t["success"] if s["state"] == "bright" else t["danger"])))
+                elif c == 0:
+                    it.setForeground(QtGui.QBrush(QtGui.QColor(
+                        *ION_COLORS[int(s["index"]) % len(ION_COLORS)])))
                 self.setItem(r, c, it)
 
 
@@ -566,6 +695,10 @@ class ShotHistogramPlot(pg.PlotWidget):
         self.lines = []
         self.log = False
         self._last = None
+        style.style_plot(self)
+
+    def apply_theme(self):
+        style.style_plot(self)
 
     @staticmethod
     def color(label):

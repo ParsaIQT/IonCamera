@@ -28,6 +28,7 @@ import numpy as np
 from ioncam import version_string
 from ioncam.analysis.readout import grabber_roi_sums
 from ioncam.camera.base import AcquisitionSettings
+from ioncam.config import config_help
 
 
 def _plain(o):
@@ -158,7 +159,9 @@ class IonCamAPI:
         ``roi`` = [x0, y0, x1, y1] in sensor pixels crops the image.
         ``view="corrected"``: the analysed live frame with the background
         model removed (learned static background, scatter profile, bias) -
-        float32 - as the ion detection sees it; other frames stay raw."""
+        float32 - as the ion detection sees it; other frames stay raw.
+        ``view="background"``: the learned static background for the frame's
+        pixels (float32, counts at its brightness now; zero where none was learned)."""
         f = self._engine.latest_frame(int(since_index))
         if f is None:
             return None
@@ -166,7 +169,13 @@ class IonCamAPI:
         out = {"index": f.index, "t": f.timestamp, "tag": f.tag, "exposure": a.exposure,
                "em_gain": a.em_gain, "view": "raw"}
         img, x0, y0, hb, vb = f.data, f.x0, f.y0, f.hbin, f.vbin
-        if view == "corrected" and f.tag == "live":
+        if view == "background":
+            sb = self._engine.detector.static_background
+            m = sb.for_frame(f) if sb is not None else None
+            img = np.zeros(f.data.shape, np.float32) if m is None else \
+                (m * np.float32(a.gain_factor * sb.scale)).astype(np.float32)
+            out["view"] = "background"
+        elif view == "corrected" and f.tag == "live":
             det = self._engine.last_detection()
             if det is None or det.frame_index <= int(since_index):
                 return None
@@ -441,6 +450,11 @@ class IonCamAPI:
     def get_config(self):
         """The whole configuration as a dict of sections."""
         return _plain(self._engine.config.to_dict())
+
+    def get_config_help(self):
+        """What every configuration option means: {section: {key: help}}, the
+        section's own description under ``""``."""
+        return config_help()
 
     async def set_config(self, section, key, value):
         """Change one configuration option at runtime (not saved)."""

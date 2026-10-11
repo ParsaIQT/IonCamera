@@ -39,11 +39,13 @@ def _bind(args):
 def show(backend):
     """Create the window for ``backend`` and run the Qt event loop."""
     import pyqtgraph as pg
+    from pyqtgraph.Qt import QtCore
     from ioncam.gui.main_window import MainWindow
     app = pg.mkQApp("ioncam")
     config = backend.call("get_config").result(30)
     info = backend.call("get_info").result(30)
-    win = MainWindow(backend, config, info)
+    # the theme and the window layout are kept between sessions
+    win = MainWindow(backend, config, info, settings=QtCore.QSettings("ioncam", "ioncam_gui"))
     win.show()
     pg.exec()
     return app
