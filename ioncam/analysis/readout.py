@@ -204,113 +204,171 @@ def _roi_limits(sx, sy, hb, vb):
             int(min(12, max(2, math.ceil(6.0 * sy / vb) + 1))))
 
 
+def _intervals(c, sizes, origin, binning, lo, hi):
+    """Super-pixel intervals ``[a, a + s)`` holding super-pixel ``c`` (``s`` in
+    ``sizes``, ``a`` from ``c - s + 1`` to ``c``) whose sensor extent lies
+    inside ``[lo, hi)``, ordered by size, then start: ``(starts, sizes)``."""
+    starts, lens = [], []
+    for s in sizes:
+        for a in range(c - s + 1, c + 1):
+            x0 = origin + a * binning
+            if lo <= x0 and x0 + s * binning <= hi:
+                starts.append(a)
+                lens.append(s)
+    return np.array(starts, dtype=np.int64), np.array(lens, dtype=np.int64)
+
+
+class _Candidates:
+    """The candidate ROIs of one ion, as arrays in the planner's order (width,
+    left, height, bottom): ``score, a, r, w, h, cont, xt``."""
+    __slots__ = ("score", "a", "r", "w", "h", "cont", "xt")
+
+    def __init__(self, score, a, r, w, h, cont, xt):
+        self.score, self.a, self.r, self.w, self.h = score, a, r, w, h
+        self.cont, self.xt = cont, xt
+
+    def __len__(self):
+        return len(self.score)
+
+    def pick(self, k) -> tuple:
+        """Candidate ``k`` as ``(score, a, r, w, h, cont, xt)`` (plain Python numbers)."""
+        return (float(self.score[k]), int(self.a[k]), int(self.r[k]), int(self.w[k]),
+                int(self.h[k]), float(self.cont[k]), float(self.xt[k]))
+
+
 def _ion_candidates(i, pos, sx, sy, px, py, hb, vb, bounds, max_w, max_h, fixed=None,
-                    halo=(0.0, 0.0)):
+                    halo=(0.0, 0.0)) -> _Candidates:
     """All ROIs (superpixel rects inside ``bounds`` = (x0, y0, x1, y1), sensor
-    px: the sensor or a fixed AQROI) containing ion i's superpixel, with scores."""
+    px: the sensor or a fixed AQROI) containing ion i's superpixel, with scores:
+    the light of ion i inside (containment), the most light of any other ion
+    inside (crosstalk) - computed for all of them at once, as separable
+    products of the 1D fractions of the PSF core (and halo)."""
     x, y = pos[i]
     bx0, by0, bx1, by1 = bounds
     ci = int(math.floor((x + 0.5 - px) / hb))
     ri = int(math.floor((y + 0.5 - py) / vb))
     widths = [fixed[0]] if fixed else range(1, max_w + 1)
     heights = [fixed[1]] if fixed else range(1, max_h + 1)
+    a, w = _intervals(ci, widths, px, hb, bx0, bx1)
+    r, h = _intervals(ri, heights, py, vb, by0, by1)
+    kx, ky = len(a), len(r)
+    if kx == 0 or ky == 0:
+        e = np.zeros(0)
+        return _Candidates(e, e.astype(np.int64), e.astype(np.int64), e.astype(np.int64),
+                           e.astype(np.int64), e, e)
     f, s_h = float(halo[0]), float(halo[1])
     use_halo = f > 0 and s_h > 0
-    out = []
     others = np.delete(pos, i, axis=0)
-    for w in widths:
-        for a in range(ci - w + 1, ci + 1):
-            x0 = px + a * hb
-            if x0 < bx0 or x0 + w * hb > bx1:
-                continue
-            xa, xb = x0 - 0.5, x0 + w * hb - 0.5
-            fx_i = float(_frac(xa, xb, x, sx))
-            fx_o = _frac(xa, xb, others[:, 0], sx) if len(others) else None
-            if use_halo:
-                hx_i = float(_frac(xa, xb, x, s_h))
-                hx_o = _frac(xa, xb, others[:, 0], s_h) if len(others) else None
-            for h in heights:
-                for r in range(ri - h + 1, ri + 1):
-                    y0 = py + r * vb
-                    if y0 < by0 or y0 + h * vb > by1:
-                        continue
-                    ya, yb = y0 - 0.5, y0 + h * vb - 0.5
-                    cont = fx_i * float(_frac(ya, yb, y, sy))
-                    if use_halo:
-                        cont = (1.0 - f) * cont + f * hx_i * float(_frac(ya, yb, y, s_h))
-                    xt = 0.0
-                    if fx_o is not None:
-                        lx = fx_o * _frac(ya, yb, others[:, 1], sy)
-                        if use_halo:
-                            lx = (1.0 - f) * lx + f * hx_o * _frac(ya, yb, others[:, 1], s_h)
-                        xt = float(np.max(lx))
-                    score = cont - CROSSTALK_WEIGHT * xt - AREA_PENALTY * w * h
-                    out.append((score, a, r, w, h, cont, xt))
-    return out
+    x0 = px + a * hb
+    xa, xb = x0 - 0.5, x0 + w * hb - 0.5
+    y0 = py + r * vb
+    ya, yb = y0 - 0.5, y0 + h * vb - 0.5
+    cont = _frac(xa, xb, x, sx)[:, None] * _frac(ya, yb, y, sy)[None, :]
+    if use_halo:
+        cont = (1.0 - f) * cont + f * _frac(xa, xb, x, s_h)[:, None] * \
+            _frac(ya, yb, y, s_h)[None, :]
+    if len(others):
+        lx = _frac(xa[:, None], xb[:, None], others[None, :, 0], sx)[:, None, :] * \
+            _frac(ya[:, None], yb[:, None], others[None, :, 1], sy)[None, :, :]
+        if use_halo:
+            lx = (1.0 - f) * lx + \
+                f * _frac(xa[:, None], xb[:, None], others[None, :, 0], s_h)[:, None, :] * \
+                _frac(ya[:, None], yb[:, None], others[None, :, 1], s_h)[None, :, :]
+        xt = lx.max(axis=2)
+    else:
+        xt = np.zeros((kx, ky))
+    score = cont - CROSSTALK_WEIGHT * xt - AREA_PENALTY * w[:, None] * h[None, :]
+    return _Candidates(score.ravel(), np.repeat(a, ky), np.tile(r, kx), np.repeat(w, ky),
+                       np.tile(h, kx), cont.ravel(), xt.ravel())
+
+
+def _all_candidates(pos, sx, sy, px, py, hb, vb, bounds, fixed=None, halo=(0.0, 0.0)):
+    """``_ion_candidates`` of every ion for the grid phase ``(px, py)``."""
+    max_w, max_h = _roi_limits(sx, sy, hb, vb)
+    return [_ion_candidates(i, pos, sx, sy, px, py, hb, vb, bounds, max_w, max_h, fixed, halo)
+            for i in range(len(pos))]
 
 
 def _best_layout(pos, sx, sy, px, py, hb, vb, bounds, fixed=None, along_x=None,
-                 halo=(0.0, 0.0)):
+                 halo=(0.0, 0.0), cands=None):
     """Per-ion ROIs for one grid phase: maximise the worst ion score, no overlaps.
 
     Ions are processed along the dominant chain axis; a bottleneck dynamic
     programme over the right edge of the previous ROI guarantees disjoint
-    ROIs (exact for chains, also works for zig-zags with distinct columns)."""
+    ROIs (exact for chains, also works for zig-zags with distinct columns).
+    ``cands``: the ions' candidates (:func:`_all_candidates`), if known."""
     n = len(pos)
-    max_w, max_h = _roi_limits(sx, sy, hb, vb)
+    if cands is None:
+        cands = _all_candidates(pos, sx, sy, px, py, hb, vb, bounds, fixed, halo)
     if along_x is None:
         along_x = bool(np.ptp(pos[:, 0]) >= np.ptp(pos[:, 1])) if n > 1 else True
     order = np.argsort(pos[:, 0] if along_x else pos[:, 1], kind="stable")
-    cands = []
-    for i in order:
-        c = _ion_candidates(i, pos, sx, sy, px, py, hb, vb, bounds, max_w, max_h, fixed,
-                            halo)
-        if not c:
-            return None
-        cands.append(c)
+    if any(len(cands[i]) == 0 for i in order):
+        return None
     # DP: state = end coordinate (exclusive, in superpixels) along the chain axis
-    # value = (worst score so far, sum of scores) ; back-pointers for the choice
-    states = {-10 ** 9: ((float("inf"), 0.0), None)}
+    # value = (worst score so far, sum of scores) ; back-pointers for the choice.
+    # (dicts keep the insertion order: ties go to the first state / candidate)
+    states = {-10 ** 9: (float("inf"), 0.0)}
     history = []
-    for c in cands:
-        new = {}
-        for (score, a, r, w, h, cont, xt) in c:
-            start, end = (a, a + w) if along_x else (r, r + h)
-            best_prev = None
-            for e, (val, _) in states.items():
-                if e <= start and (best_prev is None or val > states[best_prev][0]):
-                    best_prev = e
-            if best_prev is None:
-                continue
-            pv = states[best_prev][0]
-            val = (min(pv[0], score), pv[1] + score)
-            if end not in new or val > new[end][0]:
-                new[end] = (val, (best_prev, (score, a, r, w, h, cont, xt)))
-        if not new:
+    for i in order:
+        c = cands[i]
+        start = c.a if along_x else c.r
+        end = start + (c.w if along_x else c.h)
+        # best previous state for every start: the first of the best values
+        # among the states ending at or before it
+        prev = {}
+        for s in np.unique(start).tolist():
+            best = None
+            for e, val in states.items():
+                if e <= s and (best is None or val > states[best]):
+                    best = e
+            prev[s] = best
+        ok = np.array([prev[s] is not None for s in start.tolist()], bool)
+        if not ok.any():
             return None
+        idx = np.nonzero(ok)[0]
+        bp = [prev[s] for s in start[idx].tolist()]
+        p0 = np.array([states[e][0] for e in bp])
+        p1 = np.array([states[e][1] for e in bp])
+        sc = c.score[idx]
+        v0 = np.minimum(p0, sc)
+        v1 = p1 + sc
+        ends = end[idx]
+        new = {}
+        # ends in the order they first appear; per end the first candidate with
+        # the lexicographically largest (worst, sum)
+        _, first = np.unique(ends, return_index=True)
+        for k0 in np.sort(first).tolist():
+            e = int(ends[k0])
+            sel = np.nonzero(ends == e)[0]
+            sel = sel[v0[sel] == v0[sel].max()]
+            k = int(sel[np.argmax(v1[sel] == v1[sel].max())])
+            new[e] = ((float(v0[k]), float(v1[k])), (bp[k], c.pick(idx[k])))
         history.append(new)
-        states = {e: (v, None) for e, (v, _) in new.items()}
+        states = {e: v for e, (v, _) in new.items()}
     # backtrack
     end = max(history[-1], key=lambda e: history[-1][e][0])
     worst = history[-1][end][0][0]
     picks = [None] * n
     for k in range(n - 1, -1, -1):
-        prev, choice = history[k][end][1]
+        prev_end, choice = history[k][end][1]
         picks[order[k]] = choice
-        end = prev
+        end = prev_end
     return worst, picks
 
 
-def _independent_layout(pos, sx, sy, px, py, hb, vb, bounds, fixed=None, halo=(0.0, 0.0)):
+def _independent_layout(pos, sx, sy, px, py, hb, vb, bounds, fixed=None, halo=(0.0, 0.0),
+                        cands=None):
     """Every ion its own best ROI for one grid phase, overlaps allowed (for
     ions closer than the binning separates, where no disjoint layout exists)."""
-    max_w, max_h = _roi_limits(sx, sy, hb, vb)
+    if cands is None:
+        cands = _all_candidates(pos, sx, sy, px, py, hb, vb, bounds, fixed, halo)
     picks = []
-    for i in range(len(pos)):
-        c = _ion_candidates(i, pos, sx, sy, px, py, hb, vb, bounds, max_w, max_h, fixed, halo)
-        if not c:
+    for c in cands:
+        if len(c) == 0:
             return None
-        picks.append(max(c))
+        top = np.nonzero(c.score == c.score.max())[0]
+        picks.append(max(c.pick(k) for k in top))
     return min(p[0] for p in picks), picks
 
 
@@ -417,9 +475,19 @@ def plan_readout(positions: Sequence[Sequence[float]], sigma: Tuple[float, float
     dominant = bool(np.ptp(pos[:, 0]) >= np.ptp(pos[:, 1])) if n > 1 else True
     # partition along the chain axis first; for 2D crystals also try the other axis
     layouts = []
+    cache = {}
+
+    def cands(px, py):
+        # the candidates do not depend on the partition axis: computed once a phase
+        if (px, py) not in cache:
+            cache[(px, py)] = _all_candidates(pos, sx, sy, px, py, hbin, vbin, bounds, fixed,
+                                              halo)
+        return cache[(px, py)]
+
     for along_x in (dominant, not dominant):
         for px, py in phases:
-            res = _best_layout(pos, sx, sy, px, py, hbin, vbin, bounds, fixed, along_x, halo)
+            res = _best_layout(pos, sx, sy, px, py, hbin, vbin, bounds, fixed, along_x, halo,
+                               cands(px, py))
             if res is not None:
                 layouts.append((px, py, res))
         if layouts:
@@ -430,7 +498,8 @@ def plan_readout(positions: Sequence[Sequence[float]], sigma: Tuple[float, float
         # overlapping ROIs independently - and the crosstalk is reported, to be
         # measured (e.g. with a SPAM experiment) before thresholding.
         for px, py in phases:
-            res = _independent_layout(pos, sx, sy, px, py, hbin, vbin, bounds, fixed, halo)
+            res = _independent_layout(pos, sx, sy, px, py, hbin, vbin, bounds, fixed, halo,
+                                      cands(px, py))
             if res is not None:
                 layouts.append((px, py, res))
     for px, py, (worst, picks) in layouts:

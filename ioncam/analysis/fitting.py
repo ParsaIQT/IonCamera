@@ -39,11 +39,12 @@ class GaussFit:
     window: tuple = (0, 0, 0, 0)   # (c0, r0, c1, r1): the image region fitted (= model's extent)
 
 
-def _axis_terms(n: int, centers: np.ndarray, sigma: float):
+def _axis_terms(n: int, centers: np.ndarray, sigma: float, start: int = 0):
     """Pixel-integrated 1D Gaussian fractions and their derivatives.
 
-    Returns (E, dE/dc, dE/dsigma), each (N, n) for pixels 0..n-1."""
-    edges = np.arange(n + 1, dtype=float) - 0.5
+    Returns (E, dE/dc, dE/dsigma), each (N, n) for pixels start..start+n-1."""
+    edges = (np.arange(n + 1, dtype=float) - 0.5) if start == 0 else \
+        (np.arange(start, start + n + 1, dtype=float) - 0.5)
     z = (edges[None, :] - centers[:, None]) / sigma           # (N, n+1)
     cdf = ndtr(z)
     pdf = np.exp(-0.5 * z * z) / _SQRT2PI
@@ -54,15 +55,45 @@ def _axis_terms(n: int, centers: np.ndarray, sigma: float):
     return e, de_dc, de_ds
 
 
+def _box(g: np.ndarray, pad: float, w: int, h: int):
+    """Bounding box (c0, r0, c1, r1) of the guesses ``g`` plus ``pad``, on the image."""
+    return (int(max(0, math.floor(g[:, 0].min() - pad))),
+            int(max(0, math.floor(g[:, 1].min() - pad))),
+            int(min(w, math.ceil(g[:, 0].max() + pad) + 1)),
+            int(min(h, math.ceil(g[:, 1].max() + pad) + 1)))
+
+
+def _windows(g: np.ndarray, pad: float, w: int, h: int):
+    """Disjoint image boxes covering every guess +- ``pad``: the guesses are
+    grouped while their boxes overlap, each group fitted in its bounding box
+    (one box - the bounding box of all - for a compact crystal)."""
+    groups = [[i] for i in range(len(g))]
+    while True:
+        boxes = [_box(g[k], pad, w, h) for k in groups]
+        for a in range(len(groups)):
+            for b in range(a + 1, len(groups)):
+                p, q = boxes[a], boxes[b]
+                if p[0] < q[2] and q[0] < p[2] and p[1] < q[3] and q[1] < p[3]:
+                    groups[a] += groups.pop(b)
+                    break
+            else:
+                continue
+            break
+        else:
+            return boxes
+
+
 def fit_gaussians(img: np.ndarray, guesses: Sequence[Sequence[float]], sigma0: float,
                   fit_offset: bool = True, max_nfev: int = 200,
                   margin: float = 4.0, halo: bool = False) -> GaussFit:
     """Jointly fit Gaussian PSFs to ``img`` around initial ``guesses`` ((col, row) list).
 
-    Only a bounding box around the guesses (``margin`` sigmas) is used.  With
-    ``halo`` the PSF is a core plus a broad, isotropic Gaussian halo (fraction
-    and sigma fitted, shared by all ions) - real imaging systems put a
-    significant part of the light into such wings, which is what sets the
+    Only the pixels within ``margin`` sigmas of the guesses are used: the
+    bounding box of a compact crystal, one such box per group of guesses far
+    apart (so spots scattered over the sensor cost no more than a crystal).
+    With ``halo`` the PSF is a core plus a broad, isotropic Gaussian halo
+    (fraction and sigma fitted, shared by all ions) - real imaging systems put
+    a significant part of the light into such wings, which is what sets the
     crosstalk between neighbouring readout ROIs.  The halo is kept only if it
     is significant; otherwise the single-Gaussian fit is returned.
     """
@@ -73,16 +104,18 @@ def fit_gaussians(img: np.ndarray, guesses: Sequence[Sequence[float]], sigma0: f
         raise ValueError("no ions to fit")
     h, w = img.shape
     pad = (max(margin, 9.0) if halo else margin) * sigma0 + 2
-    c0 = int(max(0, math.floor(g[:, 0].min() - pad)))
-    c1 = int(min(w, math.ceil(g[:, 0].max() + pad) + 1))
-    r0 = int(max(0, math.floor(g[:, 1].min() - pad)))
-    r1 = int(min(h, math.ceil(g[:, 1].max() + pad) + 1))
+    c0, r0, c1, r1 = _box(g, pad, w, h)
     data = img[r0:r1, c0:c1]
     hh, ww = data.shape
     gx = g[:, 0] - c0
     gy = g[:, 1] - r0
+    # the fitted windows (frame coordinates relative to (c0, r0)) and their pixels
+    wins = [(a - c0, b - r0, cc - c0, d - r0) for a, b, cc, d in _windows(g, pad, w, h)]
+    parts = [data[b:d, a:cc] for a, b, cc, d in wins]
+    fitted = parts[0].ravel() if len(parts) == 1 else np.concatenate([q.ravel() for q in parts])
+    n_px = fitted.size
 
-    off0 = float(np.median(data)) if fit_offset else 0.0
+    off0 = float(np.median(fitted)) if fit_offset else 0.0
     # initial fluxes from aperture sums
     flux0 = []
     for x, y in zip(gx, gy):
@@ -104,28 +137,33 @@ def fit_gaussians(img: np.ndarray, guesses: Sequence[Sequence[float]], sigma0: f
         return (p[0], p[1], p[2], p[3:3 + n], p[3 + n:3 + 2 * n], p[3 + 2 * n:3 + 3 * n],
                 f_h, s_h)
 
-    def terms(p):
+    def terms(p, win):
         off, sx, sy, fl, xs, ys, f_h, s_h = unpack(p)
-        ex = _axis_terms(ww, xs, sx)
-        ey = _axis_terms(hh, ys, sy)
-        hx = _axis_terms(ww, xs, max(s_h, sx * 1.01)) if halo else None
-        hy = _axis_terms(hh, ys, max(s_h, sy * 1.01)) if halo else None
+        a, b, cc, d = win
+        ex = _axis_terms(cc - a, xs, sx, a)
+        ey = _axis_terms(d - b, ys, sy, b)
+        hx = _axis_terms(cc - a, xs, max(s_h, sx * 1.01), a) if halo else None
+        hy = _axis_terms(d - b, ys, max(s_h, sy * 1.01), b) if halo else None
         return off, sx, sy, fl, xs, ys, f_h, s_h, ex, ey, hx, hy
 
-    def model(p):
-        off, sx, sy, fl, xs, ys, f_h, s_h, ex, ey, hx, hy = terms(p)
+    def model_window(p, win):
+        off, sx, sy, fl, xs, ys, f_h, s_h, ex, ey, hx, hy = terms(p, win)
         m = off + (1.0 - f_h) * (ey[0].T * fl[None, :]) @ ex[0]
         if halo:
             m = m + f_h * (hy[0].T * fl[None, :]) @ hx[0]
         return m
 
-    def residuals(p):
-        return (model(p) - data).ravel()
+    def model(p):
+        if len(wins) == 1:
+            return model_window(p, wins[0]).ravel()
+        return np.concatenate([model_window(p, win).ravel() for win in wins])
 
-    def jac(p):
-        off, sx, sy, fl, xs, ys, f_h, s_h, ex, ey, hx, hy = terms(p)
+    def residuals(p):
+        return model(p) - fitted
+
+    def jac_window(p, win, j):
+        off, sx, sy, fl, xs, ys, f_h, s_h, ex, ey, hx, hy = terms(p, win)
         c = 1.0 - f_h
-        j = np.empty((hh * ww, 3 + 3 * n + nh))
         j[:, 0] = 1.0 if fit_offset else 0.0
         j[:, 1] = c * ((ey[0].T * fl[None, :]) @ ex[2]).ravel()
         j[:, 2] = c * ((ey[2].T * fl[None, :]) @ ex[0]).ravel()
@@ -148,6 +186,14 @@ def fit_gaussians(img: np.ndarray, guesses: Sequence[Sequence[float]], sigma0: f
             j[:, 3 + 3 * n] = (halo_all - core_all).ravel()
             j[:, 4 + 3 * n] = (f_h * ((hy[2].T * fl[None, :]) @ hx[0] +
                                       (hy[0].T * fl[None, :]) @ hx[2])).ravel()
+
+    def jac(p):
+        j = np.empty((n_px, 3 + 3 * n + nh))
+        k = 0
+        for win in wins:
+            size = (win[2] - win[0]) * (win[3] - win[1])
+            jac_window(p, win, j[k:k + size])
+            k += size
         return j
 
     sol = least_squares(residuals, p0, jac=jac, bounds=(lo, hi), method="trf",
@@ -156,13 +202,15 @@ def fit_gaussians(img: np.ndarray, guesses: Sequence[Sequence[float]], sigma0: f
     off, sx, sy, fl, xs, ys, f_h, s_h = unpack(p)
     res = sol.fun
     dof = max(1, res.size - p.size)
-    m = model(p)
+    m_fit = model(p)
+    # the model image over the whole box around the guesses (for the callers)
+    m = m_fit.reshape(hh, ww) if len(wins) == 1 else model_window(p, (0, 0, ww, hh))
     # EMCCD noise grows with the signal (shot noise x excess factor): the
     # variance law var = a + b * signal is fitted to the squared residuals, and
     # the parameter errors of this unweighted fit follow from the sandwich
     # estimator (a single average variance would understate the errors of the
     # positions, which are set by the noisy pixels on the ions)
-    sig = np.maximum(m - off, 0.0).ravel()
+    sig = np.maximum(m_fit - off, 0.0)
     r2 = res * res * (res.size / dof)
     a_ = np.column_stack([np.ones_like(sig), sig])
     coef = np.linalg.lstsq(a_, r2, rcond=None)[0]
@@ -186,8 +234,9 @@ def fit_gaussians(img: np.ndarray, guesses: Sequence[Sequence[float]], sigma0: f
             # no significant halo: the plain Gaussian model describes the data
             return fit_gaussians(img, guesses, sigma0, fit_offset, max_nfev, margin, False)
     # reduced chi2 relative to a Poisson-like variance estimate of the data
-    var = np.maximum(np.abs(m - off), 1.0) + max(1.0, float(np.var(data[data < np.median(data)])))
-    red = float(np.sum(res ** 2 / var.ravel()) / dof)
+    var = np.maximum(np.abs(m_fit - off), 1.0) + \
+        max(1.0, float(np.var(fitted[fitted < np.median(fitted)])))
+    red = float(np.sum(res ** 2 / var) / dof)
     pos = np.column_stack([xs + c0, ys + r0])
     perr = np.column_stack([err[3 + n:3 + 2 * n], err[3 + 2 * n:3 + 3 * n]])
     return GaussFit(positions=pos, sigma=(float(sx), float(sy)), flux=np.asarray(fl, float),

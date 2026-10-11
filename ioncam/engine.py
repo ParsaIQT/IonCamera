@@ -93,6 +93,30 @@ def _merge_split_spots(positions, flux, n: int, sigma: float) -> np.ndarray:
     return pos
 
 
+def _crystal_spots(positions, sites, sigma: float, scale: float = 0.0) -> np.ndarray:
+    """Which spots of a long exposure belong to the crystal the tracker follows
+    (``sites``: its bright and dark ions, sensor px) - along the chain axis up
+    to 1.5 ion spacings beyond its ends, across it within 3 PSF sigmas (at
+    least 3 px) of its ions.  A long exposure also shows surface light
+    (defects, dust, electrode edges) as ion-like spots anywhere in the field
+    of view, unless a learned background removes it."""
+    pos = np.asarray(positions, float).reshape(-1, 2)
+    s = np.asarray(sites, float).reshape(-1, 2)
+    if len(pos) == 0 or len(s) == 0:
+        return np.ones(len(pos), bool)
+    across = max(3.0 * float(sigma), 3.0)
+    if len(s) == 1:
+        reach = max(across, 1.5 * float(scale) if scale else 2.0 * across)
+        return np.hypot(pos[:, 0] - s[0, 0], pos[:, 1] - s[0, 1]) <= reach
+    center = s.mean(axis=0)
+    _, _, vt = np.linalg.svd(s - center)
+    axis, normal = vt[0], np.array([-vt[0][1], vt[0][0]])
+    u, v = (s - center) @ axis, (s - center) @ normal
+    ext = max(1.5 * float(np.ptp(u)) / (len(s) - 1), across)
+    up, vp = (pos - center) @ axis, (pos - center) @ normal
+    return (up >= u.min() - ext) & (up <= u.max() + ext) & (np.abs(vp) <= np.abs(v).max() + across)
+
+
 def _pad_roi(roi, min_size: int, sensor_shape) -> tuple:
     """``roi`` (x0, y0, x1, y1) grown symmetrically to at least ``min_size``
     pixels per axis, kept on the sensor."""
@@ -784,6 +808,17 @@ class IonCamEngine:
         frame = Frame(mean, frames[-1].index, frames[-1].timestamp, applied)
         det = self.detector.analyze(frame)
         positions = det.positions
+        spot_flux = np.array([sp.flux for sp in det.spots], float)
+        quality: Dict[str, Any] = {"detected": len(positions)}
+        if snap.get("stable") and snap.get("sites") and len(positions):
+            # the crystal on screen is the one to locate: spots far from it are
+            # surface light (and would make the fit and the plan slow and wrong)
+            keep = _crystal_spots(positions, [[s_["x"], s_["y"]] for s_ in snap["sites"]],
+                                  cfg.detection.psf_sigma,
+                                  (snap.get("chain") or {}).get("scale_px") or 0.0)
+            if keep.any() and not keep.all():
+                positions, spot_flux = positions[keep], spot_flux[keep]
+                quality["ignored"] = int((~keep).sum())
         n_det = len(positions)
         if n_det == 0:
             raise ProcedureError("no ions found in the long exposure "
@@ -792,8 +827,7 @@ class IonCamEngine:
         guesses = positions
         n_known = expected or (int(snap.get("n_bright") or 0) if snap.get("stable") else 0)
         if n_known and n_det > n_known:
-            guesses = _merge_split_spots(positions, [sp.flux for sp in det.spots], n_known,
-                                         cfg.detection.psf_sigma)
+            guesses = _merge_split_spots(positions, spot_flux, n_known, cfg.detection.psf_sigma)
         if expected and n_det != expected:
             guesses = self._chain_guesses(positions, expected, det, snap.get("chain")) \
                 if expected > n_det else guesses
@@ -809,7 +843,6 @@ class IonCamEngine:
                 guesses = sites
         cu, cv = det.to_crop(guesses[:, 0], guesses[:, 1])
         psf = cfg.detection.psf_sigma
-        quality: Dict[str, Any] = {"detected": n_det}
         halo = (0.0, 0.0)
         if cal.fit_psf:
             # core + halo (the halo - aberration wings - is isotropic in sensor px,
@@ -834,7 +867,7 @@ class IonCamEngine:
         else:
             pos = positions
             sigma = (psf, psf)
-            flux = np.array([s.flux for s in det.spots])
+            flux = spot_flux
             errors = np.full(pos.shape, np.nan)
         # dark ions known to the tracker: carry them over (shifted to the new frame)
         states = ["bright"] * len(pos)
@@ -892,6 +925,10 @@ class IonCamEngine:
         if result["max_value"] >= 65000:
             result.setdefault("warnings", []).append("long exposure saturated - lower the "
                                                      "locate exposure or EM gain")
+        if quality.get("ignored"):
+            result.setdefault("warnings", []).append(
+                "{} spot(s) away from the tracked crystal ignored - surface light? (learning "
+                "the background removes it)".format(quality["ignored"]))
         self._last_locate = result
         self._save("locate", result, image=mean)
         msg = "Located {} ion(s), PSF sigma {:.2f} x {:.2f} px".format(result["n_ions"], sigma[0],
@@ -1000,6 +1037,8 @@ class IonCamEngine:
         plan = plan_readout(pos, sigma, self.camera.sensor_shape, hb, vb,
                             flip_x=cfg.grabber.flip_x, flip_y=cfg.grabber.flip_y,
                             res_width=cfg.grabber.res_width, ion_states=loc["states"], **kw)
+        for w in loc.get("warnings", []):
+            plan.add_note(w)
         if self._temperature[1] != "stabilized":
             plan.add_note("sensor temperature not stabilised ({}, {:.1f} C)".format(
                 self._temperature[1], self._temperature[0]))

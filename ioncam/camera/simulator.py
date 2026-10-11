@@ -511,12 +511,20 @@ def emccd_counts(electrons: np.ndarray, em_gain: float, use_em: bool, sensitivit
     """Convert mean photo-electrons into a noisy uint16 EMCCD image."""
     n = rng.poisson(np.maximum(electrons, 0.0) + cic)
     if use_em and em_gain > 1.0:
-        out = rng.gamma(n, em_gain)
+        # (a gamma variate of shape 0 is 0 and draws nothing: only the pixels
+        # with electrons are sampled - the same numbers, faster)
+        out = np.zeros(n.shape)
+        hit = n > 0
+        out[hit] = rng.gamma(n[hit], em_gain)
         np.minimum(out, EM_REGISTER_FULL_WELL, out=out)
     else:
         out = n.astype(np.float64)
-    counts = bias + out / sensitivity + rng.normal(0.0, read_noise_e / sensitivity, n.shape)
-    return np.clip(np.rint(counts), 0, 65535).astype(np.uint16)
+    out /= sensitivity
+    out += bias
+    out += rng.normal(0.0, read_noise_e / sensitivity, n.shape)
+    np.rint(out, out=out)
+    np.clip(out, 0, 65535, out=out)
+    return out.astype(np.uint16)
 
 
 def readout_time(roi, hbin: int, vbin: int, hs_mhz: float, vs_us: float) -> float:

@@ -280,3 +280,43 @@ def test_locate_merges_an_ion_split_in_two():
     assert len(g) == 3 and g[np.argsort(g[:, 0])][1] == pytest.approx([262.0, 168.0], abs=0.15)
     assert len(_merge_split_spots([[0, 0], [6, 0]], [1e4, 1e4], 1, 1.8)) == 2
     assert len(_merge_split_spots([[0, 0], [2, 0], [9, 0]], [1e4, 1e4, 1e4], 2, 1.8)) == 3
+
+
+def test_fit_of_scattered_spots_uses_a_window_each():
+    """Spots far apart (an ion and surface light across the sensor) are fitted
+    in one window each - not in their bounding box, which made a locate on a
+    dirty trap take tens of seconds - with the same result as fitting each
+    on its own; a compact crystal keeps its bounding box."""
+    from ioncam.analysis.fitting import _windows
+    rng = np.random.default_rng(1)
+    yy, xx = np.mgrid[0:400, 0:400]
+    truth = [(60.3, 50.7), (64.6, 51.1), (330.2, 290.4)]
+    img = np.full(xx.shape, 30.0)
+    for x, y in truth:
+        img += 9000 * np.exp(-((xx - x) ** 2 + (yy - y) ** 2) / (2 * 1.3 ** 2)) / (2 * np.pi * 1.3 ** 2)
+    img = rng.poisson(img).astype(float)
+    guesses = [(x + 0.3, y - 0.2) for x, y in truth]
+    boxes = _windows(np.array(guesses), 4 * 1.3 + 2, 400, 400)
+    assert len(boxes) == 2 and sum((c1 - c0) * (r1 - r0) for c0, r0, c1, r1 in boxes) < 1000
+    fit = fit_gaussians(img, guesses, 1.3)
+    assert fit.success and np.abs(fit.positions - np.array(truth)).max() < 0.1
+    assert fit.model.shape == (fit.window[3] - fit.window[1], fit.window[2] - fit.window[0])
+    alone = fit_gaussians(img, guesses[:2], 1.3)
+    assert len(_windows(np.array(guesses[:2]), 4 * 1.3 + 2, 400, 400)) == 1
+    assert fit.positions[:2] == pytest.approx(alone.positions, abs=0.01)
+
+
+def test_locate_keeps_the_tracked_crystal():
+    """Spots of a long exposure away from the crystal the tracker follows are
+    surface light; an ion the tracker missed at the end of the chain is not."""
+    from ioncam.engine import _crystal_spots
+    a = np.deg2rad(45)
+    sites = [[100 + d * np.cos(a), 100 + d * np.sin(a)] for d in (-4.3, 0.0, 4.3)]
+    spots = sites + [[100 + 8.6 * np.cos(a), 100 + 8.6 * np.sin(a)],   # missed end ion
+                     [100.8, 99.6],                                       # split spot
+                     [140.0, 60.0], [60.0, 100.0], [100.0 + 30 * np.cos(a), 100 + 30 * np.sin(a)]]
+    keep = _crystal_spots(spots, sites, 1.2)
+    assert keep.tolist() == [True] * 5 + [False] * 3
+    one = _crystal_spots([[50, 50], [52.5, 51], [80, 50]], [[51, 50.5]], 1.2, 3.4)
+    assert one.tolist() == [True, True, False]
+    assert _crystal_spots([[0, 0]], [], 1.2).tolist() == [True]

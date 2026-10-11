@@ -53,7 +53,7 @@ pip install git+https://github.com/m-labs/sipyco      # not on PyPI (ARTIQ envs 
 
 ioncam_gui --simulate          # GUI + simulated trap; use the "Simulation" tab to play
 aqctl_ioncam --simulate        # headless RPC server with the simulator
-pytest                         # 121 tests (~3 min), all on the simulator / emulated SDK
+pytest                         # 124 tests (~3 min), all on the simulator / emulated SDK
 ```
 
 In the GUI the image brightness follows every frame (**Auto** under the histogram). Drag
@@ -203,8 +203,11 @@ Measured on the simulator (13k photons/s per ion, PSF σ 1.8 px + 15 % halo, typ
 surface): every ion found and ~0.2 px rms per 50 ms frame at EM gain 50-100 (the photon
 limit); single frames resolve chains down to ~2.7 σ spacing, denser ones are followed
 through the tracker's prior; no false clouds and < 1 false spot per 7 empty frames at EM
-gain 300; ~26 ms per 512×512 frame, ~12-14 ms with a smaller ROI (scipy; installing
-`opencv-python-headless`, the `fast` extra, speeds up the filtering).
+gain 300; ~19 ms per 512×512 frame, ~10 ms with a 200×140 ROI (scipy; installing
+`opencv-python-headless`, the `fast` extra, speeds up the filtering). ioncam runs numpy's
+BLAS with one thread (`OPENBLAS_NUM_THREADS=1` unless you set it yourself): its matrix
+products are small, and BLAS worker threads competing with the camera, analysis and GUI
+threads made the live analysis about three times slower.
 
 ## Grabber readout, step by step
 
@@ -222,6 +225,12 @@ gain 300; ~26 ms per 512×512 frame, ~12-14 ms with a smaller ROI (scipy; instal
    sandwich estimator).
    Dark ions known to the tracker are carried along. With `detection.auto_psf` the
    measured core and halo are used by the detector and the planner from then on.
+   When the tracker follows a stable crystal, only that crystal is located: spots of
+   the long exposure away from it - surface light such as defects and dust, which the
+   exposure shows when no background is learned (e.g. after turning the simulated
+   trap) - are ignored, and the plan's warnings say how many. Spots far apart are
+   fitted in windows of their own, so the fit never spans the sensor; a calibration
+   takes about 2 s (two 0.5 s exposures, the plan, 200 verification frames).
 2. **Plan.** By default every ion gets **one super-pixel** (`calibration.roi_size =
    [1, 1]`, "ROI per ion" in the GUI), and of all binning-grid phases the planner picks
    the one that puts the ions closest to the centres of their super-pixels. Every
@@ -475,7 +484,7 @@ These are worth knowing, because several would silently corrupt data:
 
 ## Tests
 
-`pytest` runs 121 tests in about 3 minutes, in the realistic regime (13k photons/s
+`pytest` runs 124 tests in about 3 minutes, in the realistic regime (13k photons/s
 per ion, blurred PSF with halo, laser scatter, surface defects):
 - chain physics against James' published values;
 - detector accuracy (photon-limited) and false-alarm rates at EM gain 1, 50 and 300,
@@ -491,9 +500,11 @@ per ion, blurred PSF with halo, laser scatter, surface defects):
 - planner invariants, its containment / crosstalk against the simulated image (halo
   included), and agreement with the Grabber gateware model, including its `x1` quirk;
   close ions get overlapping ROIs instead of an error, one centred super-pixel per ion
-  with a clean background strip, a fixed AQROI, moving the AQROI by hand; locate
-  splitting a merged pair and merging an ion the detector split in two; the quick fidelity estimate from bright shots against EMCCD
-  shots with the ions really dark (alone and next to a bright ion);
+  with a clean background strip, a fixed AQROI, moving the AQROI by hand, every
+  candidate ROI's score against the PSF integrals; locate splitting a merged pair,
+  merging an ion the detector split in two, keeping to the tracked crystal and fitting
+  scattered spots in windows of their own; the quick fidelity estimate from bright
+  shots against EMCCD shots with the ions really dark (alone and next to a bright ion);
 - the Andor driver's exact SDK call sequence on the emulated SDK;
 - a full stack over real sipyco RPC with concurrent clients;
 - a headless GUI test (levels set by hand stay put, the D-pad direction through the

@@ -322,3 +322,23 @@ def test_quick_fidelity_matches_dark_shots():
     # ROI 0 gets far more of ion 1's light (8 %) than ROI 1 of ion 0's (3 %)
     assert res["ions"][0]["crosstalk"] > 2 * res["ions"][1]["crosstalk"]
     assert res["ions"][0]["dark_error_neighbours_bright"] > res["ions"][0]["dark_error"]
+
+
+def test_candidate_rois_score_every_rectangle():
+    """The planner scores all candidate ROIs of an ion at once: each one's
+    containment and worst crosstalk equal the light fractions of the PSF
+    (core + halo) inside that rectangle."""
+    from ioncam.analysis.readout import (AREA_PENALTY, CROSSTALK_WEIGHT, _ion_candidates,
+                                         _light_matrix)
+    pos = chain(3, 3.4, angle=45)
+    halo = (0.15, 4.5)
+    c = _ion_candidates(1, pos, 1.2, 1.4, 1, 3, 2, 2, (0, 0) + SENSOR, 4, 3, halo=halo)
+    assert len(c) == (1 + 2 + 3 + 4) * (1 + 2 + 3)
+    for k in range(0, len(c), 7):
+        score, a, r, w, h, cont, xt = c.pick(k)
+        x0, y0 = 1 + a * 2, 3 + r * 2
+        f = _light_matrix([x0 - 0.5], [x0 + 2 * w - 0.5], [y0 - 0.5], [y0 + 2 * h - 0.5],
+                          pos, 1.2, 1.4, halo)[0]
+        assert cont == pytest.approx(f[1], rel=1e-12)
+        assert xt == pytest.approx(max(f[0], f[2]), rel=1e-12, abs=1e-15)
+        assert score == pytest.approx(cont - CROSSTALK_WEIGHT * xt - AREA_PENALTY * w * h)

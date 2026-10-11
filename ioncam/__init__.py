@@ -19,6 +19,16 @@ import os as _os
 
 __version__ = "1.0.0"
 
+# One BLAS thread.  numpy's BLAS (OpenBLAS, MKL) spreads every matrix product
+# over all cores, but ioncam's products are small (an image times a few dozen
+# columns): the threads cost far more than they save - 8 ms instead of 0.2 ms
+# to expand a 512 x 512 background map, 60 instead of 21 ms to analyse a full
+# frame - and they compete with the camera, analysis and GUI threads.  Takes
+# effect when ioncam is imported before numpy (aqctl_ioncam, ioncam_gui); a
+# value set in the environment is kept.
+for _var in ("OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "OMP_NUM_THREADS"):
+    _os.environ.setdefault(_var, "1")
+
 
 def _git_commit() -> str:
     """Short commit of the git checkout this code runs from - with an editable
