@@ -33,7 +33,7 @@ from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from ioncam import __version__
+from ioncam import __version__, version_string
 from ioncam.analysis.chain import equilibrium_positions, fit_chain
 from ioncam.analysis.detection import DetectionResult, Detector
 from ioncam.analysis.fitting import PSF, fit_gaussians
@@ -167,10 +167,14 @@ class ReadoutMonitor:
                "outside_fraction": outside, "outside_baseline": baseline}
         if plan is None or arr.size == 0:
             return out
+        rects = plan.sdk_rois()
         for i in range(arr.shape[1]):
             col = arr[:, i]
+            u0, v0, u1, v1 = rects[i]
+            px = max((u1 - u0) * (v1 - v0), 1)
             d = {"index": i, "kind": "ion" if i < plan.n_ions else "background",
-                 "mean": float(col.mean()), "std": float(col.std())}
+                 "mean": float(col.mean()), "std": float(col.std()), "pixels": px,
+                 "mean_per_pixel": float(col.mean()) / px}
             if i < plan.n_ions:
                 th = fit_threshold(col)
                 d["threshold"] = th
@@ -246,7 +250,7 @@ class IonCamEngine:
         self._analysis_thread.start()
         self.info = self._call(self._open_camera, timeout=60.0)
         self.events.emit("started", "ioncam {} started with {}".format(
-            __version__, self.info.get("model", "camera")), "info", **self.info)
+            version_string(), self.info.get("model", "camera")), "info", **self.info)
         if auto_live:
             self.start_live()
         return dict(self.info)
@@ -556,7 +560,8 @@ class IonCamEngine:
             "settings": a.to_dict() if a is not None else None,
             "live_settings": self._live.to_dict(),
             "ions": {k: snap.get(k) for k in ("state", "n_bright", "n_dark", "n_ions", "stable",
-                                               "stable_for", "fluorescence_level", "chain",
+                                               "stable_for", "fluorescence_level",
+                                               "marker_radius", "chain",
                                                "pending", "hold", "n_spots", "n_clouds",
                                                "last_update")},
             "sites": snap.get("sites", []),

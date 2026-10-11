@@ -53,7 +53,7 @@ pip install git+https://github.com/m-labs/sipyco      # not on PyPI (ARTIQ envs 
 
 ioncam_gui --simulate          # GUI + simulated trap; use the "Simulation" tab to play
 aqctl_ioncam --simulate        # headless RPC server with the simulator
-pytest                         # 107 tests (~3 min), all on the simulator / emulated SDK
+pytest                         # 116 tests (~3 min), all on the simulator / emulated SDK
 ```
 
 In the GUI the image brightness follows every frame (**Auto** under the histogram). Drag
@@ -65,7 +65,14 @@ With the real camera on the camera PC (Windows):
 
 1. Install the Andor SDK2 driver and Andor's `pyAndorSDK2` package (`pip install .` in
    the folder from Andor's zip). **Close Andor Solis**, since only one program can own
-   the camera.
+   the camera. Install ioncam itself from your git checkout **in editable mode**, once:
+   `pip install -e ".[gui]"` (if you installed it with `pip install .` before, first
+   `pip uninstall ioncam`). Then a `git pull` is all an update takes - just restart
+   `ioncam_gui` / `aqctl_ioncam`; re-run the pip command only if the dependencies
+   changed. The window title (and `get_version()`) shows the commit that is running,
+   e.g. `1.0.0 (git dd10636)`; `installed copy` means a copy in site-packages that does
+   not follow the checkout. (Without installing at all, `python -m ioncam.gui.app` and
+   `python -m ioncam.server` run straight from the checkout.)
 2. `aqctl_ioncam --write-config ioncam.toml`, then edit it. Every option is commented.
 3. `ioncam_gui -c ioncam.toml` opens the camera, starts live video and serves RPC on port
    3270. Alternatively run `aqctl_ioncam -c ioncam.toml --bind '*'` headless, and from
@@ -147,6 +154,7 @@ gives clean fingerprints:
 | collision / heating | light turns diffuse and dim, then re-crystallises | `crystal_melted` → `crystal_recovered` or `ion_lost` |
 | lasers blocked / off | all light gone, including the diffuse light | `fluorescence_lost` → `fluorescence_restored`, or `ions_presumed_lost` after `forget_time` |
 | shuttling, camera bumped | rigid shift with every ion matched | `chain_moved` |
+| refocusing | the same ions, imaged wider (or sharper) | `focus_changed` (wider); the PSF is re-measured |
 
 * A missing ion **together with** a common shift means the chain re-centred: that is a
   loss, never "an end ion went dark".
@@ -160,7 +168,14 @@ gives clean fingerprints:
   ion takes one ion's worth with it.
 * The PSF (core + halo) is measured on averaged frames of the live crystal and handed to
   the detector (`detection.auto_psf`), so a wrong `detection.psf_sigma` corrects itself
-  without a calibration.
+  without a calibration. After refocusing, a detector still assuming the sharper image
+  would split each ion in two: if the same ions with a re-fitted, wider PSF explain the
+  frames, it is reported as `focus_changed`, not as trapped ions.
+* The green circles around the ions hold `tracker.marker_light_fraction` (80 %) of an
+  ion's light, from the PSF measured in the image (core + halo); after refocusing they
+  settle to the new size within `tracker.marker_settle_time` (5 s), whatever the frame
+  rate. The trace under the image is each ion's brightness relative to its reference,
+  measured in every frame (a dark ion drops to ~0).
 * After a re-arrangement the new configuration is fitted with the linear-chain
   equilibrium model (James 1998), using the previous length scale and centre as priors,
   so hidden **dark ions are located** and still counted.
@@ -206,17 +221,23 @@ gain 300; ~26 ms per 512×512 frame, ~12-14 ms with a smaller ROI (scipy; instal
    sandwich estimator).
    Dark ions known to the tracker are carried along. With `detection.auto_psf` the
    measured core and halo are used by the detector and the planner from then on.
-2. **Plan.** For every binning-grid phase it gives each ion its own ROI. An ion centred
-   in a super-pixel needs 1, an ion on a boundary needs 2. The layout maximises the worst
-   ion's light **containment** (exact integrals of the fitted PSF, halo included) while
-   penalising **crosstalk** and area. The AQROI is the bounding box plus `frame_margin`
-   super-pixels, so it is centred on the crystal, and it includes a background ROI.
-   ROI edges can only lie on the binning grid, so an ion sits as centrally in its ROI as
-   the grid allows (the GUI draws the grid as dotted lines, and the plan lists each
-   ion's offset from its ROI centre) - offsets of up to half a super-pixel are expected,
-   not a drawing error. With one ion at 4×4 binning this gives an 8×8 px AQROI with the
-   ion at the centre of 2×2 super-pixels, the same layout as an AQROI of
-   `257,264,161,168` in Solis.
+2. **Plan.** By default every ion gets **one super-pixel** (`calibration.roi_size =
+   [1, 1]`, "ROI per ion" in the GUI), and of all binning-grid phases the planner picks
+   the one that puts the ions closest to the centres of their super-pixels. Every
+   super-pixel adds its own dark counts (clock-induced charge, scatter, read-noise
+   spread) to an ROI sum, so the fewest pixels around the brightest part of the ion -
+   rather than the most light - usually give the best bright/dark discrimination (SPAM
+   fidelity). With the lab trap (PSF 1.2 px + halo, two ions 4.3 px apart) at 4×4
+   binning that is 66-68 % of each ion's light in its super-pixel, with 2-8 %
+   crosstalk. `roi_size = [0, 0]` ("auto") instead sizes each ROI for the most light
+   (exact integrals of the fitted PSF, halo included), penalising crosstalk and area -
+   bigger ROIs, more dark counts. The AQROI is the bounding box plus `frame_margin`
+   super-pixels, so it is centred on the crystal; its background ROI is a strip of
+   super-pixels placed far enough out to hold < 2 % of an ion's light. ROI edges can
+   only lie on the binning grid, so an ion sits as centrally in its ROI as the grid
+   allows (the GUI draws the grid as dotted lines, and the plan lists each ion's offset
+   from its ROI centre); with several ions their spacing decides how well all can be
+   centred at once.
    Ions closer than the binning can separate are never refused: each still gets its own
    best ROI, the ROIs overlap (the Grabber sums each one independently) and a warning
    names them, so the crosstalk can be measured - e.g. in a SPAM experiment - before
@@ -229,8 +250,10 @@ gain 300; ~26 ms per 512×512 frame, ~12-14 ms with a smaller ROI (scipy; instal
 
 The returned plan includes `binning_advice`, which shows how other binnings would score.
 Real ion images are blurred and have wings, so neighbouring ROIs do see each other: a
-3-ion chain with 6 px spacing (PSF σ 1.8 px + 15 % halo) gets 58 % / 11 % (worst
-containment / crosstalk) at 4×4, 80 % / 10 % at 3×3 and 71 % / 4 % at 1×1.
+3-ion chain with 6 px spacing (PSF σ 1.8 px + 15 % halo) gets 37 % / 6 % (worst
+containment / crosstalk) with one 4×4 super-pixel per ion - a super-pixel smaller than
+the ion image holds little of its light, and the plan says so - while auto-sized ROIs
+get 58 % / 11 % at 4×4, 80 % / 10 % at 3×3 and 71 % / 4 % at 1×1.
 `auto_binning=True` picks the cheapest binning that meets the targets
 (`calibration.min_containment`, `max_crosstalk`).
 
@@ -331,8 +354,10 @@ frame without it and none with it; the ions are still found.
 reaching the camera, default 13 000), laser power, PSF core and halo, chain length scale,
 uniform stray light, laser scatter (rate at the beam centre, widths along / across the
 beam, angle, offset), defects (number, brightness, height above the surface), scratches,
-electrode-gap scatter, collection NA and ion height; plus ions (load, lose, dark,
-melt), lasers, repumper, oven, camera moves and external triggers. The EMCCD model has
+electrode-gap scatter, collection NA and ion height, and the **trap rotation** in the
+image (0 / 45 / 90° buttons, or any angle: chain, electrodes, surface and laser beam
+turn together about the trap centre); plus ions (load, lose, dark, melt), lasers,
+repumper, oven, camera moves and external triggers. The EMCCD model has
 Poisson photo-electrons, clock-induced charge, the gamma-distributed EM register, read
 noise, bias and 16-bit saturation.
 
@@ -401,7 +426,7 @@ These are worth knowing, because several would silently corrupt data:
 
 ## Tests
 
-`pytest` runs 107 tests in about 3 minutes, in the realistic regime (13k photons/s
+`pytest` runs 116 tests in about 3 minutes, in the realistic regime (13k photons/s
 per ion, blurred PSF with halo, laser scatter, surface defects):
 - chain physics against James' published values;
 - detector accuracy (photon-limited) and false-alarm rates at EM gain 1, 50 and 300,
@@ -412,11 +437,13 @@ per ion, blurred PSF with halo, laser scatter, surface defects):
   a dark ion present, melting, lasers off, rigid moves, shuttling with hold, a quiet
   stable crystal), and a tight trap (PSF 1.2 px, two or three ions ~4 px apart): dark
   then bright then lost at every site, the PSF learned from the live crystal, a
-  full-sensor start;
+  full-sensor start, refocusing, a trap turned by 45° and 90°, the per-ion brightness
+  trace and the 80 %-light marker size;
 - planner invariants, its containment / crosstalk against the simulated image (halo
   included), and agreement with the Grabber gateware model, including its `x1` quirk;
-  close ions get overlapping ROIs instead of an error, a fixed AQROI, moving the AQROI
-  by hand; locate splitting a merged pair;
+  close ions get overlapping ROIs instead of an error, one centred super-pixel per ion
+  with a clean background strip, a fixed AQROI, moving the AQROI by hand; locate
+  splitting a merged pair;
 - the Andor driver's exact SDK call sequence on the emulated SDK;
 - a full stack over real sipyco RPC with concurrent clients;
 - a headless GUI test (levels set by hand stay put, the D-pad direction through the

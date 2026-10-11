@@ -71,7 +71,7 @@ _SURFACE_KEYS = {"background_rate", "scatter_rate", "scatter_sigma_along",
                  "defect_rate", "defect_spread", "defect_max_height_um", "scratches",
                  "gap_scatter", "gap_offset_px", "hot_pixels", "hot_pixel_rate",
                  "surface_seed", "magnification", "pixel_size_um", "numerical_aperture",
-                 "ion_height_um", "psf_sigma"}
+                 "ion_height_um", "psf_sigma", "trap_angle_deg", "axis_angle_deg"}
 
 
 def defocus_radius_px(height_um: float, na: float, magnification: float,
@@ -118,8 +118,7 @@ class IonTrapScene:
         self._uid = 0
         self.ions: List[_Ion] = []
         self.center = np.array(cfg.center, float)
-        angle = math.radians(cfg.axis_angle_deg)
-        self.axis = np.array([math.cos(angle), math.sin(angle)])
+        self._set_axis()
         self.scale = float(cfg.length_scale_px)
         self.psf_sigma = float(cfg.psf_sigma)
         self.photon_rate = float(cfg.photon_rate)
@@ -137,6 +136,10 @@ class IonTrapScene:
         for _ in range(cfg.n_ions):
             self._add_ion(crystallized=True)
 
+    def _set_axis(self) -> None:
+        a = math.radians(self.cfg.axis_angle_deg + self.cfg.trap_angle_deg)
+        self.axis = np.array([math.cos(a), math.sin(a)])
+
     # -- the static part: trap surface, scatter, hot pixels --------------------
 
     def _apply_preset(self, name: str) -> None:
@@ -149,7 +152,7 @@ class IonTrapScene:
     def _beam_profile(self, x, y) -> np.ndarray:
         """Relative laser intensity on the surface at sensor (x, y)."""
         cfg = self.cfg
-        a = math.radians(cfg.beam_angle_deg)
+        a = math.radians(cfg.beam_angle_deg + cfg.trap_angle_deg)    # turns with the trap
         dx, dy = np.asarray(x) - self._beam_center[0], np.asarray(y) - self._beam_center[1]
         along = dx * math.cos(a) + dy * math.sin(a)
         across = -dx * math.sin(a) + dy * math.cos(a)
@@ -165,7 +168,11 @@ class IonTrapScene:
         # the surface is fixed in the lab: it only moves in the image if the camera does
         vx, vy = self._view
         trap_center = np.array(cfg.center, float) + self._view
-        self._beam_center = trap_center + np.asarray(cfg.scatter_offset, float)
+        rot = math.radians(cfg.trap_angle_deg)
+        cr, sr = math.cos(rot), math.sin(rot)
+        off = np.asarray(cfg.scatter_offset, float)
+        self._beam_center = trap_center + np.array([cr * off[0] - sr * off[1],
+                                                    sr * off[0] + cr * off[1]])
         yy, xx = np.mgrid[0:h, 0:w].astype(float)
         profile = self._beam_profile(xx, yy)
         r_surface = defocus_radius_px(cfg.ion_height_um, cfg.numerical_aperture,
@@ -192,8 +199,15 @@ class IonTrapScene:
             pts_f.append(np.full(t.size, 0.08 * cfg.defect_rate) *
                          np.exp(0.5 * rng.standard_normal(t.size)))
             pts_z.append(np.zeros(t.size))
+        if pts_x and rot:
+            # the trap turned: its surface turns about the trap centre (positions
+            # wrapped into the sensor, so the defect density stays uniform)
+            for k in range(len(pts_x)):
+                dx, dy = pts_x[k] - trap_center[0], pts_y[k] - trap_center[1]
+                pts_x[k] = np.mod(trap_center[0] + cr * dx - sr * dy + 0.5, w) - 0.5
+                pts_y[k] = np.mod(trap_center[1] + sr * dx + cr * dy + 0.5, h) - 0.5
         if cfg.gap_scatter > 0:
-            ax = math.radians(cfg.axis_angle_deg)
+            ax = math.radians(cfg.axis_angle_deg + cfg.trap_angle_deg)
             ux, uy = math.cos(ax), math.sin(ax)
             t = np.arange(-1.5 * max(h, w), 1.5 * max(h, w), 1.0)
             for side in (-1.0, 1.0):
@@ -263,6 +277,8 @@ class IonTrapScene:
             self.background_rate = float(cfg.background_rate)
             if "length_scale_px" in params:
                 self.scale = float(cfg.length_scale_px)
+            if "trap_angle_deg" in params or "axis_angle_deg" in params:
+                self._set_axis()
             if rebuild:
                 self._build_surface()
             return self.parameters()

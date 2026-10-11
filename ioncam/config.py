@@ -114,8 +114,14 @@ class CalibrationConfig:
                                 "many px around them (faster); 0 = full sensor/live ROI")
     expected_ions: int = opt(0, "if > 0, calibration fails unless exactly this many "
                                 "ions are found")
-    roi_size: Tuple[int, int] = opt((0, 0), "Grabber ROI size per ion in binned pixels "
-                                            "[w, h]; [0, 0] = choose automatically")
+    roi_size: Tuple[int, int] = opt((1, 1), "Grabber ROI size per ion in super-pixels "
+                                            "(binned px) [w, h].  [1, 1]: one super-pixel "
+                                            "per ion, the binning grid placed so the ions "
+                                            "sit at their centres - the fewest pixels, so "
+                                            "the fewest dark counts per ROI: usually the "
+                                            "best state discrimination.  [0, 0]: as much of "
+                                            "each ion's light as the grid allows (bigger "
+                                            "ROIs, more dark counts)")
     min_containment: float = opt(0.60, "required fraction of each ion's light inside its ROI "
                                        "(PSF halo included: real optics rarely give > 85 %)")
     max_crosstalk: float = opt(0.12, "maximum fraction of an ion's light in a neighbour's ROI")
@@ -124,7 +130,7 @@ class CalibrationConfig:
     include_dark_sites: bool = opt(True, "also give dark ions known to the tracker a ROI")
     verify: bool = opt(True, "take test frames with the final readout settings "
                              "(internal trigger) and check every ROI before arming")
-    verify_frames: int = opt(20, "number of verification frames")
+    verify_frames: int = opt(50, "number of verification frames")
     min_verify_snr: float = opt(5.0, "minimum significance of each ion's mean signal over "
                                      "the verification frames (is it in its ROI?)")
     fit_psf: bool = opt(True, "joint 2D Gaussian fit of all ions (sub-pixel positions, PSF)")
@@ -189,6 +195,11 @@ class TrackerConfig:
                                     "average of the frames since the last check every "
                                     "this many seconds (dim or dense chains that single "
                                     "frames cannot resolve); 0 = off")
+    marker_light_fraction: float = opt(0.8, "ion markers are circles holding this fraction "
+                                            "of an ion's light (PSF core + halo as measured "
+                                            "in the image)")
+    marker_settle_time: float = opt(5.0, "the marker size settles this long after the ion "
+                                         "image changes (e.g. refocusing) [s]")
 
 
 @dataclass
@@ -243,6 +254,10 @@ class SimulatorConfig:
     n_ions: int = opt(3, "ions present at start")
     center: Tuple[float, float] = opt((262.0, 168.0), "chain centre [sensor px]")
     axis_angle_deg: float = opt(0.0, "chain axis angle w.r.t. sensor x [deg]")
+    trap_angle_deg: float = opt(0.0, "rotation of the whole trap in the image about its "
+                                     "centre [deg]: chain axis, electrodes, surface "
+                                     "defects and laser beam (as if the camera were "
+                                     "turned; hot pixels stay on the sensor)")
     length_scale_px: float = opt(5.6, "chain length scale l = (e^2/(4 pi eps0 m w_z^2))^(1/3) "
                                       "x M / pixel [px]: 40Ca+ at w_z = 2 pi 1 MHz has l = "
                                       "4.45 um = 5.6 px at M = 20 and 16 um pixels.  2 ions are "

@@ -131,6 +131,9 @@ def adopt_learned_psf(tracker: "ChainTracker", detection_cfg) -> Optional[str]:
     f = float(min(max(e["halo_fraction"], 0.0), 0.5))
     hs = float(e["halo_sigma"]) if f > 0 else 0.0
     d = detection_cfg
+    if f <= 0:
+        # no significant halo in this fit (dim light): keep the one measured before
+        f, hs = d.psf_halo_fraction, d.psf_halo_sigma
     if abs(sigma - d.psf_sigma) < 0.04 * d.psf_sigma and abs(f - d.psf_halo_fraction) < 0.03:
         return None
     old = PSF.from_sensor(d.psf_sigma, d.psf_halo_fraction, d.psf_halo_sigma)
@@ -142,6 +145,25 @@ def adopt_learned_psf(tracker: "ChainTracker", detection_cfg) -> Optional[str]:
     if f > 0:
         msg += " + {:.0%} of the light in a halo of sigma {:.1f} px".format(f, hs)
     return msg + " - used for detection from now on"
+
+
+def encircled_radius(sigma: float, halo_fraction: float = 0.0, halo_sigma: float = 0.0,
+                     fraction: float = 0.8) -> float:
+    """Radius of the circle that holds ``fraction`` of the light of a round
+    PSF: a Gaussian core (``sigma``) plus ``halo_fraction`` of the light in a
+    Gaussian halo (``halo_sigma``), same units."""
+    f = min(max(float(halo_fraction), 0.0), 0.95) if halo_sigma > 0 else 0.0
+    s, h = max(float(sigma), 1e-6), max(float(halo_sigma), 1e-6)
+    q = min(max(float(fraction), 1e-3), 0.999)
+
+    def light(r):
+        return (1.0 - f) * -math.expm1(-r * r / (2.0 * s * s)) + \
+            f * -math.expm1(-r * r / (2.0 * h * h))
+    lo, hi = 0.0, 10.0 * (max(s, h) if f > 0 else s)
+    for _ in range(60):
+        mid = 0.5 * (lo + hi)
+        lo, hi = (mid, hi) if light(mid) < q else (lo, mid)
+    return 0.5 * (lo + hi)
 
 
 def photometry_scale(model: PSF, true: PSF) -> float:
@@ -265,7 +287,9 @@ class ChainTracker:
         self._region_var: Optional[float] = None   # its frame-to-frame scatter
         self._moved_accum = np.zeros(2)
         self._dim = False
-        self.fluorescence_level = float("nan")
+        self.fluorescence_level = float("nan")   # median bright-ion level, smoothed
+        self.marker_radius: Optional[float] = None   # sensor px holding marker_light_fraction
+        self._marker_t: Optional[float] = None
         self.last_shift = np.zeros(2)
         self.history: Deque[Tuple[float, float, List[float]]] = deque(maxlen=3000)
         self.n_spots = 0
@@ -278,6 +302,7 @@ class ChainTracker:
         self._last_resid: List[float] = []
         self.psf_estimate: Optional[dict] = None   # PSF learned from averaged frames
         self._psf_adopted: Optional[dict] = None   # the estimate last given to detection
+        self._image_psf: Optional[PSF] = None      # the image before a change of focus
         self._budget_var: Optional[float] = None   # scatter of the crystal's light budget
         self._avg_reset()
 
@@ -339,6 +364,8 @@ class ChainTracker:
             "sites": [s.to_dict(i) for i, s in enumerate(self.sites)],
             "fluorescence_level": (None if not math.isfinite(self.fluorescence_level)
                                    else round(float(self.fluorescence_level), 3)),
+            "marker_radius": (None if self.marker_radius is None
+                              else round(float(self.marker_radius), 3)),
             "chain": chain,
             "pending": pend,
             "hold": dict(self._hold) if self._hold else None,
@@ -405,7 +432,11 @@ class ChainTracker:
         e = self.psf_estimate
         true = new if e is None else PSF.from_sensor(e["sigma"], e["halo_fraction"],
                                                      e["halo_sigma"])
-        r = photometry_scale(new, true) / max(photometry_scale(old, true), 1e-12)
+        # the references were taken of the image as it was: after refocusing
+        # (see _refocused) the ions are imaged differently, not just modelled
+        before = self._image_psf if self._image_psf is not None else true
+        self._image_psf = None
+        r = photometry_scale(new, true) / max(photometry_scale(old, before), 1e-12)
         for s in self.sites:
             if s.ref:
                 s.ref *= r
@@ -434,6 +465,7 @@ class ChainTracker:
         events: List[dict] = []
         spots = np.array([[s.x, s.y] for s in det.spots], float).reshape(-1, 2)
         self.n_spots = len(spots)
+        self._update_marker(det, t)
         self._update_clouds(det, t, events)
 
         if self._hold is not None:
@@ -795,6 +827,7 @@ class ChainTracker:
 
     def _update_crystal(self, det, spots, t, events):
         obs = self._observe(det, spots)
+        self._record_levels(det, obs)
         hyp = self._classify(det, spots, obs)
         self._record_history(obs, t)
         if hyp is None:
@@ -830,6 +863,8 @@ class ChainTracker:
                     self._pos_noise = math.sqrt(0.95 * self._pos_noise ** 2 + 0.05 * ms)
             if not ambiguous:
                 self._apply_tracking(obs, spots, t, full=moved)
+            if not moved:
+                self._update_refs(obs)
             if moved:
                 self._avg_reset()
             else:
@@ -877,7 +912,11 @@ class ChainTracker:
                 # (decided as at the end: until the average shows the change, it
                 # is not under way, and frames of the old crystal end it)
                 p_.checked_n = p_.avg_n
-                p_.looks_same = self._decide_change(p_, det)[0] == "same"
+                verdict, what = self._decide_change(p_, det)
+                p_.looks_same = verdict in ("same", "refocused")
+                if verdict == "refocused":
+                    self._pending = None
+                    events.append(self._focus_event(what, t))
         if committed and kind == "CHANGE" and p_ is not None and \
                 (p_.avg is None or p_.avg_n < 4):
             committed = False      # decided on the average of >= 4 frames
@@ -893,6 +932,10 @@ class ChainTracker:
             self._commit_sites(hyp[1], hyp[2], obs, t, events)
         elif kind == "CHANGE":
             verdict, new_pos = self._decide_change(p, det)
+            if verdict == "refocused":
+                events.append(self._focus_event(new_pos, t))
+                self._set_state(STABLE, t)
+                return
             if verdict == "dark":
                 # dark: the rest of the crystal is exactly where it was
                 self._commit_sites(new_pos, (), obs, t, events)
@@ -943,6 +986,7 @@ class ChainTracker:
 
     def _update_melted(self, det, spots, t, events):
         cfg = self.cfg
+        self._record_levels(det)
         if len(spots) == 0:
             self._pending = None
             if t - self._state_since > cfg.forget_time and self._premelt is not None:
@@ -982,6 +1026,7 @@ class ChainTracker:
 
     def _update_dark_crystal(self, det, spots, t, events):
         cfg = self.cfg
+        self._record_levels(det)
         if len(spots) == 0:
             self._pending = None
             if t - self._state_since > cfg.forget_time:
@@ -1220,16 +1265,6 @@ class ChainTracker:
                 elif not full:
                     s.x += float(applied[0])
                     s.y += float(applied[1])
-            lv = obs["levels"][k]
-            if np.isfinite(lv):
-                s.level = float(lv)
-            s.snr = float(obs["vals"][k] / obs["noise"][k])
-            if s.state == BRIGHT and obs["inside"][k]:
-                nk = float(obs["norm"][k])
-                if s.ref is None:
-                    s.ref = nk if nk > 0 else obs["default_ref"]
-                elif nk > 0 and 0.3 < nk / s.ref < 3.0:
-                    s.ref += 0.02 * (nk - s.ref)
         region = obs.get("region")
         if region is not None and region > 0 and not obs["missing"]:
             if self._region_ref is None:
@@ -1248,6 +1283,68 @@ class ChainTracker:
                 self._update_chain_fit()
 
     # -- re-measuring the crystal on averaged frames --------------------------------
+
+    def _update_marker(self, det: DetectionResult, t: float) -> None:
+        """Size of the ion markers: the circle holding ``marker_light_fraction``
+        of an ion's light, from the PSF measured in the image (core + halo,
+        fitted to averaged frames of the live crystal - which follows a change
+        of focus - else the detector's, from the calibration fits).  It
+        settles in ``marker_settle_time`` whatever the frame rate."""
+        e, psf = self.psf_estimate, det.psf
+        if psf is None:
+            return
+        hb, vb = det.hbin, det.vbin
+        core = math.sqrt(psf.sx * hb * psf.sy * vb)
+        f, halo = psf.halo, (math.sqrt(psf.hx * hb * psf.hy * vb) if psf.halo > 0 else 0.0)
+        if e is not None:
+            core = math.sqrt(e["sigma"][0] * e["sigma"][1])
+            if e["halo_fraction"] > 0:
+                f, halo = e["halo_fraction"], e["halo_sigma"]
+        r = encircled_radius(core, f, halo, self.cfg.marker_light_fraction)
+        if self.marker_radius is None or self._marker_t is None:
+            self.marker_radius = r
+        else:
+            tau = max(self.cfg.marker_settle_time, 1e-3) / 3.0      # 95 % settled
+            a = 1.0 - math.exp(-min(max(t - self._marker_t, 0.0), 3.0 * tau) / tau)
+            self.marker_radius += a * (r - self.marker_radius)
+        self._marker_t = t
+
+    def _record_levels(self, det: DetectionResult, obs=None) -> None:
+        """Brightness of every site in this frame relative to its reference,
+        whatever the frame shows - the per-ion fluorescence trace (photometry
+        at the sites, so a dark ion reads ~0 and lasers off read 0 for all)."""
+        if not self.sites:
+            return
+        if obs is None:
+            pos = self.positions()
+            vals, noise, inside = det.photometry(pos[:, 0], pos[:, 1])
+            refs = [s.ref for s in self.sites if s.state == BRIGHT and s.ref]
+            default = float(np.median(refs)) if refs else None
+            norm = vals / max(det.gain_factor, 1e-12)
+            levels = np.array([norm[k] / (s.ref or default) if (s.ref or default) else np.nan
+                               for k, s in enumerate(self.sites)])
+        else:
+            vals, noise, inside, levels = obs["vals"], obs["noise"], obs["inside"], obs["levels"]
+        for k, s in enumerate(self.sites):
+            if not inside[k]:
+                continue
+            if np.isfinite(levels[k]):
+                s.level = float(levels[k])
+            if np.isfinite(noise[k]) and noise[k] > 0:
+                s.snr = float(vals[k] / noise[k])
+
+    def _update_refs(self, obs) -> None:
+        """Brightness references follow slow drifts (laser power, focus) on
+        frames of the unchanged crystal - those with two ions seen as one too
+        (joint photometry at the sites does not care, and leaving them out
+        would bias the references towards the brighter frames)."""
+        for k, s in enumerate(self.sites):
+            if s.state == BRIGHT and obs["inside"][k]:
+                nk = float(obs["norm"][k])
+                if s.ref is None:
+                    s.ref = nk if nk > 0 else obs["default_ref"]
+                elif nk > 0 and 0.3 < nk / s.ref < 3.0:
+                    s.ref += 0.02 * (nk - s.ref)
 
     def _avg_reset(self) -> None:
         self._avg = None
@@ -1323,11 +1420,14 @@ class ChainTracker:
                                det.hbin, det.vbin)
 
     def _learn_psf(self, mean: np.ndarray, guesses: np.ndarray, det: DetectionResult,
-                   var_mean: np.ndarray) -> PSF:
+                   var_mean: np.ndarray, span: Tuple[float, float] = (0.6, 1.6),
+                   known_count: bool = False) -> PSF:
         """Fit core + halo to the averaged crystal.  The estimate is kept only if
         the model then explains the image down to the noise (with the wrong
         number of ions it would not, and a PSF bent to hide an ion is worse than
-        none) and the core width is plausible."""
+        none) and the core width is plausible (within ``span`` of the current).
+        It must be round - unless the ions are ``known_count`` (an established
+        crystal), where it only must not be stretched along the chain."""
         cur = self._psf_for(det)
         if det.hbin != 1 or det.vbin != 1 or len(guesses) == 0:
             return cur
@@ -1337,9 +1437,18 @@ class ChainTracker:
             return cur
         sx, sy = g.sigma
         # two unresolved ions look like one stretched along the chain: a learned
-        # PSF must be round (a wrong ion count must not be "explained" by it)
-        ok = (g.success and 0.6 * det.psf.sx < sx < 1.6 * det.psf.sx and
-              0.6 * det.psf.sy < sy < 1.6 * det.psf.sy and 0.92 < sx / sy < 1.087)
+        # PSF must be round (a wrong ion count must not be "explained" by it).
+        # With the ions known, wider across the chain is fine (a short average
+        # often shows that - the halo it cannot resolve yet): it hides no ion
+        round_ = 0.92 < sx / sy < 1.087
+        if known_count and len(guesses) >= 2:
+            d = guesses - guesses.mean(axis=0)
+            ax, ay = np.linalg.eigh(d.T @ d)[1][:, -1]
+            along, across = math.hypot(sx * ax, sy * ay), math.hypot(sx * ay, sy * ax)
+            round_ = along / across < 1.087 and across / along < 1.25
+        lo, hi = span
+        ok = (g.success and lo * det.psf.sx < sx < hi * det.psf.sx and
+              lo * det.psf.sy < sy < hi * det.psf.sy and round_)
         if ok:
             # residuals near the ions against the noise of the average
             c0, r0, c1, r1 = g.window
@@ -1546,10 +1655,51 @@ class ChainTracker:
         if the rest of the crystal stayed exactly where it was, else the
         verdict of _confirm_on_average ("same", "hidden" or "changed" with
         positions)."""
+        refocus = self._refocused(p, det)
+        if refocus is not None:
+            return "refocused", refocus
         dark = max(p.dark_votes, key=p.dark_votes.get) if p.dark_votes else None
         if dark is not None and self._rest_moved(p, det, dark) == "unmoved":
             return "dark", dark
         return self._confirm_on_average(p, det)
+
+    def _focus_event(self, widths, t: float) -> dict:
+        return self._event("focus_changed", "info",
+                           "The ions' image changed size (focus?): PSF sigma {:.2f} -> {:.2f} px "
+                           "- same crystal".format(*widths), t, before=widths[0], after=widths[1])
+
+    def _refocused(self, p: "_Pending", det: DetectionResult):
+        """Did the ions' image get wider (refocusing) rather than the crystal
+        change?  A detector still assuming the old, sharper PSF splits the
+        wider ions into "new" ones.  If the sites as they were, with a
+        re-fitted, clearly wider PSF, explain the average of the frames that
+        showed the change, it is the same crystal (extra ions would leave light
+        unexplained, or stretch the image along the chain; a lost ion cannot be
+        explained by a wider PSF).  The new PSF is kept; returns the old and new
+        core widths [sensor px], or None (and nothing changed).  A sharper
+        image splits nothing - _verify re-measures it."""
+        old = self.positions(include_dark=False)
+        if p.avg is None or p.avg_n < 4 or det.psf is None or len(old) == 0 or \
+                det.hbin != 1 or det.vbin != 1 or len(p.reliable()) <= len(old):
+            return None          # (a wider image shows as ions split into more spots)
+        n = p.avg_n
+        mean = p.avg / n
+        var_mean = _variance_of_mean(mean, p.avg_sq, n)
+        crop, x0, y0, hb, vb, box = p.avg_key
+        ua, va = box[:2]
+        g = np.column_stack([old[:, 0] - x0 - crop[0] - ua, old[:, 1] - y0 - crop[1] - va])
+        before_e = self.psf_estimate
+        before = self._psf_for(det)
+        after = self._learn_psf(mean, g, det, var_mean, span=(1.0, 2.5), known_count=True)
+        if self.psf_estimate is before_e:
+            return None
+        w0, w1 = math.sqrt(before.sx * before.sy), math.sqrt(after.sx * after.sy)
+        if w1 < 1.15 * w0:
+            self.psf_estimate = before_e     # no change of focus: leave no trace
+            return None
+        self._image_psf = before         # what the brightness references were taken with
+        self._avg_reset()                # (the stable average mixes both focus settings)
+        return round(w0, 3), round(w1, 3)
 
     def _rest_moved(self, p: "_Pending", det: DetectionResult, newly_dark) -> str:
         """An ion that goes dark leaves the rest of the crystal exactly where
@@ -1638,7 +1788,10 @@ class ChainTracker:
         lv = [s.level for s in self.sites if s.state == BRIGHT and np.isfinite(s.level)]
         if not lv:
             return
-        level = float(np.median(lv))
+        med = float(np.median(lv))
+        level = self.fluorescence_level
+        # smoothed over ~10 frames: single frames of dim ions are noisy
+        level = med if not math.isfinite(level) else 0.9 * level + 0.1 * med
         self.fluorescence_level = level
         if not self._dim and level < 0.5:
             self._dim = True

@@ -99,7 +99,9 @@ def test_calibrate_arm_trigger_monitor(system):
         assert counts["sums"][-1] == c.sim_grabber_sums()     # USB copy == Grabber view
         stats = c.get_readout_stats()
         assert len(stats["rois"]) == 4
-        assert stats["rois"][0]["mean"] > stats["rois"][3]["mean"]   # ion ROI > background
+        # ion ROI brighter than the background ROI, per super-pixel (the default
+        # ion ROI is a single super-pixel, the background strip several)
+        assert stats["rois"][0]["mean_per_pixel"] > stats["rois"][3]["mean_per_pixel"]
         assert c.is_readout_valid()
         c.disarm_readout()
         assert c.get_status()["mode"] == "live"
@@ -301,7 +303,7 @@ def test_tight_trap_readout_by_hand(tmp_path):
         assert moved["grabber_rois"] == plan["grabber_rois"] and moved["manual_offset"] == [1, 0]
         assert moved["applied"]["roi"] == moved["aqroi"]          # re-armed with it
         assert c.get_status()["mode"] == "readout"
-        fine = c.replan_readout(2, 2)
+        fine = c.replan_readout(2, 2, None, [2, 2])      # 2x2 super-pixels per ion
         assert fine["binning"] == [2, 2] and min(fine["containment"]) > 0.6
         aq = fine["aqroi"]
         fixed = c.replan_readout(2, 2, [aq[0] - 4, aq[1] - 2, aq[2] + 4, aq[3] + 2])

@@ -5,15 +5,20 @@ Geometry
 The camera reads the AQROI ``[x0, x1) x [y0, y1)`` (sensor px) with on-chip
 binning ``hbin x vbin``; the resulting ``W x H`` frame is what the ARTIQ
 Grabber receives over Camera Link.  Each ion gets its own rectangular ROI of
-binned pixels (sizes may differ between ions).  Where the ion sits relative to the binning grid matters: an ion on a
-super-pixel boundary splits its light.  The grid *phase* is set by the
-AQROI origin, so the planner tries every phase (``hbin x vbin`` choices) and
-every ROI size, computing for each ion the exact fraction of its fitted PSF
-(Gaussian core plus, if measured, the broad halo of aberration wings that
-dominates the crosstalk of real imaging systems) inside its own ROI
-(*containment*) and inside every other ROI (*crosstalk*), and keeps the
-placement with the best worst-case containment
-(smallest ROIs first among those meeting ``min_containment``).  The AQROI is
+binned pixels.  By default every ion gets one super-pixel (``roi_size = (1,
+1)``): each super-pixel adds its own dark counts (clock-induced charge,
+scatter, read noise) to the sum, so the fewest pixels around the brightest
+part of the ion image usually discriminate bright from dark best.  Where the
+ion sits relative to the binning grid matters: an ion on a super-pixel
+boundary splits its light.  The grid *phase* is set by the AQROI origin, so
+the planner tries every phase (``hbin x vbin`` choices) - which centres the
+ions in their super-pixels as well as their spacing allows - and with
+``roi_size = (0, 0)`` every ROI size, computing for each ion the exact
+fraction of its fitted PSF (Gaussian core plus, if measured, the broad halo
+of aberration wings that dominates the crosstalk of real imaging systems)
+inside its own ROI (*containment*) and inside every other ROI (*crosstalk*),
+and keeps the placement with the best worst-case containment (smallest ROIs
+first among those meeting ``min_containment``).  The AQROI is
 then the bounding box of all ROIs plus a symmetric margin, i.e. centred on
 the crystal.  Ions closer than the binning can separate still get a plan:
 every ion its own best ROI, overlapping ROIs allowed (the Grabber sums each
@@ -448,11 +453,13 @@ def plan_readout(positions: Sequence[Sequence[float]], sigma: Tuple[float, float
     key, px, py, picks, f, cont, xt = best
     geometry: List[str] = []
     if not key[0]:
+        hint = ("a super-pixel smaller than the ion image holds little of its light: more "
+                "binning or a larger roi_size" if fixed else
+                "consider less binning (see binning_advice) or a larger ion spacing")
         geometry.append("no placement reaches containment >= {:.0%} with crosstalk <= {:.0%}; "
-                        "best worst-ion containment {:.1%}, worst crosstalk {:.1%} - consider "
-                        "less binning (see binning_advice) or a larger ion spacing".format(
+                        "best worst-ion containment {:.1%}, worst crosstalk {:.1%} - {}".format(
                             min_containment, max_crosstalk, cont.min(),
-                            float(xt.max()) if n > 1 else 0.0))
+                            float(xt.max()) if n > 1 else 0.0, hint))
     m0 = np.array([p[1] for p in picks])
     n0 = np.array([p[2] for p in picks])
     wid = np.array([p[3] for p in picks])
@@ -463,6 +470,7 @@ def plan_readout(positions: Sequence[Sequence[float]], sigma: Tuple[float, float
         aq = aq_fixed
         u_min, u_max = (aq[0] - px) // hbin, (aq[2] - px) // hbin
         v_min, v_max = (aq[1] - py) // vbin, (aq[3] - py) // vbin
+        bg_row = None
     else:
         # -- AQROI: bounding box of the ROIs + symmetric margin, kept on the sensor
         u_lo, u_hi = int(m0.min()), int((m0 + wid).max())
@@ -478,6 +486,30 @@ def plan_readout(positions: Sequence[Sequence[float]], sigma: Tuple[float, float
             notes.append("crystal close to the sensor edge: AQROI margin reduced")
         u_min, u_max = u_lo - left, u_hi + right
         v_min, v_max = v_lo - bottom, v_hi + top
+        bg_row = None
+        if background_roi:
+            # the background strip: a super-pixel row across the ion columns
+            # holding < 2 % of an ion's light, as close to the ions as that
+            # allows (small ROIs leave the ions' wings in the next row; every
+            # extra row costs readout time)
+            c0, c1 = int(m0.min()), int((m0 + wid).max())
+            best_bg = None
+            for extra in range(3):
+                for row in (v_min - extra, v_max - 1 + extra):
+                    y_a = py + row * vbin
+                    if y_a < 0 or y_a + vbin > sh or \
+                            any(n0[i] <= row < n0[i] + hgt[i] for i in range(n)):
+                        continue
+                    c = float(_light_matrix([px + c0 * hbin - 0.5], [px + c1 * hbin - 0.5],
+                                            [y_a - 0.5], [y_a + vbin - 0.5], pos, sx, sy,
+                                            halo).sum())
+                    if best_bg is None or c < best_bg[0]:
+                        best_bg = (c, row)
+                if best_bg is not None and best_bg[0] <= 0.02:
+                    break
+            if best_bg is not None:
+                bg_row = best_bg[1]
+                v_min, v_max = min(v_min, bg_row), max(v_max, bg_row + 1)
         aq = (px + u_min * hbin, py + v_min * vbin, px + u_max * hbin, py + v_max * vbin)
     fw, fh = u_max - u_min, v_max - v_min
     ion_rois = [(int(m0[i] - u_min), int(n0[i] - v_min), int(m0[i] - u_min + wid[i]),
@@ -490,7 +522,7 @@ def plan_readout(positions: Sequence[Sequence[float]], sigma: Tuple[float, float
         cu0 = min(r[0] for r in ion_rois)
         cu1 = max(r[2] for r in ion_rois)
         cands = []
-        for v in [0, fh - 1]:
+        for v in ([0, fh - 1] if bg_row is None else [bg_row - v_min]):
             rect = (cu0, v, cu1, v + 1)
             if any(_overlap(rect, r) for r in ion_rois):
                 continue
@@ -690,13 +722,19 @@ def verify_plan(plan: ReadoutPlan, frames: Sequence[np.ndarray], min_snr: float 
                      "discrimination_error": round(err, 4)})
         if plan.ion_states[i] == "bright" and snr < min_snr:
             problems.append("ion {}: SNR {:.1f} < {} - not in its ROI?".format(i, snr, min_snr))
-    bright = [nets[i] for i in range(n) if plan.ion_states[i] == "bright"]
-    if len(bright) >= 2:
-        med = float(np.median(bright))
-        for i in range(n):
-            if plan.ion_states[i] == "bright" and med > 0 and nets[i] < 0.4 * med:
-                problems.append("ion {} gives only {:.0%} of the median ion signal".format(
-                    i, nets[i] / med))
+    # every ROI against the light the plan expects in it (containment and the
+    # neighbours' share, for whatever ROI sizes and overlaps the plan has)
+    lit = [i for i in range(n) if plan.ion_states[i] == "bright"]
+    F = np.asarray(plan.crosstalk_matrix, float).reshape(n, n) if plan.crosstalk_matrix \
+        else np.eye(n)
+    expected = F[:, lit].sum(axis=1) if lit else np.zeros(n)
+    ratio = {i: nets[i] / expected[i] for i in lit if expected[i] > 0.02}
+    if len(ratio) >= 2:
+        med = float(np.median(list(ratio.values())))
+        for i, r in ratio.items():
+            if med > 0 and r < 0.4 * med:
+                problems.append("ion {} gives only {:.0%} of the signal expected in its ROI "
+                                "(compared with the other ions)".format(i, r / med))
     return {"ok": not problems, "problems": problems, "n_frames": int(f.shape[0]),
             "background_per_pixel": round(bg_level, 2), "background_noise": round(bg_noise, 2),
             "ions": ions, "max_count": int(f.max())}

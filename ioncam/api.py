@@ -25,7 +25,7 @@ import time
 
 import numpy as np
 
-from ioncam import __version__
+from ioncam import version_string
 from ioncam.analysis.readout import grabber_roi_sums
 from ioncam.camera.base import AcquisitionSettings
 
@@ -63,12 +63,14 @@ class IonCamAPI:
         return True
 
     def get_version(self):
-        """ioncam version string."""
-        return __version__
+        """ioncam version and the git commit it runs from ("installed copy" if it
+        was copied into site-packages instead of installed with ``pip install -e``)."""
+        return version_string()
 
     def get_info(self):
         """Camera model, serial number, sensor size, simulated flag, capabilities."""
         info = dict(self._engine.info)
+        info["ioncam_version"] = version_string()
         try:
             info["capabilities"] = self._engine.camera.capabilities()
         except Exception:

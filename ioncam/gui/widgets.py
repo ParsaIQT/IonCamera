@@ -253,12 +253,18 @@ class ImagePanel(QtWidgets.QWidget):
             self._geometry = geom
         self._last = (img, roi, hbin, vbin)
 
-    def set_sites(self, sites, spots=(), clouds=()):
+    def set_sites(self, sites, spots=(), clouds=(), marker_radius=None):
+        """Ion markers: circles holding ``marker_radius``'s share of each ion's
+        light (radius in sensor px, from the server; fixed screen size without)."""
         vis = self.show_overlays
         b = [(s["x"], s["y"]) for s in sites if s["state"] == "bright"]
         d = [(s["x"], s["y"]) for s in sites if s["state"] != "bright"]
-        self.sc_bright.setData(pos=np.array(b).reshape(-1, 2) if vis else np.zeros((0, 2)))
-        self.sc_dark.setData(pos=np.array(d).reshape(-1, 2) if vis else np.zeros((0, 2)))
+        size = dict(size=2.0 * float(marker_radius), pxMode=False) if marker_radius else \
+            dict(size=16, pxMode=True)
+        self.sc_bright.setData(pos=np.array(b).reshape(-1, 2) if vis else np.zeros((0, 2)),
+                               **size)
+        self.sc_dark.setData(pos=np.array(d).reshape(-1, 2) if vis else np.zeros((0, 2)),
+                             **size)
         self.sc_spots.setData(pos=np.array([(s["x"], s["y"]) for s in spots]).reshape(-1, 2)
                               if vis else np.zeros((0, 2)))
         self.sc_clouds.setData(pos=np.array([(s["x"], s["y"]) for s in clouds]).reshape(-1, 2)

@@ -1,5 +1,7 @@
 """Crystal tracking scenarios in virtual time (simulated trap + EMCCD)."""
 
+import math
+
 import numpy as np
 import pytest
 
@@ -231,3 +233,55 @@ def test_full_sensor_start():
     assert sc.tracker.n_bright == 3
     sc.run(4.0)
     assert sc.take() == []
+
+
+def test_brightness_levels_follow_every_ion():
+    """The per-ion brightness (the GUI's trace) is measured in every frame: a
+    dark ion reads ~0 at once, the others ~1."""
+    sc = settle(3, **TIGHT)
+    sc.scene.set_dark(1, True)
+    sc.step(3)
+    lv = [s.level for s in sc.tracker.sites]
+    assert lv[1] < 0.3 and lv[0] > 0.6 and lv[2] > 0.6
+    assert 0.8 < sc.tracker.fluorescence_level < 1.2
+
+
+def test_encircled_radius():
+    from ioncam.analysis.tracker import encircled_radius
+    assert encircled_radius(1.0, fraction=0.8) == pytest.approx(1.794, abs=1e-3)
+    assert encircled_radius(1.2, 0.15, 4.5) > encircled_radius(1.2)      # the halo counts
+
+
+@pytest.mark.parametrize("seed", [1, 3])
+def test_refocusing_is_not_a_change_of_the_crystal(seed):
+    """Defocus (PSF core 1.2 -> 1.8 px): a detector still assuming the sharp
+    PSF splits the ions, but the same ions with a re-fitted wider PSF explain
+    the image - "focus_changed", no ions trapped.  The markers (80 % of the
+    light) follow within the settling time."""
+    from ioncam.analysis.tracker import encircled_radius
+    sc = settle(2, seed=seed, **TIGHT)
+    sc.scene.set_params(psf_sigma=1.8)
+    sc.run(8.0)
+    assert kinds(sc.take()) == ["focus_changed"]
+    assert sc.tracker.n_bright == 2
+    halo = sc.cfg.simulator.psf_halo_fraction, sc.cfg.simulator.psf_halo_sigma
+    assert sc.tracker.marker_radius == pytest.approx(encircled_radius(1.8, *halo), rel=0.12)
+
+
+@pytest.mark.parametrize("angle", [45, 90])
+def test_rotated_trap(angle):
+    """The simulator turns the whole trap in the image (sim trap_angle_deg):
+    dark vs lost work along any chain direction."""
+    sc = settle(3, trap_angle_deg=angle, **TIGHT)
+    pos = sc.tracker.positions()
+    d = pos[-1] - pos[0]
+    assert math.degrees(math.atan2(abs(d[1]), abs(d[0]))) == pytest.approx(angle, abs=3)
+    sc.scene.set_dark(2, True)
+    sc.run(2.5)
+    assert kinds(sc.take()) == ["ion_dark"]
+    sc.scene.set_dark(2, False)
+    sc.run(2.5)
+    sc.take()
+    sc.scene.lose_ion(0)
+    sc.run(3.0)
+    assert kinds(sc.take()) == ["ion_lost"] and sc.tracker.n_bright == 2

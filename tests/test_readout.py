@@ -228,3 +228,21 @@ def test_grabber_mapping_check():
                     ("rot180", exp[::-1, ::-1])]:
         r = compare_grabber_frame(exp, m + rng.normal(0, 30, m.shape))
         assert r["best"] == name
+
+
+@pytest.mark.parametrize("n", [1, 2, 3])
+def test_one_centred_super_pixel_per_ion(n):
+    """The default: one super-pixel per ion (each super-pixel adds dark
+    counts), the grid placed so the ions sit at their centres; the background
+    strip far enough out to be clean."""
+    assert tuple(Config().calibration.roi_size) == (1, 1)
+    pos = chain(n, 3.4)
+    p = plan_readout(pos, (1.2, 1.2), SENSOR, 4, 4, roi_size=(1, 1), halo=TIGHT_HALO)
+    for i, (x, y) in enumerate(pos):
+        u0, v0, u1, v1 = p.ion_rois[i]
+        assert (u1 - u0, v1 - v0) == (1, 1)
+        cx = p.roi[0] + (u0 + 0.5) * 4 - 0.5
+        cy = p.roi[1] + (v0 + 0.5) * 4 - 0.5
+        # centred as far as the spacing allows (3.66 px apart on a 4 px grid: <= 0.84)
+        assert abs(x - cx) <= 0.85 and abs(y - cy) <= 0.5
+    assert min(p.containment) > 0.6 and p.background_contamination <= 0.02

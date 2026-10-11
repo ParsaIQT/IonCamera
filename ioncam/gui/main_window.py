@@ -45,6 +45,7 @@ SIM_FIELDS = [
     ("psf_halo_fraction", "PSF halo: fraction of the light", 0.0, 0.8, 0.05, 2),
     ("psf_halo_sigma", "PSF halo sigma [px]", 0.5, 30.0, 0.5, 1),
     ("length_scale_px", "chain length scale [px]", 1.0, 100.0, 0.2, 2),
+    ("trap_angle_deg", "trap rotation in the image [deg]", -180.0, 180.0, 15.0, 0),
     ("background_rate", "uniform stray light [photons/s/px]", 0.0, 1e4, 1.0, 1),
     ("scatter_rate", "laser scatter at the beam centre [photons/s/px]", 0.0, 1e5, 5.0, 1),
     ("scatter_sigma_along", "scatter width along the beam [px]", 1.0, 2000.0, 10.0, 0),
@@ -171,8 +172,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.simulated = bool(info.get("simulated"))
         backend.on_error = self._error
         disp = _Display(config.get("display", {}))
-        self.setWindowTitle("ioncam - {} ({})".format(info.get("model", "camera"),
-                                                       backend.describe()))
+        self.setWindowTitle("ioncam {} - {} ({})".format(
+            info.get("ioncam_version", ""), info.get("model", "camera"), backend.describe()))
         self.resize(1500, 900)
 
         self.banner = StatusBanner()
@@ -331,6 +332,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.vbin = QtWidgets.QSpinBox()
         self.vbin.setRange(1, 16)
         self.vbin.setValue(ro.get("vbin", 4))
+        rs = (self.config.get("calibration", {}).get("roi_size") or [1, 1])
+        self.roi_w, self.roi_h = QtWidgets.QSpinBox(), QtWidgets.QSpinBox()
+        for sp, v in ((self.roi_w, rs[0]), (self.roi_h, rs[1])):
+            sp.setRange(0, 12)
+            sp.setValue(int(v))
+            sp.setSpecialValueText("auto")
+            sp.setToolTip("Grabber ROI per ion, in super-pixels.  1 x 1: one super-pixel per "
+                          "ion, the grid placed so the ions sit at their centres - the fewest "
+                          "pixels and so the fewest dark counts in each sum, usually the best "
+                          "SPAM fidelity.  auto: as much of each ion's light as the grid "
+                          "allows (bigger ROIs, more dark counts).")
         self.auto_bin = QtWidgets.QCheckBox("auto binning")
         self.verify = QtWidgets.QCheckBox("verify")
         self.verify.setChecked(True)
@@ -355,6 +367,7 @@ class MainWindow(QtWidgets.QMainWindow):
         box = _group("Grabber readout", [
             _row("ions", self.n_ions, "binning", self.hbin, "x", self.vbin, self.auto_bin,
                  self.verify),
+            _row("ROI per ion", self.roi_w, "x", self.roi_h, "super-pixels"),
             _row("exposure", self.ro_exp, "EM gain", self.ro_gain),
             _row(_button("Locate ions", lambda: self._cmd("locate_ions", self.n_ions.value(),
                                                           callback=self._located),
@@ -485,6 +498,10 @@ class MainWindow(QtWidgets.QMainWindow):
             _row(_button("Melt 1 s", lambda: c("sim_melt", 1.0)),
                  _button("Shift +5 px", lambda: c("sim_shift", 5.0, 0.0)),
                  _button("Shift -5 px", lambda: c("sim_shift", -5.0, 0.0))),
+            _row("rotate the trap", *[_button("{} deg".format(a), lambda a_=a: self._set_sim(
+                trap_angle_deg=a_), "turn the whole trap in the image (ions, electrodes, "
+                "surface, laser beam) - then learn the background again")
+                for a in (0, 45, 90)]),
         ]))
         lay.addWidget(_group("Lab", [
             _row(_button("Lasers off", lambda: c("sim_set_lasers", False)),
@@ -616,8 +633,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _calibrate(self):
         kw = dict(n_ions=self.n_ions.value(), hbin=self.hbin.value(), vbin=self.vbin.value(),
-                  auto_binning=self.auto_bin.isChecked(), verify=self.verify.isChecked(),
-                  exposure=self.ro_exp.value(), em_gain=self.ro_gain.value())
+                  roi_size=self._roi_size(), auto_binning=self.auto_bin.isChecked(),
+                  verify=self.verify.isChecked(), exposure=self.ro_exp.value(),
+                  em_gain=self.ro_gain.value())
         self._cmd("calibrate_readout", callback=self._got_plan, **kw)
 
     def _located(self, res):
@@ -676,12 +694,18 @@ class MainWindow(QtWidgets.QMainWindow):
             self.msg_label.setText("cannot move the AQROI: {}".format(exc))
         self.backend.call("nudge_readout", dx, dy, callback=done, error=failed)
 
+    def _roi_size(self):
+        """[w, h] super-pixels; [0, 0] = auto (either one "auto" makes both)."""
+        w, h = self.roi_w.value(), self.roi_h.value()
+        return [0, 0] if w == 0 or h == 0 else [w, h]
+
     def _replan(self):
-        self._cmd("replan_readout", self.hbin.value(), self.vbin.value(), callback=self._got_plan)
+        self._cmd("replan_readout", self.hbin.value(), self.vbin.value(), None,
+                  self._roi_size(), callback=self._got_plan)
 
     def _use_aqroi(self):
         self._cmd("replan_readout", self.hbin.value(), self.vbin.value(),
-                  [sp.value() for sp in self.aq_edit], callback=self._got_plan)
+                  [sp.value() for sp in self.aq_edit], self._roi_size(), callback=self._got_plan)
 
     def _copy_snippet(self):
         QtWidgets.QApplication.clipboard().setText(artiq_snippet(self._plan))
@@ -737,7 +761,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._remote_bin = 2 if fr["image"].size * fr["hbin"] * fr["vbin"] > 300000 else 1
         det = out.get("detection") or {}
         sites = st.get("sites", [])
-        self.image.set_sites(sites, det.get("spots", []), det.get("clouds", []))
+        self.image.set_sites(sites, det.get("spots", []), det.get("clouds", []),
+                             st["ions"].get("marker_radius"))
         upd = st["ions"].get("last_update")
         if sites and upd and upd != getattr(self, "_last_tracker_update", None):
             self._last_tracker_update = upd
