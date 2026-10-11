@@ -315,6 +315,28 @@ class IonCamAPI:
             bool(arm), verify, bool(auto_binning), bool(force), locate or {},
             **_settings(readout_settings)))
 
+    async def nudge_readout(self, dx=0, dy=0):
+        """Move the AQROI by (dx, dy) sensor px, e.g. 1 px steps to centre the
+        ions in their ROIs by hand.  The Grabber ROIs are frame coordinates, so
+        they move with it and stay the same numbers; containment and crosstalk
+        are re-computed, an armed readout is re-armed.  Returns the plan."""
+        return _plain(await self._run(self._engine.nudge_readout, int(dx), int(dy)))
+
+    async def replan_readout(self, hbin=0, vbin=0, aqroi=None, roi_size=None):
+        """Plan again from the located ions (no new locate): another binning
+        and/or a fixed AQROI [x0, y0, x1, y1] (sensor px, half-open, a multiple
+        of the binning) inside which the ROIs are placed.  Ions too close to
+        separate get overlapping ROIs plus a warning, never an error.  Re-arms
+        if armed; not verified (see verify_readout).  Returns the plan."""
+        return _plain(await self._run(self._engine.replan_readout, int(hbin), int(vbin),
+                                      aqroi, roi_size))
+
+    async def verify_readout(self, force=True):
+        """Test frames with the current plan (internal trigger): signal of
+        every ion in its ROI, single-shot SNR.  Returns the plan with its
+        "verification"."""
+        return _plain(await self._run(self._engine.verify_readout, bool(force)))
+
     async def arm_readout(self):
         """Re-arm the Grabber readout with the existing plan (e.g. after live)."""
         return _plain(await self._run(self._engine.arm_readout))

@@ -84,6 +84,9 @@ def format_plan(plan):
     lines.append("  -> core device log should say: grabber0 frame size: {}x{}".format(w, h))
     lines.append("AQROI (Solis Left, Right, Bottom, Top): {}".format(
         ", ".join(str(v) for v in plan["aqroi_solis"])))
+    off = plan.get("manual_offset") or [0, 0]
+    if any(off):
+        lines.append("  moved by hand by ({:+d}, {:+d}) px from the computed plan".format(*off))
     lines.append("SDK SetImage{}".format(tuple(plan["sdk_image"])))
     lines.append("")
     lines.append(" ROI    x0  y0  x1  y1   contain  crosstalk   ion - ROI centre [px]")
@@ -251,7 +254,10 @@ class MainWindow(QtWidgets.QMainWindow):
         ])
         self.auto_levels = QtWidgets.QCheckBox("auto levels")
         self.auto_levels.setChecked(True)
-        self.auto_levels.toggled.connect(lambda v: setattr(self.image, "auto_levels", v))
+        self.auto_levels.setToolTip("brightness levels follow every frame; off (or after "
+                                    "dragging the histogram handles) they stay as set")
+        self.auto_levels.toggled.connect(self.image.set_auto_levels)
+        self.image.autoLevelsChanged.connect(self._auto_levels_changed)
         self.overlays = QtWidgets.QCheckBox("overlays")
         self.overlays.setChecked(True)
         self.overlays.toggled.connect(self._toggle_overlays)
@@ -363,11 +369,66 @@ class MainWindow(QtWidgets.QMainWindow):
         w = QtWidgets.QWidget()
         lay = QtWidgets.QVBoxLayout(w)
         lay.addWidget(box)
+        lay.addWidget(self._manual_box())
         lay.addWidget(self.plan_text, 2)
         lay.addLayout(_row(copy))
         lay.addLayout(_row("histogram of ion", self.hist_ion, self.hist_label))
         lay.addWidget(self.hist, 1)
         return w
+
+    def _manual_box(self):
+        """Adjusting the readout by hand: a D-pad moves the AQROI - and every
+        Grabber ROI with it - on screen, re-planning with another binning or
+        inside a given AQROI keeps the located ion positions."""
+        self.nudge_step = QtWidgets.QSpinBox()
+        self.nudge_step.setRange(1, 64)
+        self.nudge_step.setValue(1)
+        self.nudge_step.setSuffix(" px")
+        self.nudge_step.setToolTip("step of the D-pad [sensor px]")
+        pad = QtWidgets.QGridLayout()
+        pad.setSpacing(2)
+        arrows = QtCore.Qt.ArrowType
+        for r, c, arrow, right, up, name in ((0, 1, arrows.UpArrow, 0, 1, "up"),
+                                             (1, 0, arrows.LeftArrow, -1, 0, "left"),
+                                             (1, 2, arrows.RightArrow, 1, 0, "right"),
+                                             (2, 1, arrows.DownArrow, 0, -1, "down")):
+            b = QtWidgets.QToolButton()
+            b.setArrowType(arrow)
+            b.setAutoRepeat(True)
+            b.setAutoRepeatDelay(400)
+            b.setAutoRepeatInterval(150)
+            b.setMinimumSize(34, 34)
+            b.setToolTip("move the AQROI - and all ROI boxes with it - {} on screen by one "
+                         "step: the ions move the other way inside their ROIs".format(name))
+            b.clicked.connect(lambda _=False, r_=right, u_=up: self._nudge(r_, u_))
+            pad.addWidget(b, r, c)
+        pad.addWidget(self.nudge_step, 1, 1)
+        self.offset_label = QtWidgets.QLabel("no plan yet")
+        self.offset_label.setWordWrap(True)
+        self.aq_edit = []
+        for name in ("x0", "y0", "x1", "y1"):
+            sp = QtWidgets.QSpinBox()
+            sp.setRange(0, 8192)
+            sp.setToolTip("AQROI {} [sensor px; x1, y1 exclusive]".format(name))
+            self.aq_edit.append(sp)
+        self._nudge_pending = [0, 0]
+        self._nudge_busy = False
+        right = QtWidgets.QVBoxLayout()
+        right.addWidget(self.offset_label)
+        right.addLayout(_row(
+            _button("Re-plan", self._replan, "plan again with the binning set above, from the "
+                    "ions already located (no new locate)"),
+            _button("Verify", lambda: self._cmd("verify_readout", callback=self._got_plan),
+                    "test frames with this plan: signal of every ion in its ROI")))
+        right.addLayout(_row("AQROI", *self.aq_edit))
+        right.addLayout(_row(_button("Use this AQROI", self._use_aqroi,
+                                     "place the ROIs inside this AQROI (sensor px, x1/y1 "
+                                     "exclusive; its size a multiple of the binning)")))
+        g = QtWidgets.QGroupBox("Adjust by hand (D-pad moves the AQROI and all ROIs)")
+        gl = QtWidgets.QHBoxLayout(g)
+        gl.addLayout(pad)
+        gl.addLayout(right, 1)
+        return g
 
     def _ions_tab(self):
         self.sites = SiteTable()
@@ -571,6 +632,56 @@ class MainWindow(QtWidgets.QMainWindow):
         self._plan_created = plan.get("created")
         self.plan_text.setPlainText(format_plan(plan))
         self.image.set_plan(plan)
+        off = plan.get("manual_offset") or [0, 0]
+        self.offset_label.setText("AQROI {} (Solis L,R,B,T {}), {}x{} binning{}".format(
+            plan["aqroi"], plan["aqroi_solis"], plan["binning"][0], plan["binning"][1],
+            ", moved by hand ({:+d}, {:+d}) px".format(*off) if any(off) else ", as planned"))
+        for sp, v in zip(self.aq_edit, plan["aqroi"]):
+            sp.setValue(int(v))
+
+    def _auto_levels_changed(self, on):
+        self.auto_levels.blockSignals(True)
+        self.auto_levels.setChecked(on)
+        self.auto_levels.blockSignals(False)
+
+    def _nudge(self, right, up):
+        """D-pad: move the AQROI one step in a screen direction (steps pressed
+        while a move is being applied are added up and sent together)."""
+        if not self._plan:
+            self.msg_label.setText("no readout plan to adjust - calibrate first")
+            return
+        dx, dy = self.image.screen_step(right, up)
+        k = self.nudge_step.value()
+        self._nudge_pending[0] += dx * k
+        self._nudge_pending[1] += dy * k
+        self._send_nudge()
+
+    def _send_nudge(self):
+        if self._nudge_busy or self._nudge_pending == [0, 0]:
+            return
+        dx, dy = self._nudge_pending
+        self._nudge_pending = [0, 0]
+        self._nudge_busy = True
+        self.msg_label.setText("moving the AQROI by ({:+d}, {:+d}) px...".format(dx, dy))
+
+        def done(plan):
+            self._nudge_busy = False
+            self.msg_label.setText("AQROI moved by ({:+d}, {:+d}) px".format(dx, dy))
+            self._got_plan(plan)
+            self._send_nudge()
+
+        def failed(name, exc):
+            self._nudge_busy = False
+            self._nudge_pending = [0, 0]
+            self.msg_label.setText("cannot move the AQROI: {}".format(exc))
+        self.backend.call("nudge_readout", dx, dy, callback=done, error=failed)
+
+    def _replan(self):
+        self._cmd("replan_readout", self.hbin.value(), self.vbin.value(), callback=self._got_plan)
+
+    def _use_aqroi(self):
+        self._cmd("replan_readout", self.hbin.value(), self.vbin.value(),
+                  [sp.value() for sp in self.aq_edit], callback=self._got_plan)
 
     def _copy_snippet(self):
         QtWidgets.QApplication.clipboard().setText(artiq_snippet(self._plan))

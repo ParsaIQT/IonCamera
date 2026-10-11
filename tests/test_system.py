@@ -283,6 +283,54 @@ def test_full_stack_on_emulated_andor_sdk(tmp_path):
         engine.shutdown()
 
 
+def test_tight_trap_readout_by_hand(tmp_path):
+    """PSF 1.2 px, l = 3.4 px (the lab's trap): coarse binning gives
+    overlapping ROIs instead of an error; the AQROI is then moved by hand in
+    1 px steps (the Grabber ROIs stay), re-planned and verified."""
+    engine, server, port = make_system(tmp_path, n_ions=3, psf_sigma=1.2, length_scale_px=3.4)
+    c = client(port)
+    try:
+        assert c.wait_for_ions(3, timeout=20)["ok"]
+        plan = c.calibrate_readout(n_ions=3, hbin=8, vbin=8)
+        assert c.get_status()["mode"] == "readout"
+        assert plan["roi_labels"] == ["ion 0", "ion 1", "ion 2", "bg"]
+        assert any("overlap" in w or "same ROI" in w for w in plan["warnings"])
+        moved = c.nudge_readout(1, 0)
+        x0, y0, x1, y1 = plan["aqroi"]
+        assert moved["aqroi"] == [x0 + 1, y0, x1 + 1, y1]
+        assert moved["grabber_rois"] == plan["grabber_rois"] and moved["manual_offset"] == [1, 0]
+        assert moved["applied"]["roi"] == moved["aqroi"]          # re-armed with it
+        assert c.get_status()["mode"] == "readout"
+        fine = c.replan_readout(2, 2)
+        assert fine["binning"] == [2, 2] and min(fine["containment"]) > 0.6
+        aq = fine["aqroi"]
+        fixed = c.replan_readout(2, 2, [aq[0] - 4, aq[1] - 2, aq[2] + 4, aq[3] + 2])
+        assert fixed["aqroi"] == [aq[0] - 4, aq[1] - 2, aq[2] + 4, aq[3] + 2]
+        checked = c.verify_readout()
+        assert checked["verification"]["ok"] and c.get_status()["mode"] == "readout"
+        c.disarm_readout()
+    finally:
+        c.close_rpc()
+        server.stop()
+        engine.shutdown()
+
+
+def test_locate_splits_a_merged_pair(tmp_path):
+    """Two ions 2.8 px apart look like one spot: told how many to expect,
+    locate fits two along the spot's elongation."""
+    engine, server, port = make_system(tmp_path, n_ions=2, psf_sigma=1.2, length_scale_px=2.2)
+    try:
+        time.sleep(2.0)
+        res = engine.locate_ions(2)
+        truth = np.array(engine.sim_scene().state()["positions"])
+        pos = np.array(res["positions"])
+        assert res["n_ions"] == 2
+        assert np.abs(pos[np.argsort(pos[:, 0])] - truth[np.argsort(truth[:, 0])]).max() < 0.3
+    finally:
+        server.stop()
+        engine.shutdown()
+
+
 def test_calibration_files_written(system, tmp_path_factory):
     engine, port = system
     d = os.path.join(engine.config.storage.data_dir, "calibrations")
@@ -314,6 +362,35 @@ def test_gui_smoke(tmp_path):
         assert "ion" in win.banner.count.text()
         x0, y0, x1, y1 = win.image.visible_sensor_rect()
         assert x0 <= 170 and x1 >= 350          # whole live ROI visible
+        # brightness levels dragged by hand stay put (auto levels switch off)
+        win.image.hist.item.region.setRegion((100.0, 400.0))
+        t = time.time()
+        while time.time() - t < 0.5:
+            app.processEvents()
+            time.sleep(0.01)
+        assert not win.image.auto_levels and not win.auto_levels.isChecked()
+        assert tuple(win.image.img.levels) == (100.0, 400.0)
+        win.image.set_auto_levels(True)
+        assert tuple(win.image.img.levels) != (100.0, 400.0)
+        # the D-pad moves things on screen: through the display rotation
+        win.image.set_orientation(90)
+        # (90 deg clockwise: sensor +x points down, +y right on screen)
+        assert win.image.screen_step(1, 0) == (0, 1) and win.image.screen_step(0, 1) == (-1, 0)
+        win.image.set_orientation(0)
+        assert win.image.screen_step(1, 0) == (1, 0) and win.image.screen_step(0, 1) == (0, 1)
+        # every Grabber ROI is labelled on the image
+        win._got_plan({"aqroi": [250, 160, 270, 176], "aqroi_solis": [251, 270, 161, 176],
+                       "binning": [2, 2], "n_ions": 2, "ion_rois": [[2, 2, 5, 6], [5, 2, 8, 6]],
+                       "background_roi": [2, 0, 8, 1], "containment": [0.8, 0.75],
+                       "created": 1.0, "frame_size": [10, 8], "sdk_image": [2, 2, 251, 270,
+                                                                              161, 176],
+                       "grabber_rois": [[2, 2, 5, 6], [5, 2, 8, 6], [2, 0, 8, 1]],
+                       "positions": [[255.0, 168.0], [262.0, 168.0]], "crosstalk": [0.1, 0.1],
+                       "ion_states": ["bright", "bright"], "background_contamination": 0.0,
+                       "ion_mask": 3, "full_mask": 7})
+        labels = [it.textItem.toPlainText() for it in win.image._rects
+                  if isinstance(it, pg.TextItem)]
+        assert labels[:3] == ["ion 0 80%", "ion 1 75%", "bg"] and "AQROI" in labels
         win.close()
     finally:
         backend.close()

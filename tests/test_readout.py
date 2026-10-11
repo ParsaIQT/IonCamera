@@ -4,7 +4,8 @@ import pytest
 from ioncam.analysis.chain import equilibrium_positions
 from ioncam.analysis.readout import (PlanError, binning_advice, compare_grabber_frame,
                                      fit_threshold, grabber_roi_sum_exact, grabber_roi_sums,
-                                     map_rect, plan_readout, validate_roi, verify_plan)
+                                     map_rect, plan_readout, reposition_plan, validate_roi,
+                                     verify_plan)
 from ioncam.camera.simulator import SimulatedCamera
 from ioncam.config import Config
 
@@ -88,6 +89,54 @@ def test_errors():
         plan_readout([], (1.3, 1.3), SENSOR, 4, 4)
     with pytest.raises(PlanError):
         plan_readout(chain(17, 10.0), (1.3, 1.3), SENSOR, 1, 1, max_rois=16)
+
+
+TIGHT_HALO = (0.15, 4.5)
+
+
+@pytest.mark.parametrize("n, hb", [(3, 8), (4, 4), (4, 8), (2, 16)])
+def test_close_ions_get_a_plan_with_overlapping_rois(n, hb):
+    """Ions closer than the binning separates (PSF 1.2 px, l = 3.4 px): no
+    error - every ion its own best ROI, overlaps allowed and reported."""
+    pos = chain(n, 3.4)
+    p = plan_readout(pos, (1.2, 1.2), SENSOR, hb, hb, halo=TIGHT_HALO)
+    w, h = p.frame_size
+    assert len(p.ion_rois) == n and all(validate_roi(r, w, h) == [] for r in p.grabber_rois)
+    for i, (x, y) in enumerate(pos):                        # every ion inside its ROI
+        u0, v0, u1, v1 = p.ion_rois[i]
+        assert p.roi[0] + u0 * hb - 0.5 <= x <= p.roi[0] + u1 * hb - 0.5
+    shared = [(i, j) for i in range(n) for j in range(i + 1, n)
+              if p.ion_rois[i][0] < p.ion_rois[j][2] and p.ion_rois[j][0] < p.ion_rois[i][2]]
+    if shared:
+        assert any("overlap" in w_ or "same ROI" in w_ for w_ in p.warnings)
+        assert p.crosstalk_matrix[shared[0][0]][shared[0][1]] > 0.2      # and it shows
+
+
+def test_fixed_aqroi():
+    pos = chain(2, 3.4)
+    p = plan_readout(pos, (1.2, 1.2), SENSOR, 2, 2, halo=TIGHT_HALO, aqroi=(252, 160, 272, 176))
+    assert p.roi == (252, 160, 272, 176) and p.frame_size == (10, 8)
+    assert min(p.containment) > 0.6
+    with pytest.raises(PlanError, match="multiple of the 2x2 binning"):
+        plan_readout(pos, (1.2, 1.2), SENSOR, 2, 2, aqroi=(252, 160, 273, 176))
+    with pytest.raises(PlanError, match="outside the AQROI"):
+        plan_readout(pos, (1.2, 1.2), SENSOR, 2, 2, aqroi=(0, 0, 20, 20))
+
+
+def test_moving_the_aqroi_by_hand():
+    """The D-pad: the AQROI moves in sensor pixels, the Grabber ROIs (frame
+    coordinates) stay - the ions shift inside them, containment follows."""
+    pos = chain(2, 3.4)
+    p = plan_readout(pos, (1.2, 1.2), SENSOR, 4, 4, halo=TIGHT_HALO)
+    q = reposition_plan(p, 2, 0, SENSOR)
+    assert q.roi == (p.roi[0] + 2, p.roi[1], p.roi[2] + 2, p.roi[3])
+    assert q.grabber_rois == p.grabber_rois and q.manual_offset == (2, 0)
+    assert q.containment != p.containment
+    assert any("moved by hand by (+2, +0)" in w for w in q.warnings)
+    back = reposition_plan(q, -2, 0, SENSOR)
+    assert np.allclose(back.containment, p.containment) and back.manual_offset == (0, 0)
+    with pytest.raises(PlanError, match="leave the"):
+        reposition_plan(p, -p.roi[0] - 1, 0, SENSOR)
 
 
 def test_halo_light_matrix_matches_simulated_image():

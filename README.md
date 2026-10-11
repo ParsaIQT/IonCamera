@@ -13,7 +13,9 @@
   centred on the crystal and aligned to the binning grid, each ion gets **its own
   Grabber ROI** sized for maximum light containment and minimum crosstalk, and
   everything is **verified with the real readout settings** before the camera is
-  **armed** (external trigger + Camera Link);
+  **armed** (external trigger + Camera Link). Ions too close for the binning still get
+  ROIs (overlapping, with the crosstalk reported), and everything can be adjusted by
+  hand - a D-pad moves the AQROI in 1 px steps;
 * **learned background**. The static light of the trap surface - laser scatter,
   defects and dust that look like ions or clouds, electrode edges, hot pixels - is
   learned once and subtracted from then on, at any ROI and binning;
@@ -51,8 +53,13 @@ pip install git+https://github.com/m-labs/sipyco      # not on PyPI (ARTIQ envs 
 
 ioncam_gui --simulate          # GUI + simulated trap; use the "Simulation" tab to play
 aqctl_ioncam --simulate        # headless RPC server with the simulator
-pytest                         # 93 tests (~2 min), all on the simulator / emulated SDK
+pytest                         # 107 tests (~3 min), all on the simulator / emulated SDK
 ```
+
+In the GUI the image brightness follows every frame (**Auto** under the histogram). Drag
+the histogram's level handles - or untick Auto, or right-click the histogram → *Auto
+levels* - and the levels stay exactly where you put them; **Fit** sets them to the
+current frame once.
 
 With the real camera on the camera PC (Windows):
 
@@ -109,6 +116,9 @@ with their docstrings):
 | `get_events(since_id)` / `wait_for_event(kinds, since_id, timeout)` | the event stream |
 | `locate_ions(expected)` | long exposure + joint fit: positions (with errors), PSF core + halo, chain fit |
 | `calibrate_readout(n_ions, hbin, vbin, auto_binning, ...)` | locate → plan AQROI/ROIs → verify → arm |
+| `nudge_readout(dx, dy)` | move the AQROI by whole sensor pixels (the ROIs move with it); re-arms |
+| `replan_readout(hbin, vbin, aqroi)` | plan again from the located ions: another binning and/or a fixed AQROI |
+| `verify_readout()` | test frames with the current plan (e.g. after adjusting it by hand) |
 | `get_readout_plan()` / `get_grabber_rois()` / `get_grabber_roi_lists()` / `is_readout_valid()` | the plan |
 | `arm_readout()` / `disarm_readout(resume_live)` | external trigger + Camera Link on/off |
 | `get_readout_counts(since_shot)` / `get_readout_stats()` | per-ROI sums of every shot (USB copy), threshold fits |
@@ -140,6 +150,17 @@ gives clean fingerprints:
 
 * A missing ion **together with** a common shift means the chain re-centred: that is a
   loss, never "an end ion went dark".
+* In a tight crystal (two ions ~4 px apart with a 1.2 px PSF) single frames often show
+  two ions as one spot, and after a loss the remaining ions re-centre towards the gap -
+  which looks much the same. So a missing ion is decided on the **average of the frames
+  that show the change**: dark if the other ions are exactly where they were, lost if
+  they re-arranged and the old crystal no longer explains the average, nothing if the
+  average still shows the old crystal (dim chains produce odd single frames all the
+  time). The crystal's light budget helps: two ions seen as one keep their light, a lost
+  ion takes one ion's worth with it.
+* The PSF (core + halo) is measured on averaged frames of the live crystal and handed to
+  the detector (`detection.auto_psf`), so a wrong `detection.psf_sigma` corrects itself
+  without a calibration.
 * After a re-arrangement the new configuration is fitted with the linear-chain
   equilibrium model (James 1998), using the previous length scale and centre as priors,
   so hidden **dark ions are located** and still counted.
@@ -179,7 +200,10 @@ gain 300; ~26 ms per 512×512 frame, ~12-14 ms with a smaller ROI (scipy; instal
    pixel-integrated PSF - a Gaussian core plus a broad Gaussian halo (aberration wings),
    kept when significant - to *all* ions at once. Overlapping PSFs in dense chains are
    resolved this way; ions the detector merged are recovered from the chain model when
-   `n_ions` is given. Position errors are honest (EMCCD noise law, sandwich estimator).
+   `n_ions` is given - even a pair seen as a single spot, split along its elongation
+   (or the tracked chain axis) - and, with `n_ions = 0`, when the tracker sees more ions
+   than the long exposure resolved. Position errors are honest (EMCCD noise law,
+   sandwich estimator).
    Dark ions known to the tracker are carried along. With `detection.auto_psf` the
    measured core and halo are used by the detector and the planner from then on.
 2. **Plan.** For every binning-grid phase it gives each ion its own ROI. An ion centred
@@ -193,6 +217,11 @@ gain 300; ~26 ms per 512×512 frame, ~12-14 ms with a smaller ROI (scipy; instal
    not a drawing error. With one ion at 4×4 binning this gives an 8×8 px AQROI with the
    ion at the centre of 2×2 super-pixels, the same layout as an AQROI of
    `257,264,161,168` in Solis.
+   Ions closer than the binning can separate are never refused: each still gets its own
+   best ROI, the ROIs overlap (the Grabber sums each one independently) and a warning
+   names them, so the crosstalk can be measured - e.g. in a SPAM experiment - before
+   thresholding. Two ions inside one super-pixel get the same ROI; only less binning
+   tells them apart.
 3. **Verify.** It takes `verify_frames` frames with the *final* readout settings
    (internal trigger) and checks that every ion stands out in its own ROI.
 4. **Arm.** External trigger, Camera Link on, run-till-abort, so every TTL gives one
@@ -204,6 +233,26 @@ Real ion images are blurred and have wings, so neighbouring ROIs do see each oth
 containment / crosstalk) at 4×4, 80 % / 10 % at 3×3 and 71 % / 4 % at 1×1.
 `auto_binning=True` picks the cheapest binning that meets the targets
 (`calibration.min_containment`, `max_crosstalk`).
+
+### Adjusting by hand
+
+On the image every Grabber ROI has its own colour and a label beside it - **ion 0 87 %**
+is Grabber ROI 0 with the share of ion 0's light it contains (chain order, as in the plan
+table), **bg** the background ROI - plus the AQROI (dashed) and the binning grid
+(dotted). The Readout tab's **Adjust by hand** box keeps the located positions and
+re-computes containment and crosstalk at once:
+
+* **D-pad** (▲ ▼ ◀ ▶, step 1 px by default; hold to repeat): moves the AQROI - and every
+  ROI with it - on screen, through the display rotation. The Grabber ROI numbers stay
+  the same (they are frame coordinates); the ions shift the other way inside them, at
+  4×4 binning by a quarter super-pixel per step. An armed readout is re-armed.
+* **Re-plan**: plan again with the binning set above, without a new locate.
+* **Use this AQROI**: place the ROIs inside an AQROI you type in (sensor px, `x1`/`y1`
+  exclusive, its size a multiple of the binning).
+* **Verify**: test frames with the plan as it is now.
+
+From ARTIQ the same is `nudge_readout(dx, dy)`, `replan_readout(hbin, vbin, aqroi)` and
+`verify_readout()`.
 
 Your Solis readout settings map onto `[readout]` (the defaults):
 
@@ -352,7 +401,7 @@ These are worth knowing, because several would silently corrupt data:
 
 ## Tests
 
-`pytest` runs 93 tests in about 2 minutes, in the realistic regime (13k photons/s
+`pytest` runs 107 tests in about 3 minutes, in the realistic regime (13k photons/s
 per ion, blurred PSF with halo, laser scatter, surface defects):
 - chain physics against James' published values;
 - detector accuracy (photon-limited) and false-alarm rates at EM gain 1, 50 and 300,
@@ -361,9 +410,14 @@ per ion, blurred PSF with halo, laser scatter, surface defects):
 - the joint core + halo fit of a dense chain (unbiased, honest errors) and its Jacobian;
 - every tracker scenario (load via cloud, dark vs lost at every chain position, loss with
   a dark ion present, melting, lasers off, rigid moves, shuttling with hold, a quiet
-  stable crystal);
+  stable crystal), and a tight trap (PSF 1.2 px, two or three ions ~4 px apart): dark
+  then bright then lost at every site, the PSF learned from the live crystal, a
+  full-sensor start;
 - planner invariants, its containment / crosstalk against the simulated image (halo
   included), and agreement with the Grabber gateware model, including its `x1` quirk;
+  close ions get overlapping ROIs instead of an error, a fixed AQROI, moving the AQROI
+  by hand; locate splitting a merged pair;
 - the Andor driver's exact SDK call sequence on the emulated SDK;
 - a full stack over real sipyco RPC with concurrent clients;
-- a headless GUI smoke test.
+- a headless GUI test (levels set by hand stay put, the D-pad direction through the
+  display rotation, ROI labels).

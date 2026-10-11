@@ -40,6 +40,11 @@ class _SensorGroup(pg.ItemGroup):
         return self._rect
 
 
+def _lighter(color, f=0.35):
+    """``color`` mixed with white (labels stay readable on a dark image)."""
+    return tuple(int(c + (255 - c) * f) for c in color[:3])
+
+
 def _pen(color, width=1.5, style=None):
     p = pg.mkPen(color, width=width)
     p.setCosmetic(True)
@@ -56,6 +61,7 @@ class ImagePanel(QtWidgets.QWidget):
     out of sync with the image, and the underlying geometry stays raw."""
 
     hovered = QtCore.Signal(str)
+    autoLevelsChanged = QtCore.Signal(bool)
 
     def __init__(self, display_cfg, parent=None):
         super().__init__(parent)
@@ -76,7 +82,43 @@ class ImagePanel(QtWidgets.QWidget):
         self.hist = pg.HistogramLUTWidget(image=self.img)
         self.hist.setMaximumWidth(110)
         lay.addWidget(self.plot, 1)
-        lay.addWidget(self.hist)
+        # brightness levels: automatic (follow every frame) or set by hand -
+        # dragging the histogram handles switches to "by hand" and the levels
+        # then stay exactly where they were put
+        self.auto_btn = QtWidgets.QToolButton()
+        self.auto_btn.setText("Auto")
+        self.auto_btn.setCheckable(True)
+        self.auto_btn.setChecked(True)
+        self.auto_btn.setToolTip("Auto: the brightness levels follow every frame.\n"
+                                 "Off: they stay where you put them (dragging the histogram "
+                                 "handles switches Auto off).")
+        self.auto_btn.toggled.connect(self.set_auto_levels)
+        fit = QtWidgets.QToolButton()
+        fit.setText("Fit")
+        fit.setToolTip("fit the levels to the current frame once, then keep them")
+        fit.clicked.connect(self.fit_levels_once)
+        side = QtWidgets.QVBoxLayout()
+        side.setContentsMargins(0, 0, 0, 0)
+        side.addWidget(self.hist, 1)
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(self.auto_btn)
+        row.addWidget(fit)
+        side.addLayout(row)
+        lay.addLayout(side)
+        self._levels_busy = False          # the levels are being set by this code
+        self.hist.item.sigLevelsChanged.connect(self._levels_by_hand)
+        self.hist.item.sigLevelChangeFinished.connect(self._levels_by_hand)
+        menu = self.hist.item.vb.menu      # right click on the histogram
+        if menu is not None:
+            menu.addSeparator()
+            self.auto_action = menu.addAction("Auto levels (follow every frame)")
+            self.auto_action.setCheckable(True)
+            self.auto_action.setChecked(True)
+            self.auto_action.toggled.connect(self.set_auto_levels)
+            menu.addAction("Fit levels to this frame once").triggered.connect(
+                self.fit_levels_once)
+        else:  # pragma: no cover
+            self.auto_action = None
         self.set_colormap(display_cfg.colormap)
 
         self.sc_bright = pg.ScatterPlotItem(symbol="o", size=16, pen=_pen("#3cff6e", 2),
@@ -93,6 +135,7 @@ class ImagePanel(QtWidgets.QWidget):
         self._labels = []
         self._rects = []
         self._roi_items = []
+        self._plan = None
         self.auto_levels = True
         self.show_overlays = True
         self._geometry = None
@@ -118,6 +161,8 @@ class ImagePanel(QtWidgets.QWidget):
         self.rotation, self.flip_x, self.flip_y = rotation, flip_x, flip_y
         for label in getattr(self, "_labels", []):
             label.setAnchor(self._label_anchor())
+        if getattr(self, "_plan", None):
+            self.set_plan(self._plan)          # ROI labels sit at the on-screen corner
         self._update_limits()
         self.vb.autoRange()
 
@@ -136,20 +181,67 @@ class ImagePanel(QtWidgets.QWidget):
                           yMax=c.y() + yr / 2, maxXRange=xr, maxYRange=yr,
                           minXRange=4.0, minYRange=4.0)
 
+    # -- brightness levels -----------------------------------------------------------------
+    def set_auto_levels(self, on):
+        """Levels follow every frame (on) or stay as set by hand (off)."""
+        on = bool(on)
+        for w in (self.auto_btn, self.auto_action):
+            if w is not None and w.isChecked() != on:
+                w.blockSignals(True)
+                w.setChecked(on)
+                w.blockSignals(False)
+        if on == self.auto_levels:
+            return
+        self.auto_levels = on
+        if on and self._last is not None:
+            self._apply_auto_levels(self._last[0])
+        self.autoLevelsChanged.emit(on)
+
+    def fit_levels_once(self):
+        """Fit the levels to the current frame, then keep them."""
+        self.set_auto_levels(False)
+        if self._last is not None:
+            self._apply_auto_levels(self._last[0])
+
+    def _levels_by_hand(self, *_):
+        if not self._levels_busy and self.auto_levels:
+            self.set_auto_levels(False)        # the user moved the levels: keep them
+
+    def _auto_levels_for(self, img):
+        lo_p, hi_p = self.cfg.level_percentiles
+        sample = img[::max(1, img.shape[0] // 256), ::max(1, img.shape[1] // 256)]
+        lo, hi = np.percentile(sample, [lo_p, hi_p])
+        hi = max(hi, float(img.max()) * 0.8) if hi_p >= 99.9 else hi
+        if hi <= lo:
+            hi = lo + 1
+        return float(lo), float(hi)
+
+    def _apply_auto_levels(self, img):
+        if not np.asarray(img).size:
+            return
+        lo, hi = self._auto_levels_for(img)
+        self._levels_busy = True
+        try:
+            self.img.setLevels((lo, hi))
+            self.hist.item.setLevels(lo, hi)
+        finally:
+            self._levels_busy = False
+
     # -- data ------------------------------------------------------------------------------
     def set_frame(self, image, roi, hbin, vbin):
         img = np.asarray(image)
         geom = (tuple(roi), hbin, vbin, img.shape)
-        if self.auto_levels and img.size:
-            lo_p, hi_p = self.cfg.level_percentiles
-            sample = img[::max(1, img.shape[0] // 256), ::max(1, img.shape[1] // 256)]
-            lo, hi = np.percentile(sample, [lo_p, hi_p])
-            hi = max(hi, float(img.max()) * 0.8) if hi_p >= 99.9 else hi
-            if hi <= lo:
-                hi = lo + 1
-            self.img.setImage(img, autoLevels=False, levels=(float(lo), float(hi)))
-        else:
-            self.img.setImage(img, autoLevels=False)
+        # levels set by hand stay put: only automatic levels are computed here
+        levels = self._auto_levels_for(img) if img.size and (
+            self.auto_levels or self.img.levels is None) else None
+        self._levels_busy = True
+        try:
+            if levels is None:
+                self.img.setImage(img, autoLevels=False)
+            else:
+                self.img.setImage(img, autoLevels=False, levels=levels)
+        finally:
+            self._levels_busy = False
         if geom != self._geometry:
             rect = QtCore.QRectF(roi[0] - 0.5, roi[1] - 0.5, img.shape[1] * hbin,
                                  img.shape[0] * vbin)
@@ -189,6 +281,7 @@ class ImagePanel(QtWidgets.QWidget):
         return (-0.5, 0.5) if int(self.rotation) % 180 == 90 else (0.5, 1.6)
 
     def set_plan(self, plan):
+        self._plan = plan
         for r in self._rects:
             r.setParentItem(None)
             if r.scene() is not None:
@@ -213,19 +306,71 @@ class ImagePanel(QtWidgets.QWidget):
             grid.setPen(_pen((42, 212, 255, 90), 1.0, QtCore.Qt.PenStyle.DotLine))
             grid.setParentItem(self.group)
             self._rects.append(grid)
-        self._add_rect(x0 - 0.5, y0 - 0.5, x1 - x0, y1 - y0, "#2ad4ff",
-                       QtCore.Qt.PenStyle.DashLine)
+        aq_rect = (x0 - 0.5, y0 - 0.5, x1 - x0, y1 - y0)
+        self._add_rect(*aq_rect, "#2ad4ff", QtCore.Qt.PenStyle.DashLine)
+        # every Grabber ROI with its own colour and a label saying what it
+        # measures - "ion 0" is Grabber ROI 0 (chain order, as in the plan
+        # table) with the share of that ion's light inside it.  The labels sit
+        # outside the AQROI beside their ROI (on screen, whatever the display
+        # rotation): the ions' on one side, the background ROI's on its side.
         rois = plan["ion_rois"] + ([plan["background_roi"]] if plan.get("background_roi") else [])
+        cont = plan.get("containment") or []
+        boxes = []
         for i, (u0, v0, u1, v1) in enumerate(rois):
-            color = "#ff4fd8" if i < plan["n_ions"] else "#9a9a9a"
-            self._add_rect(x0 + u0 * hb - 0.5, y0 + v0 * vb - 0.5, (u1 - u0) * hb, (v1 - v0) * vb,
-                           color, QtCore.Qt.PenStyle.SolidLine)
+            rect = (x0 + u0 * hb - 0.5, y0 + v0 * vb - 0.5, (u1 - u0) * hb, (v1 - v0) * vb)
+            if i < plan["n_ions"]:
+                color = ION_COLORS[i % len(ION_COLORS)]
+                text = "ion {}".format(i) + (" {:.0%}".format(cont[i]) if i < len(cont) else "")
+            else:
+                color, text = (170, 170, 170), "bg"
+            self._add_rect(*rect, color, QtCore.Qt.PenStyle.SolidLine)
+            boxes.append((text, _lighter(color), self.group.mapRectToParent(QtCore.QRectF(*rect))))
+        aq = self.group.mapRectToParent(QtCore.QRectF(*aq_rect))      # view coords, y up
+        along_y = aq.height() >= aq.width()           # chain runs up/down on screen
+        bg = boxes[plan["n_ions"]][2] if len(boxes) > plan["n_ions"] else None
+        if along_y:
+            bg_low = bg is not None and bg.center().x() < aq.center().x()
+            ion_side, bg_side = ("right", "left") if bg_low else ("left", "right")
+        else:
+            bg_low = bg is not None and bg.center().y() < aq.center().y()
+            ion_side, bg_side = ("top", "bottom") if bg_low else ("bottom", "top")
+        for i, (text, color, box) in enumerate(boxes):
+            self._add_label(text, color, aq, box, ion_side if i < plan["n_ions"] else bg_side)
+        self._add_label("AQROI", "#2ad4ff", aq, aq, "bottom" if along_y else "left")
 
     def _add_rect(self, x, y, w, h, color, style):
         r = QtWidgets.QGraphicsRectItem(x, y, w, h)
         r.setPen(_pen(color, 1.5, style))
         r.setParentItem(self.group)
         self._rects.append(r)
+
+    def _add_label(self, text, color, aq, box, side):
+        """Text just outside the AQROI ``aq`` on ``side`` (as seen on screen),
+        level with ``box`` (both rects in view coordinates, y up)."""
+        gap = 0.4
+        if side == "left":
+            pos, anchor = (aq.left() - gap, box.center().y()), (1.0, 0.5)
+        elif side == "right":
+            pos, anchor = (aq.right() + gap, box.center().y()), (0.0, 0.5)
+        elif side == "top":
+            pos, anchor = (box.center().x(), aq.bottom() + gap), (0.5, 1.0)
+        else:
+            pos, anchor = (box.center().x(), aq.top() - gap), (0.5, 0.0)
+        t = pg.TextItem(text, color=color, anchor=anchor)
+        t.setParentItem(self.group)
+        t.setPos(self.group.mapFromParent(QtCore.QPointF(*pos)))
+        self._rects.append(t)
+
+    def screen_step(self, right, up):
+        """Sensor-pixel step (dx, dy) that moves things ``right``/``up`` on
+        screen through the display rotation and flips."""
+        t = self.group.transform()
+        inv, ok = t.inverted()
+        if not ok:  # pragma: no cover
+            return int(right), int(-up)
+        a = inv.map(QtCore.QPointF(0.0, 0.0))
+        b = inv.map(QtCore.QPointF(float(right), float(up)))         # view y points up
+        return int(round(b.x() - a.x())), int(round(b.y() - a.y()))
 
     def visible_sensor_rect(self):
         """Visible area as a sensor ROI (x0, y0, x1, y1)."""

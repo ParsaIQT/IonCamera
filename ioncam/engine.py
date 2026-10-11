@@ -39,7 +39,7 @@ from ioncam.analysis.detection import DetectionResult, Detector
 from ioncam.analysis.fitting import PSF, fit_gaussians
 from ioncam.analysis.readout import (PlanError, ReadoutPlan, binning_advice,
                                      compare_grabber_frame, fit_threshold, plan_readout,
-                                     verify_plan)
+                                     reposition_plan, verify_plan)
 from ioncam.analysis.tracker import ChainTracker, adopt_learned_psf, align
 from ioncam.camera.base import (AcquisitionSettings, AppliedSettings, CameraBase, CameraError,
                                 Frame)
@@ -743,7 +743,18 @@ class IonCamEngine:
         hb, vb = applied.hbin, applied.vbin
         guesses = positions
         if expected and n_det != expected:
-            guesses = self._chain_guesses(positions, expected) if expected > n_det else positions
+            guesses = self._chain_guesses(positions, expected, det, snap.get("chain")) \
+                if expected > n_det else positions
+        elif not expected and snap.get("stable") and (snap.get("n_bright") or 0) > n_det:
+            # the tracker sees more ions than this exposure resolved (a tight
+            # pair merged into one spot): start the joint fit from its sites
+            # (a guess that carries no light is dropped after the fit)
+            sites = np.array([[s_["x"], s_["y"]] for s_ in snap["sites"]
+                              if s_["state"] == "bright"], float).reshape(-1, 2)
+            su, sv = det.to_crop(sites[:, 0], sites[:, 1])
+            h_, w_ = det.residual.shape
+            if np.all((su > 2) & (su < w_ - 3) & (sv > 2) & (sv < h_ - 3)):
+                guesses = sites
         cu, cv = det.to_crop(guesses[:, 0], guesses[:, 1])
         psf = cfg.detection.psf_sigma
         quality: Dict[str, Any] = {"detected": n_det}
@@ -838,16 +849,58 @@ class IonCamEngine:
         self.events.emit("ions_located", msg, "info", n_ions=result["n_ions"])
         return result
 
-    def _chain_guesses(self, positions: np.ndarray, n: int) -> np.ndarray:
-        """Initial positions for ``n`` ions when the detector resolved fewer (dense chain)."""
-        if len(positions) < 2:
+    def _chain_guesses(self, positions: np.ndarray, n: int, det: Optional[DetectionResult] = None,
+                       chain: Optional[dict] = None) -> np.ndarray:
+        """Initial positions for ``n`` ions when the detector resolved fewer
+        (dense chain): equilibrium positions spanning the detected ones.  From a
+        single spot (ions merged into one) along the chain axis the tracker
+        knows, spaced by its length scale - else along the spot's elongation."""
+        if len(positions) == 0 or n <= len(positions):
             return positions
+        if len(positions) == 1:
+            u = equilibrium_positions(n)
+            if chain and chain.get("scale_px"):
+                a = math.radians(chain["angle_deg"])
+                axis, scale = np.array([math.cos(a), math.sin(a)]), float(chain["scale_px"])
+            else:
+                axis, scale = self._elongation(det, positions[0], u)
+            return positions[0][None, :] + scale * u[:, None] * axis[None, :]
         cf = fit_chain(positions)
         s = (positions - cf.center) @ cf.axis
         u = equilibrium_positions(n)
         scale = (s.max() - s.min()) / (u[-1] - u[0])
         center = cf.center + 0.5 * (s.max() + s.min()) * cf.axis
         return center[None, :] + scale * u[:, None] * cf.axis[None, :]
+
+    def _elongation(self, det: Optional[DetectionResult], pos: np.ndarray, u: np.ndarray):
+        """(axis, chain length scale) from the second moments of one spot that
+        holds several ions in equilibrium positions ``u`` (along x, one PSF
+        sigma apart, if nothing better is known)."""
+        s0 = float(self.config.detection.psf_sigma)
+        axis, scale = np.array([1.0, 0.0]), s0
+        if det is None or det.residual.size == 0:
+            return axis, scale
+        cu, cv = det.to_crop(np.array([pos[0]]), np.array([pos[1]]))
+        cu, cv = float(cu[0]), float(cv[0])
+        m = int(math.ceil(4.0 * s0 / min(det.hbin, det.vbin))) + 2
+        h, w = det.residual.shape
+        u0, u1 = max(0, int(cu) - m), min(w, int(cu) + m + 1)
+        v0, v1 = max(0, int(cv) - m), min(h, int(cv) + m + 1)
+        patch = np.clip(det.residual[v0:v1, u0:u1].astype(np.float64), 0.0, None)
+        tot = patch.sum()
+        if tot <= 0:
+            return axis, scale
+        vv, uu = np.mgrid[v0:v1, u0:u1]
+        x = (uu - cu) * det.hbin
+        y = (vv - cv) * det.vbin
+        mx, my = (patch * x).sum() / tot, (patch * y).sum() / tot
+        cov = np.array([[(patch * (x - mx) ** 2).sum(), (patch * (x - mx) * (y - my)).sum()],
+                        [0.0, (patch * (y - my) ** 2).sum()]]) / tot
+        cov[1, 0] = cov[0, 1]
+        ev, vec = np.linalg.eigh(cov)
+        axis = vec[:, 1] if vec[0, 1] >= 0 else -vec[:, 1]
+        excess = max(float(ev[1] - ev[0]), 0.25 * s0 * s0)
+        return axis, math.sqrt(excess / max(float(np.mean(u ** 2)), 1e-6))
 
     # -- Grabber readout ------------------------------------------------------------------
 
@@ -896,24 +949,11 @@ class IonCamEngine:
                             flip_x=cfg.grabber.flip_x, flip_y=cfg.grabber.flip_y,
                             res_width=cfg.grabber.res_width, ion_states=loc["states"], **kw)
         if self._temperature[1] != "stabilized":
-            plan.warnings.append("sensor temperature not stabilised ({}, {:.1f} C)".format(
+            plan.add_note("sensor temperature not stabilised ({}, {:.1f} C)".format(
                 self._temperature[1], self._temperature[0]))
         do_verify = cal.verify if verify is None else verify
         if do_verify:
-            vs = rs.replace(roi=plan.roi, hbin=hb, vbin=vb, trigger="internal",
-                            acquisition="run_till_abort", camera_link=False,
-                            fast_ext_trigger=False)
-            self._step("verify: {} frames with the readout settings".format(cal.verify_frames))
-            applied = self._apply(vs, "verify")
-            self.camera.start()
-            frames = self._collect(cal.verify_frames,
-                                   timeout=cal.verify_frames * (applied.kinetic_cycle * 3 + 0.5)
-                                   + 10)
-            self.camera.stop()
-            plan.verification = verify_plan(plan, [f.data for f in frames], cal.min_verify_snr)
-            if not plan.verification["ok"] and not force:
-                raise ProcedureError("readout verification failed: {}".format(
-                    "; ".join(plan.verification["problems"])))
+            self._verify_with_camera(plan, force)
         plan.binning_advice = advice
         self._plan = plan
         self._plan_valid = True
@@ -930,6 +970,114 @@ class IonCamEngine:
             self._arm_internal(plan)
         self._save("readout_plan", plan.to_dict())
         return plan
+
+    def _verify_with_camera(self, plan: ReadoutPlan, force: bool) -> None:
+        """Frames with the readout settings (internal trigger): is every ion
+        bright enough inside its ROI?  Fills ``plan.verification``."""
+        cal = self.config.calibration
+        vs = self._readout.replace(roi=plan.roi, hbin=plan.hbin, vbin=plan.vbin,
+                                   trigger="internal", acquisition="run_till_abort",
+                                   camera_link=False, fast_ext_trigger=False)
+        self._step("verify: {} frames with the readout settings".format(cal.verify_frames))
+        applied = self._apply(vs, "verify")
+        self.camera.start()
+        frames = self._collect(cal.verify_frames,
+                               timeout=cal.verify_frames * (applied.kinetic_cycle * 3 + 0.5) + 10)
+        self.camera.stop()
+        plan.verification = verify_plan(plan, [f.data for f in frames], cal.min_verify_snr)
+        if not plan.verification["ok"] and not force:
+            raise ProcedureError("readout verification failed: {}".format(
+                "; ".join(plan.verification["problems"])))
+
+    def verify_readout(self, force: bool = True) -> dict:
+        """Test frames with the current plan (e.g. after adjusting it by hand);
+        the result goes into the plan.  ``force``: keep the plan even if the
+        verification fails (default - it is only reported)."""
+        def proc():
+            if self._plan is None:
+                raise ProcedureError("no readout plan - calibrate first")
+            self._verify_with_camera(self._plan, force)
+            return self._plan.to_dict(), True
+        return self._procedure_run("verify_readout", proc)
+
+    def nudge_readout(self, dx: int = 0, dy: int = 0) -> dict:
+        """Move the AQROI by ``(dx, dy)`` sensor px - the D-pad of the manual
+        approach: the Grabber ROIs are frame coordinates and move with it, so
+        the ions shift inside their ROIs (with binning by a fraction of a
+        super-pixel) while the ROIs handed to ARTIQ stay the same.
+        Containment and crosstalk are re-computed from the located positions;
+        an armed readout is re-armed with the new AQROI."""
+        def run():
+            plan = self._editable_plan()
+            new = reposition_plan(plan, int(dx), int(dy), self.camera.sensor_shape)
+            self._set_plan(new, "AQROI moved by ({:+d}, {:+d}) px".format(int(dx), int(dy)))
+            return new.to_dict()
+        return self._call(run)
+
+    def replan_readout(self, hbin: int = 0, vbin: int = 0,
+                       aqroi: Optional[Sequence[int]] = None,
+                       roi_size: Optional[Sequence[int]] = None) -> dict:
+        """Plan again from the located positions without a new locate: another
+        binning, and/or a fixed AQROI ``(x0, y0, x1, y1)`` (sensor px, half-open,
+        a multiple of the binning) inside which the per-ion ROIs are placed.
+        Close ions get overlapping ROIs rather than an error (see warnings).
+        Re-arms an armed readout; the plan is not verified (verify_readout)."""
+        def run():
+            pos, sigma, halo, states, newer = self._plan_source()
+            cfg = self.config
+            cal = cfg.calibration
+            hb = int(hbin) or (self._plan.hbin if self._plan else self._readout.hbin)
+            vb = int(vbin) or (self._plan.vbin if self._plan else self._readout.vbin)
+            kw = dict(roi_size=tuple(roi_size) if roi_size else tuple(cal.roi_size),
+                      frame_margin=cal.frame_margin, min_containment=cal.min_containment,
+                      max_crosstalk=cal.max_crosstalk, max_rois=cfg.grabber.roi_engine_count,
+                      background_roi=cal.background_roi, halo=halo)
+            plan = plan_readout(pos, sigma, self.camera.sensor_shape, hb, vb,
+                                flip_x=cfg.grabber.flip_x, flip_y=cfg.grabber.flip_y,
+                                res_width=cfg.grabber.res_width, ion_states=states,
+                                aqroi=tuple(int(v) for v in aqroi) if aqroi else None, **kw)
+            plan.binning_advice = binning_advice(pos, sigma, self.camera.sensor_shape, **kw)
+            if newer:
+                self._plan_valid = True
+            self._set_plan(plan, "re-planned: {}x{} binning{}".format(
+                hb, vb, ", AQROI fixed by hand" if aqroi else ""))
+            return plan.to_dict()
+        return self._call(run)
+
+    def _editable_plan(self) -> ReadoutPlan:
+        if self._procedure is not None:
+            raise ProcedureError("busy with '{}'".format(self._procedure["name"]))
+        if self._plan is None:
+            raise ProcedureError("no readout plan - calibrate (or locate, then re-plan) first")
+        return self._plan
+
+    def _plan_source(self):
+        """Located ions for a re-plan: the newer of the current plan and the
+        last locate -> (positions, sigma, halo, states, from_new_locate)."""
+        if self._procedure is not None:
+            raise ProcedureError("busy with '{}'".format(self._procedure["name"]))
+        plan, loc = self._plan, self._last_locate
+        if loc is not None and (plan is None or loc["t"] > plan.created):
+            halo = tuple(loc["psf_halo"]) if loc["psf_halo"][0] > 0 else \
+                (self.config.detection.psf_halo_fraction, self.config.detection.psf_halo_sigma)
+            return (np.array(loc["positions"], float), tuple(loc["psf_sigma"]), halo,
+                    list(loc["states"]), True)
+        if plan is None:
+            raise ProcedureError("no located ions - locate them (or calibrate) first")
+        return (np.array(plan.positions, float), tuple(plan.psf_sigma), tuple(plan.psf_halo),
+                list(plan.ion_states), False)
+
+    def _set_plan(self, plan: ReadoutPlan, what: str) -> None:
+        """Adopt a plan changed by hand (re-arming an armed readout)."""
+        self._plan = plan
+        if self._mode == READOUT:
+            self._arm_internal(plan)
+        d = plan.to_dict()
+        self.events.emit("readout_adjusted", "Readout {}: AQROI {} (Solis L,R,B,T), {}x{} "
+                         "binning, containment {}".format(
+                             what, d["aqroi_solis"], plan.hbin, plan.vbin,
+                             " ".join("{:.0%}".format(c) for c in plan.containment)), "info",
+                         aqroi=d["aqroi"], grabber_rois=d["grabber_rois"])
 
     def arm_readout(self) -> dict:
         """(Re-)arm the Grabber readout with the current plan."""
