@@ -53,7 +53,7 @@ pip install git+https://github.com/m-labs/sipyco      # not on PyPI (ARTIQ envs 
 
 ioncam_gui --simulate          # GUI + simulated trap; use the "Simulation" tab to play
 aqctl_ioncam --simulate        # headless RPC server with the simulator
-pytest                         # 116 tests (~3 min), all on the simulator / emulated SDK
+pytest                         # 121 tests (~3 min), all on the simulator / emulated SDK
 ```
 
 In the GUI the image brightness follows every frame (**Auto** under the histogram). Drag
@@ -129,6 +129,7 @@ with their docstrings):
 | `get_readout_plan()` / `get_grabber_rois()` / `get_grabber_roi_lists()` / `is_readout_valid()` | the plan |
 | `arm_readout()` / `disarm_readout(resume_live)` | external trigger + Camera Link on/off |
 | `get_readout_counts(since_shot)` / `get_readout_stats()` | per-ROI sums of every shot (USB copy), threshold fits |
+| `get_readout_histograms(source)` | histograms of every ROI (verification or triggered shots) and, with every shot prepared bright, a threshold and quick fidelity estimate per ion |
 | `hold_tracking(reason, timeout)` / `resume_tracking()` | "ions will move on purpose" (shuttling, camera) |
 | `take_control(owner, reason, timeout)` / `release_control(owner)` | advisory lease shown in all GUIs |
 | `start_live(**settings)` / `set_live(...)` / `set_exposure` / `set_em_gain` / `set_roi` / `stop()` | live video |
@@ -243,8 +244,10 @@ gain 300; ~26 ms per 512×512 frame, ~12-14 ms with a smaller ROI (scipy; instal
    names them, so the crosstalk can be measured - e.g. in a SPAM experiment - before
    thresholding. Two ions inside one super-pixel get the same ROI; only less binning
    tells them apart.
-3. **Verify.** It takes `verify_frames` frames with the *final* readout settings
-   (internal trigger) and checks that every ion stands out in its own ROI.
+3. **Verify.** It takes `verify_frames` (200) frames with the *final* readout settings
+   (internal trigger) and checks that every ion stands out in its own ROI. The ions shine
+   in every frame, so these frames also give the first shot histograms and a quick
+   fidelity estimate with a threshold per ion (see below).
 4. **Arm.** External trigger, Camera Link on, run-till-abort, so every TTL gives one
    frame and nothing has to be re-armed per shot.
 
@@ -272,10 +275,54 @@ re-computes containment and crosstalk at once:
 * **Re-plan**: plan again with the binning set above, without a new locate.
 * **Use this AQROI**: place the ROIs inside an AQROI you type in (sensor px, `x1`/`y1`
   exclusive, its size a multiple of the binning).
-* **Verify**: test frames with the plan as it is now.
+* **Verify**: test frames with the plan as it is now; they also refresh the shot
+  histograms below, so you can step with the D-pad and compare the fidelity.
 
 From ARTIQ the same is `nudge_readout(dx, dy)`, `replan_readout(hbin, vbin, aqroi)` and
 `verify_readout()`.
+
+### Shot histograms and a quick fidelity estimate
+
+The bottom of the Readout tab shows histograms of the shots. Each ion ROI is drawn in its
+colour on the image and the background in grey, with each ion's threshold as a dashed
+line. The y axis is logarithmic by default, because the tails, where bright and dark
+overlap, set the fidelity. **shots: latest** shows the newer of two sources: the last
+verification (**Verify** or **Calibrate + arm**) or the externally triggered shots since
+arming. The other two choices pick one source.
+
+The estimate assumes **every shot is prepared bright** - do that on purpose:
+
+* each ion ROI's sums are its bright distribution;
+* the dark reference is the background ROI's super-pixels from the same shots, summed to
+  the ion ROI's size. With one super-pixel per ion, every background super-pixel is one
+  sample of what that ROI reads with the ion dark;
+* **bright if sum >** is the threshold that misclassifies the fewest, counted directly
+  on the shots with no model of the distributions. **bright→dark** is the fraction of
+  bright shots at or below it, **bg→bright** the fraction of dark-reference samples
+  above it, and **fidelity** is 1 minus their mean;
+* **neighbours bright** adds the other ions' light to the dark reference: the dark error
+  of an ion whose neighbours are bright. The crosstalk comes from the plan's crosstalk
+  matrix and the measured signals, added as EM-amplified photo-electrons (the counts per
+  photo-electron come from the bright shots' excess noise).
+
+On the simulated version of a tight trap (PSF 1.2 px, two ions 4.3 px apart, one 4×4
+super-pixel each, 2000 shots) the estimate predicted that ions 0 and 1, when dark, read
+bright 5.3 % and 4.1 % of the time; with the ions really dark it measured 4.7 % and 3.8 %.
+With the other ion bright it predicted 8.5 % and 16.9 %, and measured 7.5 % and 16.0 %.
+The estimate has these limits:
+
+* the bright error counts every shot in which an ion did not shine (failed preparation,
+  decay, loss), which is what a SPAM experiment counts too;
+* a dark neighbour also lowers the bright counts a little (its crosstalk is missing),
+  which is not modelled;
+* the background strip lies a few pixels from the ions, so a scatter gradient between the
+  strip and the ions' row is not captured;
+* 200 shots resolve errors only down to 0.5 %, so trigger more shots for finer numbers.
+
+From ARTIQ: `get_readout_histograms(source="auto")`. The verification in a plan also
+carries `threshold`, `fidelity` and `dark_error_neighbours_bright` per ion, and the
+example `ioncam_grabber_readout.py` has an `all_bright` option that takes its thresholds
+from this estimate.
 
 Your Solis readout settings map onto `[readout]` (the defaults):
 
@@ -312,10 +359,10 @@ Some points that matter when using the Grabber:
 * **Timing.** The plan reports `min_trigger_period` (exposure + readout + keep-clean).
   Keep the ROI gate open from the trigger until the frame has arrived
   (exposure + readout + margin), as in the example experiment.
-* **During experiments.** USB copies of every frame feed `get_readout_counts()` and
-  `get_readout_stats()`. If more light than at arming falls outside the ROIs, you get
-  `readout_geometry_changed`; any crystal change in live mode marks the plan
-  **outdated** (`is_readout_valid()` returns False).
+* **During experiments.** USB copies of every frame feed `get_readout_counts()`,
+  `get_readout_stats()` and `get_readout_histograms()`. If more light than at arming
+  falls outside the ROIs, you get `readout_geometry_changed`; any crystal change in live
+  mode marks the plan **outdated** (`is_readout_valid()` returns False).
 
 ## Learning the background (dirty traps)
 
@@ -356,7 +403,9 @@ uniform stray light, laser scatter (rate at the beam centre, widths along / acro
 beam, angle, offset), defects (number, brightness, height above the surface), scratches,
 electrode-gap scatter, collection NA and ion height, and the **trap rotation** in the
 image (0 / 45 / 90° buttons, or any angle: chain, electrodes, surface and laser beam
-turn together about the trap centre); plus ions (load, lose, dark, melt), lasers,
+turn together about the trap centre - like mounting a different trap, so a learned
+background is cleared, the crystal is tracked afresh and a readout plan is outdated);
+plus ions (load, lose, dark, melt), lasers,
 repumper, oven, camera moves and external triggers. The EMCCD model has
 Poisson photo-electrons, clock-induced charge, the gamma-distributed EM register, read
 noise, bias and 16-bit saturation.
@@ -426,7 +475,7 @@ These are worth knowing, because several would silently corrupt data:
 
 ## Tests
 
-`pytest` runs 116 tests in about 3 minutes, in the realistic regime (13k photons/s
+`pytest` runs 121 tests in about 3 minutes, in the realistic regime (13k photons/s
 per ion, blurred PSF with halo, laser scatter, surface defects):
 - chain physics against James' published values;
 - detector accuracy (photon-limited) and false-alarm rates at EM gain 1, 50 and 300,
@@ -443,8 +492,9 @@ per ion, blurred PSF with halo, laser scatter, surface defects):
   included), and agreement with the Grabber gateware model, including its `x1` quirk;
   close ions get overlapping ROIs instead of an error, one centred super-pixel per ion
   with a clean background strip, a fixed AQROI, moving the AQROI by hand; locate
-  splitting a merged pair;
+  splitting a merged pair and merging an ion the detector split in two; the quick fidelity estimate from bright shots against EMCCD
+  shots with the ions really dark (alone and next to a bright ion);
 - the Andor driver's exact SDK call sequence on the emulated SDK;
 - a full stack over real sipyco RPC with concurrent clients;
 - a headless GUI test (levels set by hand stay put, the D-pad direction through the
-  display rotation, ROI labels).
+  display rotation, ROI labels, the shot histograms, the trap-rotation buttons).

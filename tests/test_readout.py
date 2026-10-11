@@ -2,11 +2,12 @@ import numpy as np
 import pytest
 
 from ioncam.analysis.chain import equilibrium_positions
-from ioncam.analysis.readout import (PlanError, binning_advice, compare_grabber_frame,
-                                     fit_threshold, grabber_roi_sum_exact, grabber_roi_sums,
-                                     map_rect, plan_readout, reposition_plan, validate_roi,
-                                     verify_plan)
-from ioncam.camera.simulator import SimulatedCamera
+from ioncam.analysis.readout import (PlanError, ReadoutPlan, _dark_sums, binning_advice,
+                                     compare_grabber_frame, dark_pixel_mask, fit_threshold,
+                                     grabber_roi_sum_exact, grabber_roi_sums, map_rect,
+                                     plan_readout, reposition_plan, shot_histograms,
+                                     threshold_fidelity, validate_roi, verify_plan)
+from ioncam.camera.simulator import SimulatedCamera, emccd_counts
 from ioncam.config import Config
 
 SENSOR = (512, 512)
@@ -246,3 +247,78 @@ def test_one_centred_super_pixel_per_ion(n):
         # centred as far as the spacing allows (3.66 px apart on a 4 px grid: <= 0.84)
         assert abs(x - cx) <= 0.85 and abs(y - cy) <= 0.5
     assert min(p.containment) > 0.6 and p.background_contamination <= 0.02
+
+
+def test_threshold_fidelity_counts_the_errors():
+    dark = [0] * 90 + [5] * 10
+    bright = [3] * 5 + [10] * 95
+    r = threshold_fidelity(bright, dark)
+    # 5..9 all read the 5 % of bright shots at 3 as dark and no dark shot as bright
+    assert r["threshold"] == 7 and r["bright_errors"] == 5 and r["dark_errors"] == 0
+    assert r["fidelity"] == pytest.approx(0.975)
+    r = threshold_fidelity(range(20, 31), range(0, 11))
+    assert r["threshold"] == 14 and r["fidelity"] == 1.0
+    assert not threshold_fidelity([], [1, 2])["ok"]
+
+
+def test_dark_reference_sums_to_the_roi_size():
+    px = np.array([[1, 2, 3], [10, 20, 30]])
+    assert sorted(_dark_sums(px, 1)) == [1, 2, 3, 10, 20, 30]
+    assert list(_dark_sums(px, 2)) == [3, 5, 30, 50]          # neighbours in one shot
+    assert list(_dark_sums(px, 4)) == [16]                    # pixels of several shots
+    assert _dark_sums(np.zeros((5, 0)), 1).size == 0
+
+
+def _two_ion_plan(xt=((0.6, 0.08), (0.03, 0.6))):
+    """2 ions, one 4x4 super-pixel each (frame row 1), background ROI row 0."""
+    return ReadoutPlan(
+        n_ions=2, positions=[(5.5, 5.5), (9.5, 5.5)], ion_states=["bright"] * 2,
+        psf_sigma=(1.2, 1.2), hbin=4, vbin=4, roi=(0, 0, 12, 8), frame_size=(3, 2),
+        roi_size=(1, 1), ion_rois=[(1, 1, 2, 2), (2, 1, 3, 2)], background_roi=(1, 0, 3, 1),
+        grabber_rois=[(1, 1, 2, 2), (2, 1, 3, 2), (1, 0, 3, 1)], containment=[0.6, 0.6],
+        crosstalk=[0.08, 0.03], crosstalk_matrix=[list(r) for r in xt],
+        background_contamination=0.0)
+
+
+def _emccd_shots(plan, n, bright=(True, True), photons=30.0, scatter=0.05, seed=0):
+    """Readout frames (n x 2 x 3) of the plan above: EMCCD gain 200, 4 e-/count."""
+    rng = np.random.default_rng(seed)
+    F = np.asarray(plan.crosstalk_matrix)
+    light = photons * np.asarray(bright, float)
+    el = np.full((n, 2, 3), scatter)
+    el[:, 1, 1] += F[0] @ light
+    el[:, 1, 2] += F[1] @ light
+    return emccd_counts(el, 200.0, True, 4.0, 40.0, 100.0, 0.005, rng).astype(np.int64)
+
+
+def test_quick_fidelity_matches_dark_shots():
+    """Shots prepared bright + the background pixels predict what the ROIs
+    read with an ion really dark - alone, and next to a bright ion (planned
+    crosstalk as amplified photo-electrons)."""
+    plan = _two_ion_plan()
+    assert dark_pixel_mask(plan).tolist() == [[False, True, True], [False, False, False]]
+    # without a background ROI: the frame's pixels with (almost) no ion light
+    pos = chain(2, 3.4)
+    p = plan_readout(pos, (1.2, 1.2), SENSOR, 4, 4, roi_size=(1, 1), background_roi=False,
+                     frame_margin=2)
+    m = dark_pixel_mask(p)
+    assert 0 < m.sum() <= 64 and not any(m[v0:v1, u0:u1].any() for u0, v0, u1, v1 in
+                                         p.ion_rois)
+    f = _emccd_shots(plan, 20000)
+    res = shot_histograms(plan, plan.roi_sums(f), f[:, dark_pixel_mask(plan)])
+    assert res["shots"] == 20000 and res["dark_pixels"] == 2
+    assert [s["label"] for s in res["series"]] == ["ion 0", "ion 1", "bg"]
+    assert len(res["edges"]) == len(res["series"][0]["fraction"]) + 1
+    all_dark = plan.roi_sums(_emccd_shots(plan, 20000, (False, False), seed=1))
+    dark0 = plan.roi_sums(_emccd_shots(plan, 20000, (False, True), seed=2))
+    dark1 = plan.roi_sums(_emccd_shots(plan, 20000, (True, False), seed=3))
+    for i, d in ((0, dark0), (1, dark1)):
+        r = res["ions"][i]
+        t = r["threshold"]
+        assert r["ok"] and 0.5 < r["fidelity"] < 1.0
+        assert r["dark_error"] == pytest.approx(np.mean(all_dark[:, i] > t), abs=0.01)
+        assert r["dark_error_neighbours_bright"] == pytest.approx(np.mean(d[:, i] > t),
+                                                                  rel=0.15, abs=0.01)
+    # ROI 0 gets far more of ion 1's light (8 %) than ROI 1 of ion 0's (3 %)
+    assert res["ions"][0]["crosstalk"] > 2 * res["ions"][1]["crosstalk"]
+    assert res["ions"][0]["dark_error_neighbours_bright"] > res["ions"][0]["dark_error"]

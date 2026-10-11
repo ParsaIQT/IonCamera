@@ -679,9 +679,12 @@ def grabber_roi_sums(frame: np.ndarray, rois: Sequence[Rect]) -> np.ndarray:
 # verification and thresholds
 # ---------------------------------------------------------------------------
 
-def verify_plan(plan: ReadoutPlan, frames: Sequence[np.ndarray], min_snr: float = 3.0) -> dict:
+def verify_plan(plan: ReadoutPlan, frames: Sequence[np.ndarray], min_snr: float = 3.0,
+                enf: float = 2.0) -> dict:
     """Check, on frames taken with the final readout settings (SDK orientation),
-    that every ion is really inside its ROI."""
+    that every ion is really inside its ROI.  The ions shine in every frame,
+    so the frames also give the quick fidelity estimate of
+    :func:`shot_histograms` (``enf``: 2 with EM gain, 1 without)."""
     f = np.asarray(frames)
     problems: List[str] = []
     w, h = plan.frame_size
@@ -689,9 +692,11 @@ def verify_plan(plan: ReadoutPlan, frames: Sequence[np.ndarray], min_snr: float 
         problems.append("frame shape {} differs from the planned {}x{}".format(
             tuple(f.shape[1:]), w, h))
         return {"ok": False, "problems": problems}
-    sums = plan.roi_sums(f).astype(float)
+    raw = plan.roi_sums(f)
+    sums = raw.astype(float)
     n = plan.n_ions
     area = [(r[2] - r[0]) * (r[3] - r[1]) for r in plan.sdk_rois()]
+    quick = shot_histograms(plan, raw, f[:, dark_pixel_mask(plan)], enf=enf)["ions"]
     if plan.background_roi is not None:
         bg = sums[:, n] / area[n]                         # per binned pixel
         bg_level = float(bg.mean())
@@ -712,14 +717,18 @@ def verify_plan(plan: ReadoutPlan, frames: Sequence[np.ndarray], min_snr: float 
         # is the ion in its ROI?  judged on the mean of all frames: with ~10-20
         # photons per shot a single shot is legitimately noisy
         snr = shot * math.sqrt(n_f)
-        # rough single-shot bright/dark error: dark = background scaled to the ROI
-        dark_sd = math.sqrt(area[i]) * max(bg_noise, 1e-9)
-        err = _gauss_overlap(float(net.mean()), std, 0.0, dark_sd)
         nets.append(float(net.mean()))
         ions.append({"mean": round(float(s.mean()), 1), "std": round(std, 1),
                      "net": round(float(net.mean()), 1), "snr": round(snr, 1),
-                     "snr_single_shot": round(shot, 2),
-                     "discrimination_error": round(err, 4)})
+                     "snr_single_shot": round(shot, 2)})
+        q = quick[i]
+        if q.get("ok") and plan.ion_states[i] == "bright":
+            # the frames' own threshold, bright and dark error (background as dark)
+            ions[-1].update(threshold=q["threshold"], fidelity=round(q["fidelity"], 4),
+                            discrimination_error=round(1.0 - q["fidelity"], 4))
+            if "dark_error_neighbours_bright" in q:
+                ions[-1]["dark_error_neighbours_bright"] = round(
+                    q["dark_error_neighbours_bright"], 4)
         if plan.ion_states[i] == "bright" and snr < min_snr:
             problems.append("ion {}: SNR {:.1f} < {} - not in its ROI?".format(i, snr, min_snr))
     # every ROI against the light the plan expects in it (containment and the
@@ -738,16 +747,6 @@ def verify_plan(plan: ReadoutPlan, frames: Sequence[np.ndarray], min_snr: float 
     return {"ok": not problems, "problems": problems, "n_frames": int(f.shape[0]),
             "background_per_pixel": round(bg_level, 2), "background_noise": round(bg_noise, 2),
             "ions": ions, "max_count": int(f.max())}
-
-
-def _gauss_overlap(mu_b: float, sd_b: float, mu_d: float, sd_d: float) -> float:
-    """Mean error of the best threshold between two Gaussians (bright, dark)."""
-    if mu_b <= mu_d:
-        return 0.5
-    sd_b, sd_d = max(sd_b, 1e-9), max(sd_d, 1e-9)
-    xs = np.linspace(mu_d, mu_b, 201)
-    err = 0.5 * (ndtr((mu_d - xs) / sd_d) + ndtr((xs - mu_b) / sd_b))
-    return float(err.min())
 
 
 def fit_threshold(counts: Sequence[float]) -> dict:
@@ -811,6 +810,160 @@ def fit_threshold(counts: Sequence[float]) -> dict:
             "fidelity": 1.0 - 0.5 * (p_dark_as_bright + p_bright_as_dark),
             "p_dark_as_bright": p_dark_as_bright, "p_bright_as_dark": p_bright_as_dark,
             "separation": float((mb - ma) / math.sqrt(sa * sa + sb * sb)), "n": int(n)}
+
+
+# ---------------------------------------------------------------------------
+# shot histograms: a quick fidelity estimate from shots prepared bright
+# ---------------------------------------------------------------------------
+
+def dark_pixel_mask(plan: ReadoutPlan, max_light: float = 0.02,
+                    max_pixels: int = 64) -> np.ndarray:
+    """Frame pixels (binned, SDK orientation) that serve as the dark
+    reference: the background ROI or, without one, the (at most
+    ``max_pixels``) super-pixels holding the least ion light, all below
+    ``max_light`` of an ion's light (planned PSF)."""
+    w, h = plan.frame_size
+    mask = np.zeros((h, w), bool)
+    if plan.background_roi is not None:
+        u0, v0, u1, v1 = plan.background_roi
+        mask[v0:v1, u0:u1] = True
+        return mask
+    vv, uu = np.mgrid[0:h, 0:w]
+    ax = plan.roi[0] + uu.ravel() * plan.hbin - 0.5
+    ay = plan.roi[1] + vv.ravel() * plan.vbin - 0.5
+    f = _light_matrix(ax, ax + plan.hbin, ay, ay + plan.vbin,
+                      np.asarray(plan.positions, float).reshape(-1, 2), *plan.psf_sigma,
+                      plan.psf_halo)
+    light = f.sum(axis=1)
+    keep = np.argsort(light, kind="stable")[:max_pixels]
+    mask.ravel()[keep[light[keep] < max_light]] = True
+    return mask
+
+
+def _dark_sums(px: np.ndarray, area: int) -> np.ndarray:
+    """Dark-reference sums for a ROI of ``area`` super-pixels from the dark
+    pixels ``px`` (shots x pixels): neighbouring pixels of one shot added up
+    (pixels of several shots when a shot has too few)."""
+    px = np.asarray(px, np.int64)
+    if px.ndim != 2 or px.size == 0:
+        return np.zeros(0, np.int64)
+    if area <= 1:
+        return px.ravel()
+    if area <= px.shape[1]:
+        c = np.concatenate([np.zeros((len(px), 1), np.int64), np.cumsum(px, axis=1)], axis=1)
+        return (c[:, area:] - c[:, :-area]).ravel()
+    flat = px.ravel()
+    k = flat.size // area
+    return flat[:k * area].reshape(k, area).sum(axis=1)
+
+
+def threshold_fidelity(bright: Sequence[float], dark: Sequence[float]) -> dict:
+    """The threshold between ROI sums of shots prepared bright and dark
+    (bright if sum > threshold) that misclassifies the fewest, and the
+    readout fidelity it gives, ``1 - (P(bright <= t) + P(dark > t)) / 2`` -
+    counted on the shots themselves, no model of the distributions."""
+    b = np.sort(np.rint(np.asarray(bright, float)).astype(np.int64).ravel())
+    d = np.sort(np.rint(np.asarray(dark, float)).astype(np.int64).ravel())
+    if b.size == 0 or d.size == 0:
+        return {"ok": False, "reason": "no {} shots".format("bright" if b.size == 0 else "dark")}
+    cand = np.unique(np.concatenate([b, d]))
+    eb = np.searchsorted(b, cand, "right") / b.size          # bright read as dark
+    ed = 1.0 - np.searchsorted(d, cand, "right") / d.size    # dark read as bright
+    err = eb + ed
+    best = np.flatnonzero(err <= err.min() + 1e-12)
+    k = int(best[len(best) // 2])
+    # every integer from cand[k] to cand[k + 1] - 1 classifies the same: the middle
+    t = int(cand[k]) if k + 1 >= len(cand) else int((cand[k] + cand[k + 1] - 1) // 2)
+    nb_err = int(np.searchsorted(b, t, "right"))
+    nd_err = int(d.size - np.searchsorted(d, t, "right"))
+    e_b, e_d = nb_err / b.size, nd_err / d.size
+    return {"ok": True, "threshold": t, "fidelity": 1.0 - 0.5 * (e_b + e_d),
+            "bright_error": e_b, "dark_error": e_d, "bright_errors": nb_err,
+            "dark_errors": nd_err, "n_bright": int(b.size), "n_dark": int(d.size),
+            "bright_mean": float(b.mean()), "dark_mean": float(d.mean())}
+
+
+def shot_histograms(plan: ReadoutPlan, sums, dark_px, enf: float = 2.0, bins: int = 80,
+                    seed: int = 0) -> dict:
+    """Histograms of readout shots and a quick readout-fidelity estimate.
+
+    Every shot is taken as prepared **bright** (prepare bright on purpose), so
+    each ion ROI's sums are its bright distribution.  The dark reference is
+    the background pixels of the same shots (:func:`dark_pixel_mask`) added
+    up to the ion ROI's size: what the ROI reads with the ion dark and no
+    light from its neighbours.  :func:`threshold_fidelity` puts the threshold
+    where the two overlap least.
+
+    A dark ion next to bright ones also gets their crosstalk.  The planned
+    crosstalk matrix turns the measured signals into the light every ion
+    puts into the other ROIs; added to the dark reference as EMCCD
+    photo-electrons (Poisson, each amplified with an exponential gain
+    distribution for ``enf`` = 2 - EM gain on - or fixed for ``enf`` = 1;
+    the counts per photo-electron from the bright shots' excess variance)
+    it gives the dark error, at the same threshold, with all neighbours
+    bright."""
+    n, n_rois = plan.n_ions, plan.n_rois
+    s = np.asarray(sums, np.int64).reshape(-1, n_rois)
+    px = np.asarray(dark_px, np.int64)
+    if px.ndim != 2 or len(px) != len(s):
+        px = np.zeros((len(s), 0), np.int64)
+    areas = [(r[2] - r[0]) * (r[3] - r[1]) for r in plan.sdk_rois()[:n]]
+    dark = {a: _dark_sums(px, a) for a in sorted(set(areas))}
+    out = {"shots": int(len(s)), "n_ions": n, "dark_pixels": int(px.shape[1]),
+           "dark_reference": "background ROI" if plan.background_roi is not None
+           else "frame pixels with < 2% of an ion's light",
+           "ions": [], "series": [], "edges": []}
+    if len(s) == 0:
+        return out
+    nets, excess = [], []
+    for i in range(n):
+        d, b = dark[areas[i]], s[:, i]
+        r = threshold_fidelity(b, d) if d.size else \
+            {"ok": False, "reason": "no dark reference (no background pixels in the frame)"}
+        r.update(index=i, label="ion {}".format(i), roi_pixels=areas[i])
+        if d.size:
+            nets.append(float(b.mean() - d.mean()))
+            excess.append(float(b.var() - d.var()))
+            r["signal"] = nets[-1]
+        out["ions"].append(r)
+    if n > 1 and len(nets) == n and plan.crosstalk_matrix:
+        F = np.asarray(plan.crosstalk_matrix, float).reshape(n, n)
+        net = np.maximum(np.array(nets), 0.0)
+        diag = np.maximum(np.diag(F), 1e-9)
+        light = net / diag
+        if np.linalg.cond(F) < 1e6:
+            light = np.linalg.solve(F, net)
+        light = np.maximum(light, 0.0)
+        xt = F @ light - np.diag(F) * light            # neighbours' light in each ROI
+        g = max(sum(excess), 0.0) / max(enf * float(net.sum()), 1e-12)   # counts / e-
+        rng = np.random.default_rng(seed)
+        for i, r in enumerate(out["ions"]):
+            r["crosstalk"] = float(xt[i])
+            if not r.get("ok"):
+                continue
+            d = dark[areas[i]]
+            if g > 0:
+                k = rng.poisson(xt[i] / g, d.size)
+                x = rng.gamma(k, g) if enf > 1.5 else k * g
+            else:
+                x = np.full(d.size, xt[i])
+            e = float(np.mean(np.rint(d + x) > r["threshold"]))
+            r["dark_error_neighbours_bright"] = e
+            r["fidelity_neighbours_bright"] = 1.0 - 0.5 * (r["bright_error"] + e)
+    # common bins for all curves: the ion ROIs, then the dark reference(s)
+    series = [("ion {}".format(i), s[:, i]) for i in range(n)]
+    series += [("bg" if len(dark) == 1 else "bg ({} px)".format(a), v)
+               for a, v in dark.items() if v.size]
+    lo = math.floor(min(np.percentile(v, 0.02) for _, v in series))
+    hi = math.ceil(max(np.percentile(v, 99.98) for _, v in series))
+    width = max(1, int(math.ceil((hi - lo + 1) / max(int(bins), 1))))
+    edges = lo - 0.5 + width * np.arange(int(math.ceil((hi - lo + 1) / width)) + 1)
+    out["edges"] = edges.tolist()
+    for name, v in series:
+        h, _ = np.histogram(v, edges)
+        out["series"].append({"label": name, "n": int(v.size),
+                              "fraction": (h / v.size).tolist()})
+    return out
 
 
 def compare_grabber_frame(expected: np.ndarray, measured: np.ndarray) -> dict:

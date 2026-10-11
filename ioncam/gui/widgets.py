@@ -549,29 +549,67 @@ class SiteTable(QtWidgets.QTableWidget):
                 self.setItem(r, c, it)
 
 
-class HistogramPlot(pg.PlotWidget):
-    """Histogram of one ion's Grabber-ROI sums with the fitted threshold."""
+class ShotHistogramPlot(pg.PlotWidget):
+    """Histograms of the readout shots (``get_readout_histograms``): every ion
+    ROI in its colour on the image, the background (dark reference) in grey,
+    each ion's threshold as a dashed line in its colour."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setLabel("bottom", "ROI sum [counts]")
-        self.setLabel("left", "shots")
-        self.curve = self.plot([], [], stepMode="center", fillLevel=0,
-                               brush=(80, 140, 220, 120), pen=_pen((40, 90, 180), 1))
-        self.line = pg.InfiniteLine(angle=90, pen=_pen("#d0211a", 2, QtCore.Qt.PenStyle.DashLine))
-        self.addItem(self.line)
-        self.line.setVisible(False)
+        self.setLabel("left", "fraction of shots")
+        self.getAxis("left").enableAutoSIPrefix(False)
+        self.getAxis("bottom").enableAutoSIPrefix(False)
+        self.showGrid(x=True, y=True, alpha=0.2)
+        self.legend = self.addLegend(offset=(-10, 10))
+        self.curves = {}
+        self.lines = []
+        self.log = False
+        self._last = None
 
-    def set_data(self, values, threshold=None):
-        v = np.asarray(values, float)
-        if v.size < 2:
-            self.curve.setData([], [])
-            self.line.setVisible(False)
-            return
-        y, x = np.histogram(v, bins=min(80, max(10, v.size // 20)))
-        self.curve.setData(x, y)
-        if threshold is not None:
-            self.line.setValue(threshold)
-            self.line.setVisible(True)
-        else:
-            self.line.setVisible(False)
+    @staticmethod
+    def color(label):
+        if label.startswith("ion "):
+            return ION_COLORS[int(label.split()[1]) % len(ION_COLORS)]
+        return (150, 150, 150)
+
+    def set_log(self, on):
+        self.log = bool(on)
+        self.setLogMode(y=self.log)
+        for c in self.curves.values():
+            c.setFillLevel(None if self.log else 0.0)
+        if self._last is not None:
+            self.set_data(self._last)
+
+    def set_data(self, res):
+        self._last = res
+        res = res or {}
+        edges = np.asarray(res.get("edges") or [], float)
+        series = res.get("series") or []
+        names = [s["label"] for s in series]
+        for name in [k for k in self.curves if k not in names]:
+            c = self.curves.pop(name)
+            self.legend.removeItem(c)
+            self.removeItem(c)
+        for s in series:
+            y = np.asarray(s["fraction"], float)
+            if self.log:
+                # empty bins sit on a floor below one shot (log axis)
+                y = np.maximum(y, 0.5 / max(s.get("n", 1), 1))
+            c = self.curves.get(s["label"])
+            if c is None:
+                color = self.color(s["label"])
+                c = self.plot([], [], stepMode="center", name=s["label"], pen=_pen(color, 1.8),
+                              fillLevel=None if self.log else 0.0, brush=color + (45,))
+                self.curves[s["label"]] = c
+            if len(edges) == len(y) + 1:
+                c.setData(edges, y)
+        for ln in self.lines:
+            self.removeItem(ln)
+        self.lines = []
+        for r in res.get("ions") or []:
+            if r.get("ok"):
+                ln = pg.InfiniteLine(r["threshold"] + 0.5, angle=90, pen=_pen(
+                    self.color(r["label"]), 1.5, QtCore.Qt.PenStyle.DashLine))
+                self.addItem(ln)
+                self.lines.append(ln)

@@ -7,7 +7,10 @@ prepare():  ioncam locates the ions with a long, low-gain exposure, centres the
 kernel:     sets up the Grabber ROIs; every shot opens the ROI gate, triggers
             the camera and reads one sum per ROI (ions in chain order, then a
             background ROI).
-analyze():  bright/dark thresholds per ion from the histograms.
+analyze():  bright/dark thresholds per ion from the histograms.  With
+            ``all_bright`` (every shot prepared bright on purpose) the
+            background pixels of the same shots are the dark reference:
+            ioncam's quick fidelity estimate per ion.
 
 Wiring: a TTL output -> iXon EXT TRIG input; iXon Camera Link -> Grabber
 (base configuration).  After arming, the core device log should report
@@ -33,6 +36,9 @@ class IonCamGrabberReadout(EnvExperiment):
                                                      max=1000000))
         self.setattr_argument("shot_period", NumberValue(10 * ms, unit="ms", min=1 * ms))
         self.setattr_argument("recalibrate", BooleanValue(True))
+        # every shot prepared bright: threshold + quick fidelity with the
+        # background as the dark reference (otherwise a two-population fit)
+        self.setattr_argument("all_bright", BooleanValue(True))
 
     def prepare(self):
         n = int(self.n_ions)
@@ -115,9 +121,26 @@ class IonCamGrabberReadout(EnvExperiment):
         sums = np.asarray(self.get_dataset("ioncam.roi_sums"))
         if self.missed:
             print("{} shot(s) without a frame (trigger during readout?)".format(self.missed))
-        # server-side threshold fits from the frames the camera also sent over USB
-        stats = self.ioncam.get_readout_stats(self.n_shots_int)
         thresholds = []
+        if self.all_bright:
+            # the frames the camera also sent over USB: ion ROIs bright, the
+            # background pixels of the same shots dark
+            est = self.ioncam.get_readout_histograms("trigger", self.n_shots_int)
+            for r in est["ions"]:
+                if r.get("ok"):
+                    thresholds.append(r["threshold"])
+                    print("ion {}: bright if sum > {}, fidelity ~{:.2%} (bright->dark {:.2%}, "
+                          "dark->bright {:.2%}; {:.2%} with the neighbours bright)".format(
+                              r["index"], r["threshold"], r["fidelity"], r["bright_error"],
+                              r["dark_error"], r.get("dark_error_neighbours_bright",
+                                                     r["dark_error"])))
+                else:
+                    thresholds.append(float("nan"))
+                    print("ion {}: no estimate ({})".format(r["index"], r.get("reason")))
+            self.set_dataset("ioncam.thresholds", np.array(thresholds), broadcast=True)
+            return
+        # mixed bright and dark shots: server-side two-population fits
+        stats = self.ioncam.get_readout_stats(self.n_shots_int)
         for i in range(self.n_ion_rois):
             th = stats["rois"][i].get("threshold", {}) if i < len(stats["rois"]) else {}
             if th.get("ok"):

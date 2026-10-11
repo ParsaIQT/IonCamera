@@ -130,7 +130,8 @@ class CalibrationConfig:
     include_dark_sites: bool = opt(True, "also give dark ions known to the tracker a ROI")
     verify: bool = opt(True, "take test frames with the final readout settings "
                              "(internal trigger) and check every ROI before arming")
-    verify_frames: int = opt(50, "number of verification frames")
+    verify_frames: int = opt(200, "number of verification frames (also the shots of the "
+                                  "quick fidelity estimate until triggered shots arrive)")
     min_verify_snr: float = opt(5.0, "minimum significance of each ion's mean signal over "
                                      "the verification frames (is it in its ROI?)")
     fit_psf: bool = opt(True, "joint 2D Gaussian fit of all ions (sub-pixel positions, PSF)")

@@ -267,3 +267,16 @@ def test_fit_jacobian_matches_numeric(halo):
     jn = np.column_stack([(captured["fun"](x0 + eps * e) - captured["fun"](x0 - eps * e)) / (2 * eps)
                           for e in np.eye(len(x0))])
     assert np.abs(ja - jn).max() < 1e-6 * max(1.0, np.abs(jn).max())
+
+
+def test_locate_merges_an_ion_split_in_two():
+    """A locate exposure where the detector, with its first live PSF estimate
+    (sigma 1.69 px + 25 % halo; the ions' is 1.8 + 15 %), split the middle of
+    3 ions into two spots of half an ion's light each: told 3 ions, locate
+    merges them.  Real ions - further apart, an ion's light each - stay."""
+    from ioncam.engine import _merge_split_spots
+    spots = [[268.17, 168.01], [255.82, 168.03], [263.04, 167.77], [260.98, 168.25]]
+    g = _merge_split_spots(spots, [9541, 9491, 5459, 5520], 3, 1.69)
+    assert len(g) == 3 and g[np.argsort(g[:, 0])][1] == pytest.approx([262.0, 168.0], abs=0.15)
+    assert len(_merge_split_spots([[0, 0], [6, 0]], [1e4, 1e4], 1, 1.8)) == 2
+    assert len(_merge_split_spots([[0, 0], [2, 0], [9, 0]], [1e4, 1e4, 1e4], 2, 1.8)) == 3

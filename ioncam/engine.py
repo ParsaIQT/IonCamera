@@ -38,8 +38,9 @@ from ioncam.analysis.chain import equilibrium_positions, fit_chain
 from ioncam.analysis.detection import DetectionResult, Detector
 from ioncam.analysis.fitting import PSF, fit_gaussians
 from ioncam.analysis.readout import (PlanError, ReadoutPlan, binning_advice,
-                                     compare_grabber_frame, fit_threshold, plan_readout,
-                                     reposition_plan, verify_plan)
+                                     compare_grabber_frame, dark_pixel_mask, fit_threshold,
+                                     plan_readout, reposition_plan, shot_histograms,
+                                     verify_plan)
 from ioncam.analysis.tracker import ChainTracker, adopt_learned_psf, align
 from ioncam.camera.base import (AcquisitionSettings, AppliedSettings, CameraBase, CameraError,
                                 Frame)
@@ -69,6 +70,29 @@ def _rebaseline_needed(old: Optional[AppliedSettings], new: AppliedSettings) -> 
             (b.hbin, b.vbin, b.amplifier, b.preamp_gain_index, new.hs_speed_mhz))
 
 
+def _merge_split_spots(positions, flux, n: int, sigma: float) -> np.ndarray:
+    """More spots than the ``n`` ions known to be there: at the very high SNR of
+    a long exposure a PSF estimate that is a little off makes the detector
+    split a bright ion into two close spots with one ion's light between them.
+    Merge such pairs (closest first, within ``2 sigma``) - real ions are
+    further apart than the detector can resolve, and carry an ion's light each."""
+    pos = np.asarray(positions, float).reshape(-1, 2).copy()
+    f = np.asarray(flux, float).copy()
+    while len(pos) > n:
+        d = np.hypot(pos[:, None, 0] - pos[None, :, 0], pos[:, None, 1] - pos[None, :, 1])
+        np.fill_diagonal(d, np.inf)
+        i, j = np.unravel_index(int(np.argmin(d)), d.shape)
+        rest = np.delete(f, [i, j])
+        one_ion = float(np.median(rest)) if len(rest) else f[i] + f[j]
+        if d[i, j] > 2.0 * sigma or f[i] + f[j] > 1.5 * one_ion:
+            break
+        w = max(f[i] + f[j], 1e-12)
+        pos[i] = (pos[i] * f[i] + pos[j] * f[j]) / w
+        f[i] = f[i] + f[j]
+        pos, f = np.delete(pos, j, axis=0), np.delete(f, j)
+    return pos
+
+
 def _pad_roi(roi, min_size: int, sensor_shape) -> tuple:
     """``roi`` (x0, y0, x1, y1) grown symmetrically to at least ``min_size``
     pixels per axis, kept on the sensor."""
@@ -81,7 +105,8 @@ def _pad_roi(roi, min_size: int, sensor_shape) -> tuple:
 
 
 class ReadoutMonitor:
-    """Per-ROI sums of every readout frame + health checks."""
+    """Per-ROI sums of every readout frame (and the frame's background pixels,
+    the dark reference of the shot histograms) + health checks."""
 
     def __init__(self, maxlen: int = 50000):
         self._lock = threading.Lock()
@@ -92,6 +117,8 @@ class ReadoutMonitor:
         with self._lock:
             self.plan = plan
             self.sums: Deque[np.ndarray] = deque(maxlen=self._maxlen)
+            self.dark: Deque[np.ndarray] = deque(maxlen=self._maxlen)
+            self.dark_mask = dark_pixel_mask(plan) if plan is not None else None
             self.times: Deque[float] = deque(maxlen=self._maxlen)
             self.outside: Deque[float] = deque(maxlen=2000)
             self.frames: Deque[np.ndarray] = deque(maxlen=200)
@@ -111,6 +138,7 @@ class ReadoutMonitor:
             if data.size == 0:
                 return events
             sums = plan.roi_sums(data)
+            dark = data[:, self.dark_mask]
             n = plan.n_ions
             area = np.array([(r[2] - r[0]) * (r[3] - r[1]) for r in plan.sdk_rois()], float)
             total = data.reshape(len(data), -1).sum(axis=1).astype(float)
@@ -123,6 +151,7 @@ class ReadoutMonitor:
             for k, f in enumerate(frames[:len(data)]):
                 self.frames.append(data[k])
                 self.sums.append(sums[k])
+                self.dark.append(dark[k])
                 self.times.append(f.timestamp)
                 self.shots += 1
                 # fraction of the light outside the ion ROIs (only when ions shine)
@@ -155,6 +184,16 @@ class ReadoutMonitor:
             times = list(self.times)[k0:]
         return {"first_shot": start, "next_shot": start + len(sums),
                 "sums": [[int(v) for v in s] for s in sums], "t": times}
+
+    def shots_snapshot(self, last: int) -> Tuple[Optional[ReadoutPlan], np.ndarray,
+                                                 np.ndarray, float]:
+        """(plan, sums, dark pixels, time of the last shot) of the last shots."""
+        with self._lock:
+            k = len(self.sums) if last <= 0 else min(int(last), len(self.sums))
+            sums = np.array(list(self.sums)[-k:]) if k else np.zeros((0, 0))
+            dark = np.array(list(self.dark)[-k:]) if k else np.zeros((0, 0))
+            t = self.times[-1] if self.times else 0.0
+            return self.plan, sums, dark, t
 
     def stats(self, last: int = 2000) -> dict:
         with self._lock:
@@ -212,6 +251,7 @@ class IonCamEngine:
         self._plan: Optional[ReadoutPlan] = None
         self._plan_valid = False
         self._last_locate: Optional[dict] = None
+        self._verify_shots: Optional[dict] = None     # the last verification's frames
         self._procedure: Optional[dict] = None
         self._abort = threading.Event()
         self._error: Optional[str] = None
@@ -543,6 +583,7 @@ class IonCamEngine:
         a = self._applied
         snap = self._snapshot
         plan = self._plan
+        vs = self._verify_shots
         temp, tstat = self._temperature
         last = self.events.since(max(0, self.events.last_id - 1), limit=1)
         return {
@@ -572,7 +613,9 @@ class IonCamEngine:
                         "plan_valid": bool(plan is not None and self._plan_valid),
                         "n_ions": plan.n_ions if plan else 0,
                         "frame_size": list(plan.frame_size) if plan else None,
-                        "shots": self.monitor.shots},
+                        "shots": self.monitor.shots,
+                        "verified": vs["t"] if vs and plan and vs["plan"] == plan.created
+                        else None},
             "control": dict(self._control) if self._control else None,
             "last_event": last[0] if last else None,
             "last_event_id": self.events.last_id,
@@ -747,9 +790,13 @@ class IonCamEngine:
                                  "(lasers on? ions in the field of view?)")
         hb, vb = applied.hbin, applied.vbin
         guesses = positions
+        n_known = expected or (int(snap.get("n_bright") or 0) if snap.get("stable") else 0)
+        if n_known and n_det > n_known:
+            guesses = _merge_split_spots(positions, [sp.flux for sp in det.spots], n_known,
+                                         cfg.detection.psf_sigma)
         if expected and n_det != expected:
             guesses = self._chain_guesses(positions, expected, det, snap.get("chain")) \
-                if expected > n_det else positions
+                if expected > n_det else guesses
         elif not expected and snap.get("stable") and (snap.get("n_bright") or 0) > n_det:
             # the tracker sees more ions than this exposure resolved (a tight
             # pair merged into one spot): start the joint fit from its sites
@@ -989,7 +1036,17 @@ class IonCamEngine:
         frames = self._collect(cal.verify_frames,
                                timeout=cal.verify_frames * (applied.kinetic_cycle * 3 + 0.5) + 10)
         self.camera.stop()
-        plan.verification = verify_plan(plan, [f.data for f in frames], cal.min_verify_snr)
+        data = [f.data for f in frames]
+        enf = 2.0 if applied.settings.amplifier == "em" and applied.em_gain > 1 else 1.0
+        plan.verification = verify_plan(plan, data, cal.min_verify_snr, enf=enf)
+        w, h = plan.frame_size
+        good = [d for d in data if d.shape == (h, w)]
+        if good:
+            # kept for the shot histograms (the ions shine all the time: bright shots)
+            good = np.stack(good)
+            self._verify_shots = {"plan": plan.created, "t": time.time(),
+                                  "sums": plan.roi_sums(good),
+                                  "dark": good[:, dark_pixel_mask(plan)], "enf": enf}
         if not plan.verification["ok"] and not force:
             raise ProcedureError("readout verification failed: {}".format(
                 "; ".join(plan.verification["problems"])))
@@ -1004,6 +1061,42 @@ class IonCamEngine:
             self._verify_with_camera(self._plan, force)
             return self._plan.to_dict(), True
         return self._procedure_run("verify_readout", proc)
+
+    def readout_histograms(self, source: str = "auto", last: int = 20000) -> dict:
+        """Histograms of the readout shots - every ion ROI and the dark
+        reference - with a quick fidelity estimate per ion, every shot taken
+        as prepared bright (see :func:`shot_histograms`).  ``source``:
+        "trigger" (the externally triggered readout shots), "verify" (the
+        frames of the last verification) or "auto" (whichever is newer)."""
+        if source not in ("auto", "trigger", "verify"):
+            raise ValueError('source must be "auto", "trigger" or "verify"')
+        plan = self._plan
+        out = {"source": None, "shots": 0, "ions": [], "series": [], "edges": [],
+               "available": {"trigger": 0, "verify": 0}}
+        if plan is None:
+            return out
+        mplan, sums, dark, t_trig = self.monitor.shots_snapshot(last)
+        if mplan is None or mplan.created != plan.created:
+            sums, dark, t_trig = np.zeros((0, plan.n_rois)), np.zeros((0, 0)), 0.0
+        vs = self._verify_shots
+        if vs is not None and vs["plan"] != plan.created:
+            vs = None
+        out["available"] = {"trigger": int(len(sums)), "verify": len(vs["sums"]) if vs else 0}
+        if source == "auto":
+            source = "verify" if vs is not None and (not len(sums) or vs["t"] > t_trig) \
+                else "trigger"
+        if source == "verify":
+            if vs is None:
+                return dict(out, source="verify")
+            k = len(vs["sums"]) if last <= 0 else int(last)
+            sums, dark, enf = vs["sums"][-k:], vs["dark"][-k:], vs["enf"]
+        else:
+            a = plan.applied or {}
+            em = a.get("settings", {}).get("amplifier") == "em" and a.get("em_gain", 0) > 1
+            enf = 2.0 if em else 1.0
+        res = shot_histograms(plan, sums, dark, enf=enf)
+        res.update(source=source, available=out["available"], plan_created=plan.created)
+        return res
 
     def nudge_readout(self, dx: int = 0, dy: int = 0) -> dict:
         """Move the AQROI by ``(dx, dy)`` sensor px - the D-pad of the manual
@@ -1252,6 +1345,25 @@ class IonCamEngine:
         self.detector.clear_static_background()
         with self._tracker_lock:
             self.tracker.background_changed()
+
+    def sim_trap_turned(self) -> None:
+        """[simulation] The simulated trap was turned in the image, electrodes
+        and surface with it - as if a different trap had been mounted: the
+        learned background (of the old orientation) is dropped, the crystal is
+        tracked afresh (the ions jumping to new places is nothing a real trap
+        does; nor is the turned surface light an ion cloud) and a readout plan
+        is outdated."""
+        learned = self.detector.static_background is not None
+        self.detector.clear_static_background()
+        self.reset_tracking()
+        if learned:
+            self.events.emit("background_cleared", "The trap was turned (simulation): the "
+                             "learned background was of the old orientation and is cleared - "
+                             "learn it again", "warning")
+        if self._plan is not None and self._plan_valid:
+            self._plan_valid = False
+            self.events.emit("readout_plan_outdated", "The trap was turned (simulation) - "
+                             "recalibrate the readout", "warning")
 
     # -- control lease ---------------------------------------------------------------------
 

@@ -92,8 +92,21 @@ def test_calibrate_arm_trigger_monitor(system):
         assert a["exposure"] == pytest.approx(0.0015) and a["em_gain"] == 200
         assert c.get_grabber_roi_lists() == [plan["grabber_x0"], plan["grabber_y0"],
                                              plan["grabber_x1"], plan["grabber_y1"]]
+        # the verification frames (ions shining) give the first shot histograms:
+        # ion ROIs bright, the background pixels of the same frames dark
+        h = c.get_readout_histograms()
+        n_verify = plan["verification"]["n_frames"]
+        assert h["source"] == "verify" and h["shots"] == n_verify
+        assert [s["label"] for s in h["series"]] == ["ion 0", "ion 1", "ion 2", "bg"]
+        assert all(r["ok"] and r["fidelity"] > 0.6 for r in h["ions"])
+        assert [r["threshold"] for r in h["ions"]] == \
+            [i["threshold"] for i in plan["verification"]["ions"]]
         assert c.sim_trigger(60, 0.004) == 60
         time.sleep(0.8)
+        h = c.get_readout_histograms()               # the newer shots: triggered
+        assert h["source"] == "trigger" and h["shots"] >= 60
+        assert h["available"] == {"trigger": h["shots"], "verify": n_verify}
+        assert c.get_readout_histograms("verify")["shots"] == n_verify
         counts = c.get_readout_counts(0)
         assert counts["next_shot"] >= 60
         assert counts["sums"][-1] == c.sim_grabber_sums()     # USB copy == Grabber view
@@ -333,6 +346,30 @@ def test_locate_splits_a_merged_pair(tmp_path):
         engine.shutdown()
 
 
+def test_turning_the_trap_starts_afresh(tmp_path):
+    """Simulator: turning the trap is like mounting a different one - the
+    learned background (old orientation) is cleared, the crystal is tracked
+    afresh (no "lost" or "trapped" for the jump) and the turned electrode
+    scatter is not reported as ion clouds."""
+    engine, server, port = make_system(tmp_path, n_ions=3, psf_sigma=1.2, length_scale_px=3.4)
+    try:
+        time.sleep(2.0)
+        engine.learn_background(20)
+        last = engine.events.last_id
+        server.api.sim_set_params(trap_angle_deg=90)
+        assert engine.background_info() is None
+        time.sleep(4.0)
+        kinds = [e["kind"] for e in engine.events.since(last)]
+        assert "background_cleared" in kinds and "ions_detected" in kinds
+        assert not {"cloud_detected", "ion_lost", "ion_trapped"} & set(kinds)
+        assert engine.tracker.n_bright == 3 and engine.tracker.n_clouds == 0
+        d = engine.tracker.positions()[-1] - engine.tracker.positions()[0]
+        assert abs(d[0]) < 0.2 * abs(d[1])           # the chain now runs along y
+    finally:
+        server.stop()
+        engine.shutdown()
+
+
 def test_calibration_files_written(system, tmp_path_factory):
     engine, port = system
     d = os.path.join(engine.config.storage.data_dir, "calibrations")
@@ -345,6 +382,7 @@ def test_gui_smoke(tmp_path):
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     try:
         import pyqtgraph as pg
+        from pyqtgraph.Qt import QtWidgets
         from ioncam.gui.backend import LocalBackend
         from ioncam.gui.main_window import MainWindow
         app = pg.mkQApp("ioncam-test")
@@ -393,6 +431,26 @@ def test_gui_smoke(tmp_path):
         labels = [it.textItem.toPlainText() for it in win.image._rects
                   if isinstance(it, pg.TextItem)]
         assert labels[:3] == ["ion 0 80%", "ion 1 75%", "bg"] and "AQROI" in labels
+        # shot histograms: every ROI a curve, each ion its threshold and fidelity
+        win._got_hist({"source": "trigger", "shots": 3, "dark_reference": "background ROI",
+                       "dark_pixels": 2, "available": {"trigger": 3, "verify": 0},
+                       "edges": [0.5, 1.5, 2.5, 3.5],
+                       "series": [{"label": "ion 0", "n": 3, "fraction": [0.0, 0.5, 0.5]},
+                                  {"label": "bg", "n": 6, "fraction": [1.0, 0.0, 0.0]}],
+                       "ions": [{"ok": True, "label": "ion 0", "index": 0, "threshold": 1,
+                                 "fidelity": 0.9, "bright_error": 0.1, "dark_error": 0.1,
+                                 "bright_errors": 1, "n_bright": 3, "dark_errors": 1,
+                                 "n_dark": 6, "dark_error_neighbours_bright": 0.2}]})
+        assert set(win.hist.curves) == {"ion 0", "bg"} and len(win.hist.lines) == 1
+        assert "90.00%" in win.hist_table.text() and "3 externally" in win.hist_info.text()
+        # the simulator's rotate buttons turn the trap
+        rotate = [b for b in win.findChildren(QtWidgets.QPushButton) if b.text() == "45 deg"]
+        rotate[0].click()
+        t = time.time()
+        while time.time() - t < 5.0 and engine.sim_scene().cfg.trap_angle_deg != 45.0:
+            app.processEvents()
+            time.sleep(0.01)
+        assert engine.sim_scene().cfg.trap_angle_deg == 45.0
         win.close()
     finally:
         backend.close()

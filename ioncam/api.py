@@ -377,6 +377,18 @@ class IonCamAPI:
         the last shots, plus the fraction of light outside the ion ROIs."""
         return _plain(self._engine.monitor.stats(int(last)))
 
+    async def get_readout_histograms(self, source="auto", last=20000):
+        """Histograms of the readout shots - every ion ROI and the background
+        (dark reference) - with a quick readout-fidelity estimate per ion:
+        threshold (bright if ROI sum > threshold), bright and dark error and
+        the fidelity, taking every shot as prepared bright (prepare bright on
+        purpose).  The dark reference is the background pixels of the same
+        shots summed to the ion ROI's size; ``dark_error_neighbours_bright``
+        adds the planned crosstalk of the other ions.  ``source``:
+        "trigger" (externally triggered shots), "verify" (the last
+        verification frames) or "auto" (the newer)."""
+        return _plain(await self._run(self._engine.readout_histograms, str(source), int(last)))
+
     def check_grabber_mapping(self, image):
         """Compare an image reconstructed from Grabber single-pixel ROIs (H x W)
         with the frames received over USB; returns the best orientation and the
@@ -497,8 +509,15 @@ class IonCamAPI:
         ``beam_angle_deg=30``, ``scatter_sigma_across=20``, ``defects=300``,
         ``numerical_aperture=0.4``, ``ion_height_um=50``, ``photon_rate=8000``,
         ``psf_halo_fraction=0.2``, ``laser_power=0.7``, ``surface_seed=7`` (a
-        new surface).  Returns all parameters."""
-        return _plain(self._scene().set_params(**params))
+        new surface).  Turning the trap (``trap_angle_deg``) is like mounting
+        a different trap: a learned background is cleared, the crystal is
+        tracked afresh and a readout plan is outdated.  Returns all parameters."""
+        scene = self._scene()
+        angles = (scene.cfg.trap_angle_deg, scene.cfg.axis_angle_deg)
+        out = scene.set_params(**params)
+        if (scene.cfg.trap_angle_deg, scene.cfg.axis_angle_deg) != angles:
+            self._engine.sim_trap_turned()
+        return _plain(out)
 
     def sim_set_repumper(self, on):
         """[simulation] Repumper off: the ions are shelved (dark) while the

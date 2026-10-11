@@ -4,7 +4,7 @@ import time
 
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
-from ioncam.gui.widgets import (EventList, HistogramPlot, ImagePanel, SiteTable,
+from ioncam.gui.widgets import (EventList, ImagePanel, ShotHistogramPlot, SiteTable,
                                 StatusBanner, TracePlot)
 
 
@@ -118,9 +118,10 @@ def format_plan(plan):
         if ions_v:
             lines.append("  single-shot SNR   {}".format(
                 [i.get("snr_single_shot", i["snr"]) for i in ions_v]))
-            if "discrimination_error" in ions_v[0]:
-                lines.append("  est. bright/dark error per shot {}".format(
-                    ["{:.1%}".format(i["discrimination_error"]) for i in ions_v]))
+            if any("fidelity" in i for i in ions_v):
+                lines.append("  quick fidelity (ions bright, background as dark): {}".format(
+                    ", ".join("{:.1%} (bright if > {})".format(i["fidelity"], i["threshold"])
+                              if "fidelity" in i else "-" for i in ions_v)))
         for p in v.get("problems", []):
             lines.append("  ! " + p)
     a = plan.get("applied")
@@ -148,6 +149,31 @@ def format_plan(plan):
         for wtxt in plan["warnings"]:
             lines.append("warning: " + wtxt)
     return "\n".join(lines)
+
+
+def fidelity_table(res):
+    """The quick fidelity estimate of ``get_readout_histograms`` as an HTML table."""
+    rows = []
+    for r in (res or {}).get("ions") or []:
+        name = '<b style="color:#{:02x}{:02x}{:02x}">{}</b>'.format(
+            *ShotHistogramPlot.color(r["label"]), r["label"])
+        if not r.get("ok"):
+            rows.append("<tr><td>{}</td><td colspan=5>{}</td></tr>".format(
+                name, r.get("reason", "")))
+            continue
+        nb = r.get("dark_error_neighbours_bright")
+        rows.append("<tr><td>{}</td><td align=right>&gt; {}</td><td align=right><b>{:.2%}</b></td>"
+                    "<td align=right>{:.2%} ({}/{})</td><td align=right>{:.2%} ({}/{})</td>"
+                    "<td align=right>{}</td></tr>".format(
+                        name, r["threshold"], r["fidelity"], r["bright_error"],
+                        r["bright_errors"], r["n_bright"], r["dark_error"], r["dark_errors"],
+                        r["n_dark"], "" if nb is None else "{:.2%}".format(nb)))
+    if not rows:
+        return ""
+    head = ("<tr><th align=left>ROI</th><th>bright if</th><th>fidelity</th>"
+            "<th>bright&#8594;dark</th><th>bg&#8594;bright</th>"
+            "<th>neighbours bright</th></tr>")
+    return "<table cellspacing=0 cellpadding=2>{}{}</table>".format(head, "".join(rows))
 
 
 def artiq_snippet(plan):
@@ -360,10 +386,6 @@ class MainWindow(QtWidgets.QMainWindow):
         f = QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.SystemFont.FixedFont)
         self.plan_text.setFont(f)
         self.plan_text.setPlainText(format_plan(None))
-        self.hist = HistogramPlot()
-        self.hist_ion = QtWidgets.QSpinBox()
-        self.hist_ion.setRange(0, 63)
-        self.hist_label = QtWidgets.QLabel("")
         box = _group("Grabber readout", [
             _row("ions", self.n_ions, "binning", self.hbin, "x", self.vbin, self.auto_bin,
                  self.verify),
@@ -383,11 +405,56 @@ class MainWindow(QtWidgets.QMainWindow):
         lay = QtWidgets.QVBoxLayout(w)
         lay.addWidget(box)
         lay.addWidget(self._manual_box())
-        lay.addWidget(self.plan_text, 2)
-        lay.addLayout(_row(copy))
-        lay.addLayout(_row("histogram of ion", self.hist_ion, self.hist_label))
-        lay.addWidget(self.hist, 1)
+        top = QtWidgets.QWidget()
+        tl = QtWidgets.QVBoxLayout(top)
+        tl.setContentsMargins(0, 0, 0, 0)
+        tl.addWidget(self.plan_text, 1)
+        tl.addLayout(_row(copy))
+        split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+        split.addWidget(top)
+        split.addWidget(self._shots_box())
+        split.setSizes([150, 550])
+        lay.addWidget(split, 1)
         return w
+
+    def _shots_box(self):
+        """Histograms of the shots - the verification frames or the externally
+        triggered readout - of every ion ROI and the background, with a quick
+        fidelity estimate: prepare the ions bright in every shot; the
+        background pixels of the same shots are the dark reference."""
+        self.hist = ShotHistogramPlot()
+        self.hist_source = QtWidgets.QComboBox()
+        self.hist_source.addItems(["latest", "external triggers", "verify"])
+        self.hist_source.setToolTip("latest: the newer of the externally triggered shots "
+                                    "(since arming) and the last verification")
+        self.hist_source.activated.connect(lambda _: self._refresh_hist(force=True))
+        self.hist_log = QtWidgets.QCheckBox("log scale")
+        self.hist_log.setToolTip("the tails - where bright and dark overlap - decide the "
+                                 "fidelity")
+        self.hist_log.toggled.connect(self.hist.set_log)
+        self.hist_log.setChecked(True)
+        self.hist_info = QtWidgets.QLabel("no shots yet")
+        self.hist_info.setWordWrap(True)
+        self.hist_table = QtWidgets.QLabel("")
+        self.hist_table.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        self.hist_table.setToolTip(
+            "Every shot taken as prepared bright: an ion ROI's sums are its bright "
+            "distribution, the background pixels of the same shots (summed to the ROI's "
+            "size) the dark one.  bright if: the threshold with the fewest errors;  "
+            "bright->dark: bright shots at or below it;  bg->bright: dark-reference "
+            "samples above it;  fidelity: 1 - the mean of the two.  neighbours bright: "
+            "the dark error once the other ions' light in this ROI (planned crosstalk) is "
+            "added.")
+        self._hist_key = None
+        self._hist_busy = False
+        g = QtWidgets.QGroupBox("Shots (prepare bright): histograms and a quick fidelity "
+                                "estimate")
+        gl = QtWidgets.QVBoxLayout(g)
+        gl.addLayout(_row("shots", self.hist_source, self.hist_log))
+        gl.addWidget(self.hist_info)
+        gl.addWidget(self.hist, 1)
+        gl.addWidget(self.hist_table)
+        return g
 
     def _manual_box(self):
         """Adjusting the readout by hand: a D-pad moves the AQROI - and every
@@ -432,7 +499,8 @@ class MainWindow(QtWidgets.QMainWindow):
             _button("Re-plan", self._replan, "plan again with the binning set above, from the "
                     "ions already located (no new locate)"),
             _button("Verify", lambda: self._cmd("verify_readout", callback=self._got_plan),
-                    "test frames with this plan: signal of every ion in its ROI")))
+                    "test frames with this plan: signal of every ion in its ROI, and the "
+                    "shot histograms below with a quick fidelity estimate")))
         right.addLayout(_row("AQROI", *self.aq_edit))
         right.addLayout(_row(_button("Use this AQROI", self._use_aqroi,
                                      "place the ROIs inside this AQROI (sensor px, x1/y1 "
@@ -498,10 +566,10 @@ class MainWindow(QtWidgets.QMainWindow):
             _row(_button("Melt 1 s", lambda: c("sim_melt", 1.0)),
                  _button("Shift +5 px", lambda: c("sim_shift", 5.0, 0.0)),
                  _button("Shift -5 px", lambda: c("sim_shift", -5.0, 0.0))),
-            _row("rotate the trap", *[_button("{} deg".format(a), lambda a_=a: self._set_sim(
-                trap_angle_deg=a_), "turn the whole trap in the image (ions, electrodes, "
-                "surface, laser beam) - then learn the background again")
-                for a in (0, 45, 90)]),
+            _row("rotate the trap", *[_button(
+                "{} deg".format(a), lambda _=False, a_=a: self._set_sim(trap_angle_deg=a_),
+                "turn the whole trap in the image (ions, electrodes, surface, laser beam) - "
+                "then learn the background again") for a in (0, 45, 90)]),
         ]))
         lay.addWidget(_group("Lab", [
             _row(_button("Lasers off", lambda: c("sim_set_lasers", False)),
@@ -790,26 +858,44 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _slow_tick(self):
         self.trace.redraw()
-        if self.tabs.currentIndex() == 1 and self._status.get("readout", {}).get("shots"):
-            def job(invoke):
-                return invoke("get_readout_counts", 0, 3000), invoke("get_readout_stats", 3000)
-            self.backend.run_in_poll(job, self._got_stats)
+        if self.tabs.currentIndex() == 1:
+            self._refresh_hist()
 
-    def _got_stats(self, res):
-        counts, stats = res
-        i = self.hist_ion.value()
-        sums = counts.get("sums") or []
-        vals = [s[i] for s in sums if len(s) > i]
-        th = None
-        rois = stats.get("rois") or []
-        if i < len(rois) and rois[i].get("threshold", {}).get("ok"):
-            t = rois[i]["threshold"]
-            th = t["threshold"]
-            self.hist_label.setText("threshold {:.0f}, fidelity {:.3f}, bright {:.0%}".format(
-                th, t["fidelity"], rois[i].get("bright_fraction", 0)))
-        else:
-            self.hist_label.setText("{} shots".format(len(vals)))
-        self.hist.set_data(vals, th)
+    def _refresh_hist(self, force=False):
+        """Fetch the shot histograms when there is something new."""
+        ro = self._status.get("readout") or {}
+        src = ("auto", "trigger", "verify")[self.hist_source.currentIndex()]
+        key = (self._plan_created, ro.get("shots"), ro.get("verified"), src)
+        if self._hist_busy or not ro.get("has_plan") or (key == self._hist_key and not force):
+            return
+        self._hist_key = key
+        self._hist_busy = True
+
+        def job(invoke):
+            return invoke("get_readout_histograms", src, 20000)
+
+        def done(f):
+            self._hist_busy = False
+        self.backend.run_in_poll(job, self._got_hist).add_done_callback(done)
+
+    def _got_hist(self, res):
+        self.hist.set_data(res)
+        self.hist_table.setText(fidelity_table(res))
+        av = res.get("available") or {}
+        if not res.get("shots"):
+            self.hist_info.setText(
+                "no {}shots for this plan yet: Verify, or arm and trigger (prepare the ions "
+                "bright in every shot)".format({"trigger": "externally triggered ",
+                                                "verify": "verification "}.get(
+                                                    res.get("source"), "")))
+            return
+        self.hist_info.setText(
+            "{} {} (verification {}, triggered {});  dark reference: {}, {} super-pixel{} "
+            "per shot".format(res["shots"], {"trigger": "externally triggered shots",
+                                             "verify": "verification shots"}[res["source"]],
+                              av.get("verify", 0), av.get("trigger", 0),
+                              res.get("dark_reference", ""), res.get("dark_pixels", 0),
+                              "s" * (res.get("dark_pixels", 0) != 1)))
 
     def closeEvent(self, ev):
         self.timer.stop()
