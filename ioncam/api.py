@@ -241,14 +241,17 @@ class IonCamAPI:
                 return _plain(info)
             await asyncio.sleep(0.05)
 
-    async def locate_ions(self, expected=0, n_frames=None, **settings):
+    async def locate_ions(self, expected=0, n_frames=None, region=None, **settings):
         """Long-exposure, low-gain frames + joint Gaussian fit of all ions.
 
         Returns precise positions (sensor px, ~0.01 px), uncertainties, PSF
         sigma, fluxes, chain fit.  Live/readout mode is restored afterwards.
+        Ions are searched for only inside the live camera ROI, the search
+        region (set_search_region) and ``region`` = [x0, y0, x1, y1].
         Keyword overrides go to the [locate] settings (e.g. exposure=1.0)."""
-        return _plain(await self._run(self._engine.locate_ions, int(expected),
-                                      n_frames, **_settings(settings)))
+        return _plain(await self._run(self._engine.locate_ions, int(expected), n_frames, None,
+                                      [int(v) for v in region] if region else None,
+                                      **_settings(settings)))
 
     def hold_tracking(self, reason="", timeout=None):
         """Ions will be moved on purpose (shuttling, camera moved): suspend
@@ -301,7 +304,7 @@ class IonCamAPI:
 
     async def calibrate_readout(self, n_ions=0, hbin=0, vbin=0, roi_size=None, arm=True,
                                 verify=None, auto_binning=False, force=False, locate=None,
-                                **readout_settings):
+                                aqroi=None, **readout_settings):
         """Prepare the Grabber readout carefully and (by default) arm it.
 
         1. long exposure / low gain -> precise ion positions + PSF (locate);
@@ -315,7 +318,10 @@ class IonCamAPI:
         ``hbin``/``vbin`` override the [readout] binning; ``auto_binning`` picks
         the cheapest binning that meets the containment/crosstalk targets.
         Extra keywords override [readout] settings (exposure, em_gain, ...);
-        ``locate`` is a dict of [locate] overrides.
+        ``locate`` is a dict of [locate] overrides.  Ions are searched for only
+        inside the live camera ROI and the search region (set_search_region);
+        ``aqroi`` = [x0, y0, x1, y1] keeps that AQROI (e.g. set by hand with
+        manual_aqroi): the ions are searched for inside it and read out in it.
 
         Returns the plan: aqroi / aqroi_solis / sdk_image, frame_size (W, H),
         grabber_rois and grabber_x0/y0/x1/y1 (ions first, then background),
@@ -324,7 +330,7 @@ class IonCamAPI:
         return _plain(await self._run(
             self._engine.calibrate_readout, int(n_ions), int(hbin), int(vbin), roi_size,
             bool(arm), verify, bool(auto_binning), bool(force), locate or {},
-            **_settings(readout_settings)))
+            aqroi=[int(v) for v in aqroi] if aqroi else None, **_settings(readout_settings)))
 
     async def nudge_readout(self, dx=0, dy=0):
         """Move the AQROI by (dx, dy) sensor px, e.g. 1 px steps to centre the
@@ -341,6 +347,33 @@ class IonCamAPI:
         if armed; not verified (see verify_readout).  Returns the plan."""
         return _plain(await self._run(self._engine.replan_readout, int(hbin), int(vbin),
                                       aqroi, roi_size))
+
+    async def manual_aqroi(self, cols, rows=0, x=None, y=None, hbin=0, vbin=0, roi_size=None):
+        """An AQROI set by hand: cols x rows super-pixels (square if rows is 0)
+        centred on (x, y) sensor px - by default on the located ions - on the
+        binning-grid phase that centres those ions in their super-pixels.  The
+        ions inside get Grabber ROIs, spots outside are left out (a warning
+        lists them).  Re-arms if armed; not verified.  Returns the plan."""
+        return _plain(await self._run(
+            self._engine.manual_aqroi, int(cols), int(rows), None if x is None else float(x),
+            None if y is None else float(y), int(hbin), int(vbin), roi_size))
+
+    async def resize_readout(self, dcols=0, drows=0):
+        """dcols / drows super-pixel columns / rows more (fewer if negative) in
+        the AQROI - one at a time on the side with the narrower margin around
+        the ions' ROIs, keeping the binning grid; the ROIs are placed again
+        inside it.  Re-arms if armed.  Returns the plan."""
+        return _plain(await self._run(self._engine.resize_readout, int(dcols), int(drows)))
+
+    def set_search_region(self, x0, y0, x1, y1):
+        """Look for ions only inside [x0, y0, x1, y1] (sensor px, half-open) -
+        live tracking, locate and calibrate - so stray light elsewhere is never
+        taken for an ion.  The crystal is tracked afresh.  Returns the region."""
+        return self._engine.set_search_region((x0, y0, x1, y1))
+
+    def clear_search_region(self):
+        """Look for ions everywhere again (tracked afresh)."""
+        return self._engine.set_search_region(None)
 
     async def verify_readout(self, force=True):
         """Test frames with the current plan (internal trigger): signal of

@@ -130,3 +130,29 @@ def test_missing_sdk_gives_clear_error():
         pytest.skip("pyAndorSDK2 installed")
     with pytest.raises(CameraError, match="pyAndorSDK2"):
         c.open()
+
+
+def test_ixon_ultra_888_readout_speeds():
+    """An iXon Ultra 888 (emulated): 1024 x 1024 sensor; a speed it does not
+    have is taken by ratio - the 5 MHz of the readout settings is 10 MHz on
+    the 888 (30, 20, 10, 1 MHz), not 1 MHz; the default pre-amp gain is the
+    highest it has (no warning), and one it does not have is replaced by the
+    nearest available one (with a warning)."""
+    from ioncam.camera.andor import _nearest
+    assert _nearest([30.0, 20.0, 10.0, 1.0], 5.0) == 2 and _nearest([17.0, 10.0, 5.0, 1.0], 5.0) == 2
+    cfg = Config()
+    cfg.simulator.camera_model = "888"
+    sdk = FakeAtmcd(cfg.simulator)
+    c = AndorCamera(cfg.camera, sdk=sdk)
+    info = c.open()
+    try:
+        assert c.sensor_shape == (1024, 1024) and info["pixel_size_um"] == 13.0
+        a = c.configure(cfg.readout.replace(roi=(600, 700, 616, 716), trigger="internal"),
+                        "readout")
+        assert a.hs_speed_mhz == 10.0 and a.frame_shape == (4, 4)
+        assert a.preamp_gain == 2.0 and not any("pre-amp" in w for w in a.warnings)  # Gain 2
+        b = c.configure(cfg.readout.replace(roi=(600, 700, 616, 716), trigger="internal",
+                                            preamp_gain_index=2), "readout")
+        assert b.preamp_gain == 2.0 and any("pre-amp" in w for w in b.warnings)
+    finally:
+        c.close()

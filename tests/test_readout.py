@@ -120,8 +120,42 @@ def test_fixed_aqroi():
     assert min(p.containment) > 0.6
     with pytest.raises(PlanError, match="multiple of the 2x2 binning"):
         plan_readout(pos, (1.2, 1.2), SENSOR, 2, 2, aqroi=(252, 160, 273, 176))
-    with pytest.raises(PlanError, match="outside the AQROI"):
+    with pytest.raises(PlanError, match="no ion inside the AQROI"):
         plan_readout(pos, (1.2, 1.2), SENSOR, 2, 2, aqroi=(0, 0, 20, 20))
+
+
+def test_aqroi_by_hand_reads_out_the_ions_inside():
+    """Spots outside an AQROI set by hand (stray light taken for ions, other
+    ions) are left out with a note - not an error."""
+    ion, stray = (262.4, 168.3), (290.0, 171.0)
+    p = plan_readout([ion, stray], (1.82, 1.82), SENSOR, 4, 4, roi_size=(1, 1),
+                     aqroi=(250, 156, 274, 180), ion_states=["bright", "bright"])
+    assert p.n_ions == 1 and p.positions == [ion] and p.aqroi_by_hand
+    assert any("outside the AQROI" in w and "290.0" in w for w in p.warnings)
+    assert not plan_readout([ion], (1.82, 1.82), SENSOR, 4, 4).aqroi_by_hand
+
+
+def test_square_aqroi_and_its_size_pad():
+    """A square AQROI set by hand sits on the grid phase an automatic plan picks
+    (same containment), centred on the ion; the size pad adds and removes
+    super-pixels one side at a time, keeping the ion centred, never through
+    its ROI."""
+    from ioncam.analysis.readout import resize_aqroi, square_aqroi
+    ion = [(262.4, 168.3)]
+    auto = plan_readout(ion, (1.82, 1.82), SENSOR, 4, 4, roi_size=(1, 1))
+    r = square_aqroi(ion, (1.82, 1.82), SENSOR, 4, 4, 5)
+    assert (r[2] - r[0], r[3] - r[1]) == (20, 20)
+    assert (r[0] % 4, r[1] % 4) == (auto.roi[0] % 4, auto.roi[1] % 4)
+    p = plan_readout(ion, (1.82, 1.82), SENSOR, 4, 4, roi_size=(1, 1), aqroi=r)
+    assert p.ion_rois == [(2, 2, 3, 3)] and p.containment == pytest.approx(auto.containment)
+    q = plan_readout(ion, (1.82, 1.82), SENSOR, 4, 4, roi_size=(1, 1),
+                     aqroi=resize_aqroi(p, 2, -1, SENSOR))
+    assert q.frame_size == (7, 4) and q.roi[0] % 4 == r[0] % 4
+    assert q.ion_rois[0][0] in (2, 3) and q.containment == pytest.approx(p.containment)
+    with pytest.raises(PlanError, match="cannot lose more columns"):
+        resize_aqroi(q, -7, 0, SENSOR)
+    near = square_aqroi(ion, (1.82, 1.82), SENSOR, 4, 4, 3, center=(300.0, 200.0))
+    assert near[2] - near[0] == 12 and abs((near[0] + near[2]) / 2 - 300.0) <= 2
 
 
 def test_moving_the_aqroi_by_hand():

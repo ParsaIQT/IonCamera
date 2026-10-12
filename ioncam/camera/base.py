@@ -55,7 +55,8 @@ class AcquisitionSettings:
     hs_speed_mhz: float = 10.0        # horizontal readout rate; nearest available is used
     vs_speed_us: float = 0.0          # vertical shift speed [us/row]; 0 -> fastest recommended
     vs_amplitude: int = 0             # vertical clock voltage: 0 = Normal, 1..4 = +1..+4
-    preamp_gain_index: int = 2        # SDK pre-amp gain index (0-based); Solis "Gain 3" == 2
+    preamp_gain_index: int = -1       # SDK pre-amp gain index (0-based; Solis "Gain 3" == 2);
+                                      # -1 = the highest available at the readout speed
     baseline_clamp: bool = True
     hbin: int = 1
     vbin: int = 1

@@ -370,6 +370,62 @@ def test_turning_the_trap_starts_afresh(tmp_path):
         engine.shutdown()
 
 
+def _stray_light(engine, offsets, rate=13000.0, sigma=1.82):
+    """Static, ion-like stray light: Gaussian spots on the simulated surface,
+    at ``offsets`` (px) from the first ion; returns that ion's position."""
+    scene = engine.sim_scene()
+    x, y = scene.state()["positions"][0]
+    h, w = scene.laser_map.shape
+    yy, xx = np.mgrid[0:h, 0:w]
+    for dx, dy in offsets:
+        scene.laser_map += (rate * np.exp(-((xx - x - dx) ** 2 + (yy - y - dy) ** 2) /
+                                          (2 * sigma ** 2)) /
+                            (2 * np.pi * sigma ** 2)).astype(np.float32)
+    return x, y
+
+
+def test_stray_light_and_the_aqroi_by_hand(tmp_path):
+    """Stray light that looks like ions (a bright ion, PSF 1.82 px, as on an
+    iXon Ultra 888): ioncam says so; cropped around the ion, Calibrate + arm
+    only searches the crop (not the padding the long exposure adds); a search
+    region does the same without cropping; an AQROI typed in or set by hand
+    reads out the ion inside and leaves the stray light out."""
+    engine, server, port = make_system(tmp_path, n_ions=1, psf_sigma=1.82, surface="clean")
+    c = client(port)
+    try:
+        x, y = _stray_light(engine, [(22, 3), (80, 40)])
+        assert c.wait_for_ions(3, timeout=20)["ok"]                  # taken for ions
+        t = time.time()
+        while time.time() - t < 5 and not engine.events.since(0, ["stray_light_hint"]):
+            time.sleep(0.1)
+        assert engine.events.since(0, ["stray_light_hint"])
+        c.set_roi(int(x) - 12, int(y) - 12, int(x) + 13, int(y) + 13)   # crop around the ion
+        assert c.wait_for_ions(1, timeout=20)["ok"]
+        plan = c.calibrate_readout(hbin=4, vbin=4, arm=False)
+        assert plan["n_ions"] == 1 and abs(plan["positions"][0][0] - x) < 0.5
+        c.set_roi(160, 100, 360, 240)
+        c.set_search_region(int(x) - 15, int(y) - 15, int(x) + 16, int(y) + 16)
+        assert c.get_status()["search_region"] == [int(x) - 15, int(y) - 15, int(x) + 16,
+                                                   int(y) + 16]
+        assert c.wait_for_ions(1, timeout=20)["ok"]
+        assert c.locate_ions()["n_ions"] == 1
+        c.clear_search_region()
+        assert c.locate_ions()["n_ions"] == 3                         # everywhere again
+        typed = c.replan_readout(4, 4, [int(x) - 10, int(y) - 10, int(x) + 10, int(y) + 10])
+        assert typed["n_ions"] == 1 and any("outside the AQROI" in w for w in typed["warnings"])
+        square = c.manual_aqroi(5, 0, x, y)
+        assert square["aqroi_by_hand"] and square["frame_size"] == [5, 5]
+        wider = c.resize_readout(1, 0)
+        assert wider["frame_size"] == [6, 5] and wider["n_ions"] == 1
+        final = c.calibrate_readout(hbin=4, vbin=4, aqroi=wider["aqroi"])
+        assert final["aqroi"] == wider["aqroi"] and final["n_ions"] == 1
+        assert final["verification"]["ok"] and c.get_status()["readout"]["armed"]
+    finally:
+        c.close_rpc()
+        server.stop()
+        engine.shutdown()
+
+
 def test_calibration_files_written(system, tmp_path_factory):
     engine, port = system
     d = os.path.join(engine.config.storage.data_dir, "calibrations")
@@ -390,6 +446,9 @@ def test_gui_smoke(tmp_path):
         pytest.skip("Qt not usable: {}".format(e))
     engine, server, port = make_system(tmp_path)
     backend = LocalBackend(server.api, server)
+    # error dialogs are modal: recorded instead (a test must not block on one)
+    errors, warning = [], QtWidgets.QMessageBox.warning
+    QtWidgets.QMessageBox.warning = staticmethod(lambda *a, **k: errors.append(a[1:]))
     try:
         win = MainWindow(backend, backend.call("get_config").result(10),
                          backend.call("get_info").result(10))
@@ -443,6 +502,40 @@ def test_gui_smoke(tmp_path):
                                  "n_dark": 6, "dark_error_neighbours_bright": 0.2}]})
         assert set(win.hist.curves) == {"ion 0", "bg"} and len(win.hist.lines) == 1
         assert "90.00%" in win.hist_table.text() and "3 externally" in win.hist_info.text()
+
+        def wait(cond, seconds=10.0):
+            t = time.time()
+            while time.time() - t < seconds and not cond():
+                app.processEvents()
+                time.sleep(0.01)
+            return cond()
+        # the AQROI by hand: a square one on the ions in view, the size pad,
+        # one placed by a click; Calibrate + arm would keep it
+        win._new_aqroi()
+        assert wait(lambda: (win._plan or {}).get("aqroi_by_hand"))
+        assert win._plan["frame_size"] == [5, 5] and win.keep_aqroi.isChecked()
+        square = list(win._plan["aqroi"])
+        x0, y0 = square[:2]
+        win._resize(1, 0)                                # one super-pixel wider on screen
+        assert wait(lambda: sorted(win._plan["frame_size"]) == [5, 6])
+        assert win.size_label.text() == "6x5"
+        win._new_aqroi()                                 # back to 5 x 5 on the ions
+        assert wait(lambda: win._plan["aqroi"] == square)
+        win.place_btn.setChecked(True)
+        assert win.image.pick_mode
+        cx, cy = x0 + 14.0, y0 + 10.0                    # a little to the side
+        win.image.clicked.emit(cx, cy)
+        assert wait(lambda: win._plan["aqroi"] != square)
+        aq = win._plan["aqroi"]                          # centred on the click
+        assert abs((aq[0] + aq[2] - 1) / 2 - cx) <= 2 and abs((aq[1] + aq[3] - 1) / 2 - cy) <= 2
+        assert not win.place_btn.isChecked() and not win.image.pick_mode
+        # search only where the user looks
+        win.image.zoom_to([(260.0, 168.0)], margin=20)
+        win._search_view()
+        assert wait(lambda: engine.status()["search_region"] is not None)
+        assert wait(lambda: win.search_btn.text() == "search: region")
+        win._cmd("clear_search_region")
+        assert wait(lambda: engine.status()["search_region"] is None)
         # the simulator's rotate buttons turn the trap
         rotate = [b for b in win.findChildren(QtWidgets.QPushButton) if b.text() == "45 deg"]
         rotate[0].click()
@@ -489,8 +582,10 @@ def test_gui_smoke(tmp_path):
             time.sleep(0.01)
         assert engine.config.calibration.verify_frames == 150
         dlg.close()
+        assert not errors, errors
         win.close()
     finally:
+        QtWidgets.QMessageBox.warning = warning
         backend.close()
         server.stop()
         engine.shutdown()

@@ -88,6 +88,7 @@ class ReadoutPlan:
     notes: List[str] = field(default_factory=list)    # warnings not about the ROI placement
     targets: Tuple[float, float] = (0.6, 0.12)        # (min containment, max crosstalk)
     manual_offset: Tuple[int, int] = (0, 0)           # AQROI moved by hand [sensor px]
+    aqroi_by_hand: bool = False                       # AQROI set by hand, ROIs placed in it
 
     @property
     def n_rois(self) -> int:
@@ -168,6 +169,7 @@ class ReadoutPlan:
             "flip_y": self.flip_y,
             "warnings": list(self.warnings),
             "manual_offset": list(self.manual_offset),
+            "aqroi_by_hand": self.aqroi_by_hand,
             "created": self.created,
             "verification": self.verification,
             "applied": self.applied,
@@ -441,9 +443,27 @@ def plan_readout(positions: Sequence[Sequence[float]], sigma: Tuple[float, float
     n = len(pos)
     if n == 0:
         raise PlanError("no ions to plan a readout for")
+    notes: List[str] = []
+    if aqroi is not None:
+        # an AQROI set by hand reads out the ions inside it; spots outside
+        # (other ions, stray light taken for ions) are left out, not an error
+        ax0, ay0, ax1, ay1 = (int(v) for v in aqroi)
+        inside = ((pos[:, 0] >= ax0 - 0.5) & (pos[:, 0] < ax1 - 0.5) &
+                  (pos[:, 1] >= ay0 - 0.5) & (pos[:, 1] < ay1 - 0.5))
+        if not inside.any():
+            raise PlanError("no ion inside the AQROI {} (located: {})".format(
+                [ax0, ay0, ax1, ay1], ", ".join("({:.1f}, {:.1f})".format(x, y)
+                                                for x, y in pos[:8])))
+        if not inside.all():
+            notes.append("{} located spot(s) outside the AQROI set by hand not read out: "
+                         "{}".format(int((~inside).sum()), ", ".join(
+                             "({:.1f}, {:.1f})".format(x, y) for x, y in pos[~inside][:8])))
+            pos = pos[inside]
+            if ion_states is not None:
+                ion_states = [st for st, k in zip(ion_states, inside) if k]
+            n = len(pos)
     if n > max_rois:
         raise PlanError("{} ions but the Grabber has only {} ROI engines".format(n, max_rois))
-    notes: List[str] = []
     if background_roi and n + 1 > max_rois:
         background_roi = False
         notes.append("no ROI engine left for a background ROI")
@@ -627,7 +647,105 @@ def plan_readout(positions: Sequence[Sequence[float]], sigma: Tuple[float, float
         crosstalk_matrix=[[float(v) for v in row] for row in f],
         background_contamination=bg_cont, flip_x=flip_x, flip_y=flip_y,
         psf_halo=(float(halo[0]), float(halo[1])), warnings=notes + geometry, notes=notes,
-        targets=(float(min_containment), float(max_crosstalk)))
+        targets=(float(min_containment), float(max_crosstalk)), aqroi_by_hand=aqroi is not None)
+
+
+def square_aqroi(positions: Sequence[Sequence[float]], sigma: Tuple[float, float],
+                 sensor_shape: Tuple[int, int], hbin: int, vbin: int, cols: int,
+                 rows: Optional[int] = None, center: Optional[Sequence[float]] = None,
+                 **kw) -> Rect:
+    """An AQROI of ``cols`` x ``rows`` super-pixels (square by default) set by
+    hand, centred on ``center`` (sensor px; default: the ions), on the
+    binning-grid phase the planner picks for the ions it holds - so they sit
+    as centrally in their super-pixels as an automatic plan puts them.
+    ``kw``: :func:`plan_readout` options (roi_size, halo, ...).  Returns
+    ``(x0, y0, x1, y1)`` (sensor px, half-open)."""
+    rows = int(cols if rows is None else rows)
+    cols = int(cols)
+    sh, sw = sensor_shape
+    if cols < 1 or rows < 1:
+        raise PlanError("an AQROI needs at least one super-pixel column and row")
+    w, h = cols * hbin, rows * vbin
+    if w > sw or h > sh:
+        raise PlanError("an AQROI of {} x {} super-pixels ({} x {} px) is larger than the "
+                        "{} x {} sensor".format(cols, rows, w, h, sw, sh))
+    pos = np.asarray(positions, float).reshape(-1, 2)
+    if center is None:
+        if not len(pos):
+            raise PlanError("no ions to place the AQROI around")
+        cx, cy = (float(v) for v in pos.mean(axis=0))
+    else:
+        cx, cy = float(center[0]), float(center[1])
+    near = pos[(np.abs(pos[:, 0] - cx) < 0.5 * w) & (np.abs(pos[:, 1] - cy) < 0.5 * h)] \
+        if len(pos) else pos
+    px = py = 0
+    if len(near):
+        opts = {k: v for k, v in kw.items() if k in ("roi_size", "halo", "min_containment",
+                                                     "max_crosstalk")}
+        p = plan_readout(near, sigma, sensor_shape, hbin, vbin, frame_margin=0,
+                         background_roi=False, **opts)
+        x0, y0 = p.roi[0], p.roi[1]
+        px, py = x0 % hbin, y0 % vbin
+        if center is None:
+            # centred on the ions' ROIs, not just on the ions
+            u0 = min(r[0] for r in p.ion_rois)
+            u1 = max(r[2] for r in p.ion_rois)
+            v0 = min(r[1] for r in p.ion_rois)
+            v1 = max(r[3] for r in p.ion_rois)
+            cx = x0 + 0.5 * (u0 + u1) * hbin - 0.5
+            cy = y0 + 0.5 * (v0 + v1) * vbin - 0.5
+    out = []
+    for c, size, b, phase, n_px in ((cx, w, hbin, px, sw), (cy, h, vbin, py, sh)):
+        a = phase + b * int(round((c + 0.5 - 0.5 * size - phase) / b))
+        while a < 0:
+            a += b
+        while a + size > n_px:
+            a -= b
+        out.append(max(0, a))
+    x0, y0 = out
+    return (x0, y0, x0 + w, y0 + h)
+
+
+def resize_aqroi(plan: ReadoutPlan, dcols: int = 0, drows: int = 0,
+                 sensor_shape: Optional[Tuple[int, int]] = None) -> Rect:
+    """The AQROI of ``plan`` with ``dcols`` super-pixel columns and ``drows``
+    rows more (or fewer, if negative), on the same grid: one at a time on the
+    side with the narrower margin around the ion ROIs (removed from the wider
+    one), so the ions stay centred; never through an ion's ROI."""
+    x0, y0, x1, y1 = plan.roi
+    hb, vb = plan.hbin, plan.vbin
+    sh, sw = sensor_shape if sensor_shape is not None else (1 << 30, 1 << 30)
+    fw, fh = plan.frame_size
+    rois = plan.ion_rois
+    lo = [min(r[0] for r in rois), min(r[1] for r in rois)]         # margins in super-px
+    hi = [fw - max(r[2] for r in rois), fh - max(r[3] for r in rois)]
+    edges = [[x0, x1], [y0, y1]]
+    for axis, (d, b, n_px) in enumerate(((int(dcols), hb, sw), (int(drows), vb, sh))):
+        name = ("columns", "rows")[axis]
+        for _ in range(abs(d)):
+            a, z = edges[axis]
+            if d > 0:
+                if (lo[axis] <= hi[axis] and a - b >= 0) or z + b > n_px:
+                    if a - b < 0:
+                        raise PlanError("the AQROI cannot get more {}: it reaches both edges "
+                                        "of the sensor".format(name))
+                    edges[axis][0] = a - b
+                    lo[axis] += 1
+                else:
+                    edges[axis][1] = z + b
+                    hi[axis] += 1
+            else:
+                if lo[axis] >= hi[axis] and lo[axis] >= 1:
+                    edges[axis][0] = a + b
+                    lo[axis] -= 1
+                elif hi[axis] >= 1:
+                    edges[axis][1] = z - b
+                    hi[axis] -= 1
+                else:
+                    raise PlanError("the AQROI cannot lose more {}: the ion ROIs fill it "
+                                    "(use less binning or smaller ROIs)".format(name))
+    (x0, x1), (y0, y1) = edges
+    return (x0, y0, x1, y1)
 
 
 def reposition_plan(plan: ReadoutPlan, dx: int, dy: int,

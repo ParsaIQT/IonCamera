@@ -53,6 +53,9 @@ def get_argparser():
     parser.add_argument("-c", "--config", default=None, help="TOML configuration file")
     parser.add_argument("--simulate", action="store_true",
                         help="use the simulated camera + ion trap (no hardware needed)")
+    parser.add_argument("--sim-camera", choices=("897", "888"), default=None,
+                        help="simulated camera model: iXon Ultra 897 (512 x 512) or 888 "
+                             "(1024 x 1024); default: simulator.camera_model")
     parser.add_argument("--no-live", action="store_true",
                         help="do not start live video at start-up")
     parser.add_argument("--gui", action="store_true",
@@ -161,6 +164,8 @@ def main(argv=None):
         print("wrote", args.write_config)
         return
     config = Config.load(args.config)
+    if args.sim_camera:
+        config.simulator.camera_model = args.sim_camera
     engine, api = build(config, simulate=args.simulate)
     engine.start(auto_live=not args.no_live)
     bind = common_args.bind_address_from_args(args)

@@ -505,6 +505,15 @@ class MainWindow(QtWidgets.QMainWindow):
                          None),
             "save_events": A("Save events...", self._save_events, None, "save",
                              "write the event log to a text file"),
+            "search_view": A("Search only in the visible area", self._search_view, None, None,
+                             "look for ions only in the part of the image on screen - stray "
+                             "light elsewhere is never taken for an ion (also in Locate and "
+                             "Calibrate)"),
+            "search_ions": A("Search only around the ions", self._search_ions, None, None,
+                             "look for ions only near the tracked ones (the margin of 'Crop "
+                             "around ions')"),
+            "search_all": A("Search everywhere", lambda: c("clear_search_region"), None, None,
+                            "look for ions on the whole frame again"),
             "shortcuts": A("Keyboard shortcuts", self._shortcuts_dialog, "F1", None),
             "about": A("About ioncam", self._about, None, None),
             "quit": A("Quit", self.close, "Ctrl+Q", None),
@@ -545,8 +554,9 @@ class MainWindow(QtWidgets.QMainWindow):
         menu("&Camera", [a["live"], a["stop"], a["snap"], None, a["full_sensor"],
                          a["crop_view"], a["crop_ions"], None, a["cooler_on"], a["cooler_off"],
                          None, a["take"], a["release"]])
-        menu("&Ions", [a["learn_bg"], a["clear_bg"], None, a["accept"], a["forget"], a["hold"],
-                       None, a["locate"]])
+        menu("&Ions", [a["learn_bg"], a["clear_bg"], None, a["search_view"], a["search_ions"],
+                       a["search_all"], None, a["accept"], a["forget"], a["hold"], None,
+                       a["locate"]])
         menu("&Readout", [a["calibrate"], a["verify"], a["arm"], a["disarm"], a["abort"], None,
                           a["copy_snippet"], a["copy_plan"]])
         menu("&Help", [a["shortcuts"], a["about"]])
@@ -618,6 +628,16 @@ class MainWindow(QtWidgets.QMainWindow):
             b.toggled.connect(lambda on, k=key: self._set_overlay(k, on))
             bl.addWidget(b)
             self.overlay_buttons[key] = b
+        bl.addSpacing(8)
+        self.search_btn = QtWidgets.QToolButton()
+        self.search_btn.setText("search: everywhere")
+        self.search_btn.setToolTip("where ions are searched for (live, Locate, Calibrate)")
+        self.search_btn.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
+        menu = QtWidgets.QMenu(self.search_btn)
+        for k in ("search_view", "search_ions", "search_all"):
+            menu.addAction(self.act[k])
+        self.search_btn.setMenu(menu)
+        bl.addWidget(self.search_btn)
         bl.addStretch(1)
         bl.addWidget(_tool(self.act["save_image"], False, True))
         w = QtWidgets.QWidget()
@@ -767,12 +787,13 @@ class MainWindow(QtWidgets.QMainWindow):
             vs = live.get("vs_speed_us", 0.0) or 0.0
             self.vs.setCurrentIndex(max(0, self.vs.findData(float(vs))))
             self.preamp.clear()
+            self.preamp.addItem("highest available", -1)
             texts = caps.get("preamp_gain_texts") or []
             for k, g in enumerate(caps.get("preamp_gains") or [1.0, 2.0, 4.0]):
                 self.preamp.addItem("{} ({:g}x)".format(texts[k], g) if k < len(texts)
                                     else "{:g}x".format(g), k)
-            self.preamp.setCurrentIndex(min(int(live.get("preamp_gain_index", 0)),
-                                            self.preamp.count() - 1))
+            i = self.preamp.findData(int(live.get("preamp_gain_index", -1)))
+            self.preamp.setCurrentIndex(max(i, 0))
 
     def _ions_tab(self):
         self.sites = SiteTable()
@@ -815,7 +836,26 @@ class MainWindow(QtWidgets.QMainWindow):
                  _button("Arm alert", self._wait_ions,
                          "beeps and pops up when this many ions are trapped"), None),
         ])
-        w = _page(grid, self.crystal_label, self.sites, tracking, background, loading)
+        det = self.config.get("detection", {})
+        self.det_thr = _spin(2.0, 200.0, float(det.get("threshold_sigma", 6.0)), 1.0, " sigma", 1,
+                             width=100, tip="a spot counts as an ion when its matched-filter "
+                             "signal is this many noise sigmas: higher - only brighter spots. "
+                             "A bright ion (SNR of a few hundred) is far above the default 6; "
+                             "faint stray light is not")
+        self.det_thr.editingFinished.connect(lambda: self._cmd(
+            "set_config", "detection", "threshold_sigma", self.det_thr.value()))
+        self.search_label = _muted("search region: everywhere", wrap=True)
+        self.psf_label = _muted("", wrap=True)
+        detection = _group("Ion detection", [
+            self.search_label,
+            _row(_tool(self.act["search_view"]), _tool(self.act["search_ions"]),
+                 _tool(self.act["search_all"]), None),
+            _row("threshold", self.det_thr, 12, self.psf_label, None),
+            _muted("Stray light taken for ions?  Learn the background below (best with the "
+                   "repumper off: the ions dark, the laser still scattering), search only "
+                   "where the ions are, or raise the threshold.", wrap=True),
+        ])
+        w = _page(grid, self.crystal_label, self.sites, tracking, detection, background, loading)
         w.layout().setStretchFactor(self.sites, 1)
         return w
 
@@ -846,12 +886,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.verify.setToolTip("test frames with the final settings before arming")
         self.ro_exp = _spin(1e-5, 1.0, ro.get("exposure", 0.0015), 0.0005, " s", 5, width=110)
         self.ro_gain = _spin(0, 1000, ro.get("em_gain", 200), width=80)
+        self.keep_aqroi = QtWidgets.QCheckBox("inside the AQROI set by hand")
+        self.keep_aqroi.setToolTip("Calibrate + arm keeps the AQROI made by hand: the ions "
+                                   "are searched for only inside it and read out in it.  "
+                                   "(Ions are always searched for only inside the camera ROI "
+                                   "and the search region.)")
         calibrate = _group("Calibrate and run", [
             _grid([["ions", self.n_ions, 12, "exposure", self.ro_exp],
                    ["binning", _row(self.hbin, "x", self.vbin, None), 12, "EM gain",
                     self.ro_gain],
                    ["ROI per ion", _row(self.roi_w, "x", self.roi_h, None), 12, self.auto_bin,
                     self.verify]]),
+            _row(self.keep_aqroi, None),
             _row(_button("Calibrate + arm", self._calibrate, "locate -> plan AQROI/ROIs -> "
                          "verify -> external trigger + Camera Link (Ctrl+K)", "check",
                          "primary"), _tool(self.act["locate"]), None,
@@ -870,7 +916,10 @@ class MainWindow(QtWidgets.QMainWindow):
         pl = QtWidgets.QVBoxLayout(plan_page)
         pl.setContentsMargins(6, 6, 6, 6)
         pl.addWidget(self.plan_text, 1)
-        pl.addLayout(_row(None, _tool(self.act["copy_plan"])))
+        pl.addLayout(_row("AQROI", *self.aq_edit, _button(
+            "Use this AQROI", self._use_aqroi, "place the ROIs of the ions inside this AQROI "
+            "(sensor px, x1/y1 exclusive; its size a multiple of the binning); spots outside "
+            "are left out"), None, _tool(self.act["copy_plan"])))
         artiq_page = QtWidgets.QWidget()
         al = QtWidgets.QVBoxLayout(artiq_page)
         al.setContentsMargins(6, 6, 6, 6)
@@ -886,7 +935,7 @@ class MainWindow(QtWidgets.QMainWindow):
         split.addWidget(_scroll(top))
         split.addWidget(self.results)
         split.setStretchFactor(1, 1)
-        split.setSizes([440, 480])
+        split.setSizes([500, 430])
         self.readout_split = split
         return split
 
@@ -936,31 +985,71 @@ class MainWindow(QtWidgets.QMainWindow):
         gl.addWidget(self.hist_table)
         return w
 
-    def _manual_box(self):
-        """Adjusting the readout by hand: a D-pad moves the AQROI - and every
-        Grabber ROI with it - on screen, re-planning with another binning or
-        inside a given AQROI keeps the located ion positions."""
-        self.nudge_step = _spin(1, 64, 1, suffix=" px", tip="step of the D-pad [sensor px]",
-                                width=64)
-        self.nudge_step.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+    def _pad(self, buttons, middle):
+        """A cross of buttons around ``middle``: [(row, col, icon, tip, slot)]."""
         pad = QtWidgets.QGridLayout()
         pad.setSpacing(4)
-        for r, c, right, up, name in ((0, 1, 0, 1, "up"), (1, 0, -1, 0, "left"),
-                                      (1, 2, 1, 0, "right"), (2, 1, 0, -1, "down")):
+        for r, c, name, tip, slot, repeat in buttons:
             b = QtWidgets.QToolButton()
             b.setProperty("role", "dpad")
             b.setProperty("icon_name", name)
             b.setIcon(style.icon(name))
             b.setIconSize(QtCore.QSize(20, 20))
-            b.setAutoRepeat(True)
-            b.setAutoRepeatDelay(400)
-            b.setAutoRepeatInterval(150)
-            b.setFixedSize(36, 36)
-            b.setToolTip("move the AQROI - and all ROI boxes with it - {} on screen by one "
-                         "step: the ions move the other way inside their ROIs".format(name))
-            b.clicked.connect(lambda _=False, r_=right, u_=up: self._nudge(r_, u_))
+            if repeat:
+                b.setAutoRepeat(True)
+                b.setAutoRepeatDelay(400)
+                b.setAutoRepeatInterval(150)
+            b.setFixedSize(34, 34)
+            b.setToolTip(tip)
+            b.clicked.connect(lambda _=False, f=slot: f())
             pad.addWidget(b, r, c)
-        pad.addWidget(self.nudge_step, 1, 1)
+        pad.addWidget(middle, 1, 1, QtCore.Qt.AlignmentFlag.AlignCenter)
+        return pad
+
+    def _manual_box(self):
+        """The AQROI by hand: a new square AQROI on the ions in view (or where
+        you click), its size changed a super-pixel at a time with the size pad
+        (wider / narrower / taller / shorter as seen on screen) and moved with
+        the D-pad (the ROIs move with it, so the ions shift inside them);
+        re-planning with another binning or inside a typed AQROI keeps the
+        located ion positions."""
+        self.nudge_step = _spin(1, 64, 1, suffix=" px", tip="step of the D-pad [sensor px]",
+                                width=62)
+        self.nudge_step.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        move = "move the AQROI - and all ROI boxes with it - {} on screen by one step: the " \
+               "ions move the other way inside their ROIs"
+        dpad = self._pad([(0, 1, "up", move.format("up"), lambda: self._nudge(0, 1), True),
+                          (1, 0, "left", move.format("left"), lambda: self._nudge(-1, 0), True),
+                          (1, 2, "right", move.format("right"), lambda: self._nudge(1, 0), True),
+                          (2, 1, "down", move.format("down"), lambda: self._nudge(0, -1), True)],
+                         self.nudge_step)
+        self.size_label = QtWidgets.QLabel("-")
+        self.size_label.setProperty("role", "heading")
+        self.size_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.size_label.setToolTip("AQROI size in super-pixels (across x up/down, as on "
+                                   "screen)")
+        size = "{} super-pixel {} {} (as seen on screen; the ions stay centred, the ROIs are " \
+               "placed again)"
+        spad = self._pad([(0, 1, "taller", size.format("one", "row", "more"),
+                           lambda: self._resize(0, 1), False),
+                          (1, 0, "narrower", size.format("one", "column", "less"),
+                           lambda: self._resize(-1, 0), False),
+                          (1, 2, "wider", size.format("one", "column", "more"),
+                           lambda: self._resize(1, 0), False),
+                          (2, 1, "shorter", size.format("one", "row", "less"),
+                           lambda: self._resize(0, -1), False)], self.size_label)
+        self.sq_size = _spin(1, 64, 5, width=64, tip="size of a new square AQROI "
+                             "[super-pixels]")
+        self.place_btn = QtWidgets.QToolButton()
+        self.place_btn.setText("Place by click")
+        self.place_btn.setCheckable(True)
+        self.place_btn.setProperty("role", "button")
+        self.place_btn.setProperty("icon_name", "place")
+        self.place_btn.setIcon(style.icon("place"))
+        self.place_btn.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.place_btn.setToolTip("then click on the image: a new square AQROI centred there")
+        self.place_btn.toggled.connect(self.image.set_pick_mode)
+        self.image.clicked.connect(self._placed)
         self.offset_label = _muted("no plan yet", wrap=True)
         self.aq_edit = []
         for name in ("x0", "y0", "x1", "y1"):
@@ -969,28 +1058,35 @@ class MainWindow(QtWidgets.QMainWindow):
             self.aq_edit.append(sp)
         self._nudge_pending = [0, 0]
         self._nudge_busy = False
-        right = QtWidgets.QVBoxLayout()
-        right.setSpacing(6)
-        right.addWidget(self.offset_label)
-        right.addLayout(_row(
+        g = QtWidgets.QGroupBox("AQROI by hand")
+        gl = QtWidgets.QVBoxLayout(g)
+        gl.setSpacing(7)
+        gl.addLayout(_row(_button("New AQROI", self._new_aqroi, "a square AQROI of this many "
+                                  "super-pixels on the ions in view (else the middle of the "
+                                  "view), on the binning grid that centres them in their "
+                                  "super-pixels; the ions inside get ROIs, spots outside "
+                                  "(stray light) are left out", "square"),
+                          self.sq_size, "super-pixels", 8, self.place_btn, None))
+        pads = QtWidgets.QHBoxLayout()
+        pads.setSpacing(14)
+        for lay, caption in ((dpad, "move"), (spad, "size")):
+            col = QtWidgets.QVBoxLayout()
+            col.setSpacing(2)
+            col.addLayout(lay)
+            cap = _muted(caption)
+            cap.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            col.addWidget(cap)
+            pads.addLayout(col)
+        pads.addWidget(self.offset_label, 1)
+        gl.addLayout(pads)
+        gl.addLayout(_row(
             _button("Re-plan", self._replan, "plan again with the binning and ROI size set "
                     "above, from the ions already located (no new locate)", "refresh"),
             _button("Verify", self._verify, "test frames with this plan: signal of every ion "
                     "in its ROI, and the shot histograms below with a quick fidelity "
                     "estimate (Ctrl+Shift+V)", "verify"),
-            _button("Undo moves", self._undo_moves, "move the AQROI back to where the plan "
-                    "put it", "undo")))
-        right.addStretch(1)
-        g = QtWidgets.QGroupBox("Adjust by hand (the D-pad moves the AQROI and all ROIs)")
-        gl = QtWidgets.QVBoxLayout(g)
-        top = QtWidgets.QHBoxLayout()
-        top.addLayout(pad)
-        top.addSpacing(8)
-        top.addLayout(right, 1)
-        gl.addLayout(top)
-        gl.addLayout(_row("AQROI", *self.aq_edit, _button(
-            "Use this AQROI", self._use_aqroi, "place the ROIs inside this AQROI (sensor px, "
-            "x1/y1 exclusive; its size a multiple of the binning)"), None))
+            _button("Undo moves", self._undo_moves, "move the AQROI back to where the D-pad "
+                    "found it", "undo"), None))
         return g
 
     def _events_tab(self):
@@ -1251,6 +1347,20 @@ class MainWindow(QtWidgets.QMainWindow):
                 w.blockSignals(False)
         self.image.set_overlay(key, on)
 
+    def _search_view(self):
+        self._cmd("set_search_region", *self.image.visible_sensor_rect())
+
+    def _search_ions(self):
+        sites = self._status.get("sites") or []
+        if not sites:
+            self.msg_label.setText("no ions to search around")
+            return
+        m = self.crop_margin.value()
+        self._cmd("set_search_region", int(min(s_["x"] for s_ in sites) - m),
+                  int(min(s_["y"] for s_ in sites) - m),
+                  int(max(s_["x"] for s_ in sites) + m) + 1,
+                  int(max(s_["y"] for s_ in sites) + m) + 1)
+
     def _zoom_ions(self):
         sites = self._status.get("sites") or []
         if not self.image.zoom_to([(s["x"], s["y"]) for s in sites]):
@@ -1280,7 +1390,36 @@ class MainWindow(QtWidgets.QMainWindow):
                   roi_size=self._roi_size(), auto_binning=self.auto_bin.isChecked(),
                   verify=self.verify.isChecked(), exposure=self.ro_exp.value(),
                   em_gain=self.ro_gain.value())
+        if self.keep_aqroi.isChecked() and self._plan:
+            kw["aqroi"] = list(self._plan["aqroi"])
         self._cmd("calibrate_readout", callback=self._got_plan, **kw)
+
+    def _new_aqroi(self, center=None):
+        """A square AQROI on the ions in view (else the middle of the view), or
+        centred on ``center``."""
+        if center is None:
+            x0, y0, x1, y1 = self.image.visible_sensor_rect()
+            sites = [s_ for s_ in (self._status.get("sites") or [])
+                     if x0 <= s_["x"] < x1 and y0 <= s_["y"] < y1]
+            center = (float(np.mean([s_["x"] for s_ in sites])),
+                      float(np.mean([s_["y"] for s_ in sites]))) if sites else \
+                (0.5 * (x0 + x1), 0.5 * (y0 + y1))
+        n = self.sq_size.value()
+        self._cmd("manual_aqroi", n, n, center[0], center[1], self.hbin.value(),
+                  self.vbin.value(), self._roi_size(), callback=self._got_plan)
+
+    def _placed(self, x, y):
+        if self.place_btn.isChecked():
+            self.place_btn.setChecked(False)
+            self._new_aqroi((x, y))
+
+    def _resize(self, wider, taller):
+        """The size pad: one super-pixel more / less across / up the screen."""
+        if not self._plan:
+            self.msg_label.setText("no AQROI to resize - make one (New AQROI) or calibrate")
+            return
+        dcols, drows = (wider, taller) if self.image.screen_axes() == "x" else (taller, wider)
+        self._cmd("resize_readout", dcols, drows, callback=self._got_plan)
 
     def _verify(self):
         self._cmd("verify_readout", callback=self._got_plan)
@@ -1300,9 +1439,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.snippet_text.setPlainText(artiq_snippet(plan))
         self.image.set_plan(plan)
         off = plan.get("manual_offset") or [0, 0]
-        self.offset_label.setText("AQROI {} (Solis L,R,B,T {}), {}x{} binning{}".format(
-            plan["aqroi"], plan["aqroi_solis"], plan["binning"][0], plan["binning"][1],
-            ", moved by hand ({:+d}, {:+d}) px".format(*off) if any(off) else ", as planned"))
+        by_hand = bool(plan.get("aqroi_by_hand"))
+        x0, y0, x1, y1 = plan["aqroi"]
+        fw, fh = plan["frame_size"]
+        how = "set by hand" if by_hand else "as planned"
+        if any(off):
+            how += ", moved ({:+d}, {:+d}) px".format(*off)
+        self.offset_label.setText("AQROI x {}-{}, y {}-{} (Solis L,R,B,T {}), {} x {} "
+                                  "super-pixels of {}x{} - {}".format(
+                                      x0, x1, y0, y1, ", ".join(str(v) for v in
+                                                                plan["aqroi_solis"]),
+                                      fw, fh, plan["binning"][0], plan["binning"][1], how))
+        across = (fw, fh) if self.image.screen_axes() == "x" else (fh, fw)
+        self.size_label.setText("{}x{}".format(*across))
+        self.keep_aqroi.setChecked(by_hand)
         for sp, v in zip(self.aq_edit, plan["aqroi"]):
             sp.setValue(int(v))
 
@@ -1573,6 +1723,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 QtWidgets.QApplication.beep()
         if "plan" in out:
             self._got_plan(out["plan"])
+        region = st.get("search_region")
+        self.image.set_search_region(region)
+        if region != getattr(self, "_region_shown", False):
+            self._region_shown = region
+            self.search_btn.setText("search: region" if region else "search: everywhere")
+            self.search_label.setText(
+                "Ions are searched for only inside x {}-{}, y {}-{} ({} x {} px)".format(
+                    region[0], region[2], region[1], region[3], region[2] - region[0],
+                    region[3] - region[1]) if region else
+                "Ions are searched for everywhere in the frame")
         self._update_controls(st)
         page = self.tabs.currentWidget()
         if page is self.ions_page:
@@ -1636,6 +1796,11 @@ class MainWindow(QtWidgets.QMainWindow):
                                    "last frame · analysis {} ms".format(
                                        det.get("background", "-"), ions.get("n_spots", 0),
                                        ions.get("n_clouds", 0), det.get("analysis_ms", "-")))
+        psf = det.get("psf") or []
+        if len(psf) == 3:
+            self.psf_label.setText("PSF sigma {:.2f} px{} (from the last locate or the live "
+                                   "crystal)".format(psf[0], " + {:.0%} halo of {:.1f} px".format(
+                                       psf[1], psf[2]) if psf[1] > 0 else ""))
 
     def _update_live(self, st):
         ls = st.get("live_settings") or {}

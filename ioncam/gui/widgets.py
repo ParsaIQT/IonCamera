@@ -64,6 +64,7 @@ class ImagePanel(QtWidgets.QWidget):
 
     hovered = QtCore.Signal(str)
     autoLevelsChanged = QtCore.Signal(bool)
+    clicked = QtCore.Signal(float, float)       # sensor px, in pick mode
 
     def __init__(self, display_cfg, parent=None):
         super().__init__(parent)
@@ -145,9 +146,13 @@ class ImagePanel(QtWidgets.QWidget):
         self.show = {"markers": True, "labels": True, "spots": True, "rois": True}
         self._geometry = None
         self._last = None
+        self._search = None
+        self._search_items = []
+        self.pick_mode = False
         self.set_orientation(display_cfg.rotation, display_cfg.flip_x, display_cfg.flip_y)
         self.vb.sigResized.connect(self._update_limits)
         self.plot.scene().sigMouseMoved.connect(self._mouse_moved)
+        self.plot.scene().sigMouseClicked.connect(self._mouse_clicked)
 
     # -- appearance --------------------------------------------------------------------
     def apply_theme(self):
@@ -400,6 +405,49 @@ class ImagePanel(QtWidgets.QWidget):
         t.setParentItem(self.group)
         t.setPos(self.group.mapFromParent(QtCore.QPointF(*pos)))
         self._rects.append(t)
+
+    def set_pick_mode(self, on):
+        """In pick mode a left click on the image emits ``clicked(x, y)``."""
+        self.pick_mode = bool(on)
+        self.plot.setCursor(QtCore.Qt.CursorShape.CrossCursor if on
+                            else QtCore.Qt.CursorShape.ArrowCursor)
+
+    def _mouse_clicked(self, ev):
+        if not self.pick_mode or ev.button() != QtCore.Qt.MouseButton.LeftButton:
+            return
+        p = self.group.mapFromScene(ev.scenePos())
+        ev.accept()
+        self.clicked.emit(float(p.x()), float(p.y()))
+
+    def set_search_region(self, roi):
+        """Draw the region where ions are searched for (None: everywhere)."""
+        roi = tuple(roi) if roi else None
+        if roi == self._search:
+            return
+        self._search = roi
+        for it in self._search_items:
+            it.setParentItem(None)
+            if it.scene() is not None:
+                it.scene().removeItem(it)
+        self._search_items = []
+        if roi is None:
+            return
+        x0, y0, x1, y1 = roi
+        r = QtWidgets.QGraphicsRectItem(x0 - 0.5, y0 - 0.5, x1 - x0, y1 - y0)
+        r.setPen(_pen("#ffb020", 1.5, QtCore.Qt.PenStyle.DashDotLine))
+        r.setParentItem(self.group)
+        box = self.group.mapRectToParent(QtCore.QRectF(x0 - 0.5, y0 - 0.5, x1 - x0, y1 - y0))
+        t = pg.TextItem("search region", color="#ffc850", anchor=(0.0, 1.0))
+        t.setParentItem(self.group)
+        t.setPos(self.group.mapFromParent(QtCore.QPointF(box.left(), box.bottom())))
+        self._search_items = [r, t]
+
+    def screen_axes(self):
+        """Which sensor axis runs across the screen: "x" or "y" (display
+        rotation) - for "wider" / "taller" as the user sees it."""
+        t = self.group.transform()
+        d = t.map(QtCore.QPointF(1.0, 0.0)) - t.map(QtCore.QPointF(0.0, 0.0))
+        return "x" if abs(d.x()) >= abs(d.y()) else "y"
 
     def screen_step(self, right, up):
         """Sensor-pixel step (dx, dy) that moves things ``right``/``up`` on

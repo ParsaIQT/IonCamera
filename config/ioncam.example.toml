@@ -35,14 +35,14 @@ exposure = 0.05
 em_gain = 50
 # 'em' or 'conventional' output amplifier
 amplifier = "em"
-# horizontal readout rate [MHz]; nearest available is used
+# horizontal readout rate [MHz]; the nearest available (by ratio) is used - 5 MHz is 10 MHz on an iXon Ultra 888 (30, 20, 10, 1 MHz)
 hs_speed_mhz = 10.0
 # vertical shift speed [us]; 0 = fastest recommended
 vs_speed_us = 0.0
 # vertical clock voltage: 0 = Normal, 1..4 = +1..+4
 vs_amplitude = 0
-# pre-amp gain index (0-based); Solis 'Gain 3' = 2
-preamp_gain_index = 2
+# pre-amp gain index (0-based; Solis 'Gain 3' = 2); -1 = the highest the camera offers at this readout speed (897: Gain 3, 888: Gain 2)
+preamp_gain_index = -1
 # keep the baseline (bias) level constant
 baseline_clamp = true
 # horizontal binning
@@ -76,14 +76,14 @@ exposure = 0.5
 em_gain = 10
 # 'em' or 'conventional' output amplifier
 amplifier = "em"
-# horizontal readout rate [MHz]; nearest available is used
+# horizontal readout rate [MHz]; the nearest available (by ratio) is used - 5 MHz is 10 MHz on an iXon Ultra 888 (30, 20, 10, 1 MHz)
 hs_speed_mhz = 5.0
 # vertical shift speed [us]; 0 = fastest recommended
 vs_speed_us = 0.5
 # vertical clock voltage: 0 = Normal, 1..4 = +1..+4
 vs_amplitude = 0
-# pre-amp gain index (0-based); Solis 'Gain 3' = 2
-preamp_gain_index = 2
+# pre-amp gain index (0-based; Solis 'Gain 3' = 2); -1 = the highest the camera offers at this readout speed (897: Gain 3, 888: Gain 2)
+preamp_gain_index = -1
 # keep the baseline (bias) level constant
 baseline_clamp = true
 # horizontal binning
@@ -117,14 +117,14 @@ exposure = 0.0015
 em_gain = 200
 # 'em' or 'conventional' output amplifier
 amplifier = "em"
-# horizontal readout rate [MHz]; nearest available is used
+# horizontal readout rate [MHz]; the nearest available (by ratio) is used - 5 MHz is 10 MHz on an iXon Ultra 888 (30, 20, 10, 1 MHz)
 hs_speed_mhz = 5.0
 # vertical shift speed [us]; 0 = fastest recommended
 vs_speed_us = 0.5
 # vertical clock voltage: 0 = Normal, 1..4 = +1..+4
 vs_amplitude = 0
-# pre-amp gain index (0-based); Solis 'Gain 3' = 2
-preamp_gain_index = 2
+# pre-amp gain index (0-based; Solis 'Gain 3' = 2); -1 = the highest the camera offers at this readout speed (897: Gain 3, 888: Gain 2)
+preamp_gain_index = -1
 # keep the baseline (bias) level constant
 baseline_clamp = true
 # horizontal binning
@@ -316,6 +316,8 @@ max_fps = 25.0
 
 # Simulated trap + camera (backend = 'simulator' or --simulate)
 [simulator]
+# simulated camera: '897' (iXon Ultra 897, 512 x 512 px of 16 um) or '888' (iXon Ultra 888, 1024 x 1024 px of 13 um) - sensor, readout speeds and gains
+camera_model = "897"
 # ions present at start
 n_ions = 3
 # chain centre [sensor px]
@@ -338,8 +340,8 @@ psf_halo_fraction = 0.15
 psf_halo_sigma = 4.5
 # imaging magnification
 magnification = 20.0
-# camera pixel size [um] (iXon Ultra 897: 16)
-pixel_size_um = 16.0
+# camera pixel size [um]; 0 = the camera model's (iXon Ultra 897: 16, 888: 13)
+pixel_size_um = 0.0
 # collection NA
 numerical_aperture = 0.25
 # ion height above the trap surface [um].  The camera is focused on the ions, so a point on the surface is a blurred disk of radius h tan(asin NA) M / pixel (19 px with the defaults; small NA x h makes surface defects look like ions)

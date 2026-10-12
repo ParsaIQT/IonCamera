@@ -95,7 +95,14 @@ def _text(value) -> str:
 
 
 def _nearest(values, target) -> int:
-    return int(np.argmin(np.abs(np.asarray(values, float) - float(target))))
+    """Index of the value closest to ``target`` by ratio: readout speeds go in
+    factors, so 5 MHz asked of an iXon Ultra 888 (30, 20, 10, 1 MHz) is 10 MHz,
+    not 1 MHz (ten times slower); the 897 has 5 MHz itself."""
+    v = np.asarray(values, float)
+    t = float(target)
+    if t <= 0 or np.any(v <= 0):
+        return int(np.argmin(np.abs(v - t)))
+    return int(np.argmin(np.abs(np.log(v / t))))
 
 
 class AndorCamera(CameraBase):
@@ -397,14 +404,20 @@ class AndorCamera(CameraBase):
         return applied
 
     def _choose_preamp(self, amp: int, hs_idx: int, requested: int, warnings: List[str]) -> int:
+        """The pre-amp gain index: as requested if available at this speed, else
+        the nearest lower (then any) one; ``requested < 0``: the highest
+        available, without a warning (cameras differ: 897 three, 888 two)."""
         n = len(self._caps.get("preamp_gains") or [1.0])
+        highest = requested < 0
+        if highest:
+            requested = n - 1
         candidates = [requested] + list(range(min(requested, n - 1), -1, -1)) + list(range(n))
         for pa in candidates:
             if not 0 <= pa < n:
                 continue
             avail = self._try("IsPreAmpGainAvailable", 0, amp, hs_idx, pa, default=1)
             if avail:
-                if pa != requested:
+                if pa != requested and not highest:
                     warnings.append("pre-amp gain index {} unavailable at this speed; "
                                     "using {}".format(requested, pa))
                 return pa

@@ -42,13 +42,42 @@ from ioncam.analysis.chain import equilibrium_positions
 from ioncam.camera.base import (AcquisitionSettings, AppliedSettings, CameraBase,
                                 CameraError, normalize_roi)
 
-SENSOR_SHAPE = (512, 512)
-EM_HS_SPEEDS = [17.0, 10.0, 5.0, 1.0]       # MHz, EM amplifier (iXon Ultra 897)
-CONV_HS_SPEEDS = [3.0, 1.0, 0.08]           # MHz, conventional amplifier
-VS_SPEEDS = [0.3, 0.5, 0.9, 1.7, 3.3]       # us
-VS_FASTEST_RECOMMENDED = 1                  # 0.5 us at Normal amplitude
-PREAMP_GAINS = [1.0, 2.0, 3.0]
-EM_GAIN_RANGE = (1, 300)
+# The simulated camera (``simulator.camera_model``): sensor, readout speeds and gains.
+CAMERA_MODELS = {
+    "897": {"name": "iXon Ultra 897 (DU-897U)", "head": "DU897_BV", "sensor": (512, 512),
+            "pixel_um": 16.0,
+            "hs": {"em": [17.0, 10.0, 5.0, 1.0], "conventional": [3.0, 1.0, 0.08]},  # MHz
+            "vs": [0.3, 0.5, 0.9, 1.7, 3.3], "vs_fastest": 1,        # us; 0.5 us recommended
+            "preamp": [1.0, 2.0, 3.0], "em_gain": (1, 300)},
+    "888": {"name": "iXon Ultra 888 (DU-888U3)", "head": "DU888_BV", "sensor": (1024, 1024),
+            "pixel_um": 13.0,
+            "hs": {"em": [30.0, 20.0, 10.0, 1.0], "conventional": [1.0, 0.1]},
+            "vs": [0.6, 1.13, 2.2, 4.33], "vs_fastest": 0,
+            "preamp": [1.0, 2.0], "em_gain": (1, 300)},
+}
+_897 = CAMERA_MODELS["897"]
+SENSOR_SHAPE = _897["sensor"]
+EM_HS_SPEEDS = _897["hs"]["em"]
+CONV_HS_SPEEDS = _897["hs"]["conventional"]
+VS_SPEEDS = _897["vs"]
+VS_FASTEST_RECOMMENDED = _897["vs_fastest"]
+PREAMP_GAINS = _897["preamp"]
+EM_GAIN_RANGE = _897["em_gain"]
+
+
+def camera_model(cfg) -> dict:
+    """The simulated camera of a :class:`SimulatorConfig` ("897" or "888")."""
+    raw = str(getattr(cfg, "camera_model", "897") or "897")
+    name = raw.lower().replace("ixon", "").replace("ultra", "").strip(" _-")
+    if name not in CAMERA_MODELS:
+        raise ValueError("unknown simulator camera_model {!r}: one of {}".format(
+            raw, ", ".join(sorted(CAMERA_MODELS))))
+    return CAMERA_MODELS[name]
+
+
+def pixel_size_um(cfg) -> float:
+    """The simulated pixel size: as configured, else the camera model's."""
+    return float(cfg.pixel_size_um) or camera_model(cfg)["pixel_um"]
 EM_REGISTER_FULL_WELL = 8.0e5               # e-
 
 # Trap surfaces, from freshly made to "riddled with defects".  Rates are at the
@@ -176,7 +205,7 @@ class IonTrapScene:
         yy, xx = np.mgrid[0:h, 0:w].astype(float)
         profile = self._beam_profile(xx, yy)
         r_surface = defocus_radius_px(cfg.ion_height_um, cfg.numerical_aperture,
-                                      cfg.magnification, cfg.pixel_size_um)
+                                      cfg.magnification, pixel_size_um(cfg))
         # point sources on the surface plane (splatted to the nearest pixel)
         surface = cfg.scatter_rate * profile
         pts_x, pts_y, pts_f, pts_z = [], [], [], []
@@ -535,16 +564,25 @@ def readout_time(roi, hbin: int, vbin: int, hs_mhz: float, vs_us: float) -> floa
 
 
 def nearest_index(values, target) -> int:
-    return int(np.argmin(np.abs(np.asarray(values, float) - float(target))))
+    """Index of the value closest to ``target`` by ratio (readout speeds: 5 MHz
+    on a camera with 30, 20, 10 and 1 MHz is 10 MHz, not 1)."""
+    v = np.asarray(values, float)
+    t = float(target)
+    if t <= 0 or np.any(v <= 0):
+        return int(np.argmin(np.abs(v - t)))
+    return int(np.argmin(np.abs(np.log(v / t))))
 
 
 class SimulatedCamera(CameraBase):
-    """Simulated iXon Ultra 897 with an ion trap in front of it."""
+    """Simulated iXon Ultra (897 or 888, ``camera_model``) with an ion trap in
+    front of it."""
 
     sensor_shape: Tuple[int, int] = SENSOR_SHAPE
 
     def __init__(self, cfg):
         self.cfg = cfg
+        self.model = camera_model(cfg)
+        self.sensor_shape = tuple(self.model["sensor"])
         seed = None if cfg.seed < 0 else cfg.seed
         self.rng = np.random.default_rng(seed)
         self.scene = IonTrapScene(cfg, self.sensor_shape,
@@ -578,17 +616,18 @@ class SimulatedCamera(CameraBase):
     # -- CameraBase ------------------------------------------------------------
 
     def open(self) -> dict:
-        return {"model": "Simulated iXon Ultra 897 (DU-897U)", "serial": 0,
-                "sensor_shape": list(self.sensor_shape), "pixel_size_um": 16.0,
-                "simulated": True}
+        return {"model": "Simulated " + self.model["name"], "serial": 0,
+                "sensor_shape": list(self.sensor_shape),
+                "pixel_size_um": pixel_size_um(self.cfg), "simulated": True}
 
     def close(self) -> None:
         self.stop()
 
     def capabilities(self) -> dict:
-        return {"hs_speeds_mhz": {"em": EM_HS_SPEEDS, "conventional": CONV_HS_SPEEDS},
-                "vs_speeds_us": VS_SPEEDS, "vs_fastest_recommended": VS_SPEEDS[VS_FASTEST_RECOMMENDED],
-                "preamp_gains": PREAMP_GAINS, "em_gain_range": list(EM_GAIN_RANGE),
+        m = self.model
+        return {"hs_speeds_mhz": {k: list(v) for k, v in m["hs"].items()},
+                "vs_speeds_us": list(m["vs"]), "vs_fastest_recommended": m["vs"][m["vs_fastest"]],
+                "preamp_gains": list(m["preamp"]), "em_gain_range": list(m["em_gain"]),
                 "temperature_range": [-100, 20]}
 
     def configure(self, settings: AcquisitionSettings, tag: str = "") -> AppliedSettings:
@@ -597,18 +636,23 @@ class SimulatedCamera(CameraBase):
             self.stop()
         roi = normalize_roi(settings.roi, self.sensor_shape, settings.hbin, settings.vbin)
         em = settings.amplifier == "em"
-        speeds = EM_HS_SPEEDS if em else CONV_HS_SPEEDS
+        m = self.model
+        speeds = m["hs"]["em" if em else "conventional"]
         hs = speeds[nearest_index(speeds, settings.hs_speed_mhz)]
-        vs = (VS_SPEEDS[VS_FASTEST_RECOMMENDED] if settings.vs_speed_us <= 0
-              else VS_SPEEDS[nearest_index(VS_SPEEDS, settings.vs_speed_us)])
+        vs_list = m["vs"]
+        vs = (vs_list[m["vs_fastest"]] if settings.vs_speed_us <= 0
+              else vs_list[nearest_index(vs_list, settings.vs_speed_us)])
         warnings = []
-        pa_index = min(max(settings.preamp_gain_index, 0), len(PREAMP_GAINS) - 1)
-        if pa_index != settings.preamp_gain_index:
+        gains = m["preamp"]
+        pa_index = len(gains) - 1 if settings.preamp_gain_index < 0 else \
+            min(settings.preamp_gain_index, len(gains) - 1)
+        if 0 <= settings.preamp_gain_index != pa_index:
             warnings.append("pre-amp gain index {} not available, using {}".format(
                 settings.preamp_gain_index, pa_index))
         gain = 1
+        em_range = m["em_gain"]
         if em:
-            gain = int(min(max(settings.em_gain, EM_GAIN_RANGE[0]), EM_GAIN_RANGE[1]))
+            gain = int(min(max(settings.em_gain, em_range[0]), em_range[1]))
         exposure = max(float(settings.exposure), 1e-5)
         ro = readout_time(roi, settings.hbin, settings.vbin, hs, vs)
         keep_clean = 1.0e-3
@@ -623,15 +667,15 @@ class SimulatedCamera(CameraBase):
         shape = ((roi[3] - roi[1]) // settings.vbin, (roi[2] - roi[0]) // settings.hbin)
         self._exposure, self._ro, self._cycle, self._em_gain = exposure, ro, cycle, gain
         self._use_em = em
-        self._sensitivity = self.cfg.sensitivity * PREAMP_GAINS[-1] / PREAMP_GAINS[pa_index]
+        self._sensitivity = self.cfg.sensitivity * gains[-1] / gains[pa_index]
         self._read_noise = self.cfg.read_noise_e * math.sqrt(max(hs, 0.08) / 5.0)
         self.camera_link_enabled = settings.camera_link
         self._applied = AppliedSettings(
             settings=settings, roi=roi, frame_shape=shape, exposure=exposure,
             accumulate_cycle=cycle, kinetic_cycle=cycle, readout_time=ro,
             keep_clean_time=0.0 if (settings.frame_transfer and internal) else keep_clean,
-            hs_speed_mhz=hs, vs_speed_us=vs, preamp_gain=PREAMP_GAINS[pa_index],
-            em_gain=gain, em_gain_range=EM_GAIN_RANGE, tag=tag, warnings=warnings)
+            hs_speed_mhz=hs, vs_speed_us=vs, preamp_gain=gains[pa_index],
+            em_gain=gain, em_gain_range=em_range, tag=tag, warnings=warnings)
         return self._applied
 
     def start(self) -> None:

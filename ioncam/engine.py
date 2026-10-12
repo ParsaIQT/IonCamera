@@ -39,8 +39,8 @@ from ioncam.analysis.detection import DetectionResult, Detector
 from ioncam.analysis.fitting import PSF, fit_gaussians
 from ioncam.analysis.readout import (PlanError, ReadoutPlan, binning_advice,
                                      compare_grabber_frame, dark_pixel_mask, fit_threshold,
-                                     plan_readout, reposition_plan, shot_histograms,
-                                     verify_plan)
+                                     plan_readout, reposition_plan, resize_aqroi,
+                                     shot_histograms, square_aqroi, verify_plan)
 from ioncam.analysis.tracker import ChainTracker, adopt_learned_psf, align
 from ioncam.camera.base import (AcquisitionSettings, AppliedSettings, CameraBase, CameraError,
                                 Frame)
@@ -115,6 +115,17 @@ def _crystal_spots(positions, sites, sigma: float, scale: float = 0.0) -> np.nda
     ext = max(1.5 * float(np.ptp(u)) / (len(s) - 1), across)
     up, vp = (pos - center) @ axis, (pos - center) @ normal
     return (up >= u.min() - ext) & (up <= u.max() + ext) & (np.abs(vp) <= np.abs(v).max() + across)
+
+
+def _intersect(*rects):
+    """Intersection of the rectangles (x0, y0, x1, y1) that are not None; None
+    if all are None, () if they do not overlap."""
+    rs = [tuple(int(v) for v in r) for r in rects if r is not None]
+    if not rs:
+        return None
+    x0, y0 = max(r[0] for r in rs), max(r[1] for r in rs)
+    x1, y1 = min(r[2] for r in rs), min(r[3] for r in rs)
+    return (x0, y0, x1, y1) if x0 < x1 and y0 < y1 else ()
 
 
 def _pad_roi(roi, min_size: int, sensor_shape) -> tuple:
@@ -276,6 +287,7 @@ class IonCamEngine:
         self._plan_valid = False
         self._last_locate: Optional[dict] = None
         self._verify_shots: Optional[dict] = None     # the last verification's frames
+        self._stray_hint = False                      # the stray-light hint was given
         self._procedure: Optional[dict] = None
         self._abort = threading.Event()
         self._error: Optional[str] = None
@@ -577,6 +589,7 @@ class IonCamEngine:
         with self._tracker_cond:
             self._snapshot = snap
             self._tracker_cond.notify_all()
+        self._stray_light_hint(snap)
         for ev in events:
             self.events.add(ev)
             sb = self.detector.static_background
@@ -630,14 +643,21 @@ class IonCamEngine:
                                                "pending", "hold", "n_spots", "n_clouds",
                                                "last_update")},
             "sites": snap.get("sites", []),
-            "detection": {k: v for k, v in self._det_summary.items()
-                          if k not in ("spots", "clouds")},
+            "detection": dict({k: v for k, v in self._det_summary.items()
+                               if k not in ("spots", "clouds")},
+                              psf=[self.config.detection.psf_sigma,
+                                   self.config.detection.psf_halo_fraction,
+                                   self.config.detection.psf_halo_sigma],
+                              threshold_sigma=self.config.detection.threshold_sigma),
             "background": self.background_info(),
+            "search_region": list(self.config.detection.analysis_roi)
+            if self.config.detection.analysis_roi else None,
             "readout": {"armed": self._mode == READOUT, "has_plan": plan is not None,
                         "plan_valid": bool(plan is not None and self._plan_valid),
                         "n_ions": plan.n_ions if plan else 0,
                         "frame_size": list(plan.frame_size) if plan else None,
                         "shots": self.monitor.shots,
+                        "aqroi_by_hand": bool(plan is not None and plan.aqroi_by_hand),
                         "verified": vs["t"] if vs and plan and vs["plan"] == plan.created
                         else None},
             "control": dict(self._control) if self._control else None,
@@ -767,14 +787,17 @@ class IonCamEngine:
     # -- locating ions ------------------------------------------------------------------
 
     def locate_ions(self, expected: int = 0, n_frames: Optional[int] = None,
-                    include_dark: Optional[bool] = None, **overrides) -> dict:
-        """Long-exposure, low-gain frames + joint fit: precise ion positions and PSF."""
+                    include_dark: Optional[bool] = None, region: Optional[Sequence[int]] = None,
+                    **overrides) -> dict:
+        """Long-exposure, low-gain frames + joint fit: precise ion positions and
+        PSF.  Ions are searched for only inside the live camera ROI, the
+        detection's search region and ``region`` (x0, y0, x1, y1, sensor px)."""
         def proc():
-            return self._locate(expected, n_frames, include_dark, overrides), True
+            return self._locate(expected, n_frames, include_dark, overrides, region), True
         return self._procedure_run("locate_ions", proc)
 
     def _locate(self, expected: int, n_frames: Optional[int], include_dark: Optional[bool],
-                overrides: dict) -> dict:
+                overrides: dict, region: Optional[Sequence[int]] = None) -> dict:
         cfg = self.config
         cal = cfg.calibration
         n_frames = int(n_frames or cal.n_frames)
@@ -784,7 +807,9 @@ class IonCamEngine:
             known = self.tracker.positions(include_dark=False)
             snap = self.tracker.snapshot()
         if s.roi is None:
-            if len(known) and cal.search_margin > 0:
+            if region is not None:
+                roi = tuple(int(v) for v in region)
+            elif len(known) and cal.search_margin > 0:
                 m = cal.search_margin
                 roi = (int(math.floor(known[:, 0].min() - m)), int(math.floor(known[:, 1].min() - m)),
                        int(math.ceil(known[:, 0].max() + m)) + 1,
@@ -792,6 +817,14 @@ class IonCamEngine:
             else:
                 roi = self._live.roi
             s = s.replace(roi=roi)
+        # ions are searched for only where the user looks: inside the camera ROI
+        # (or the region asked for) and the detection's search region - the
+        # padding below only gives the background statistics room (it would
+        # otherwise bring stray light next to a tight crop into the search)
+        search = _intersect(s.roi, cfg.detection.analysis_roi, region)
+        if search == ():
+            raise ProcedureError("the search region {} and the camera ROI {} do not overlap".format(
+                list(cfg.detection.analysis_roi or region or []), list(s.roi or [])))
         if s.roi is not None:
             # background and noise statistics need some space around the crystal
             s = s.replace(roi=_pad_roi(s.roi, 64, self.camera.sensor_shape))
@@ -806,7 +839,7 @@ class IonCamEngine:
         self._step("locate: fitting")
         mean = np.mean([f.data.astype(np.float32) for f in frames], axis=0)
         frame = Frame(mean, frames[-1].index, frames[-1].timestamp, applied)
-        det = self.detector.analyze(frame)
+        det = self.detector.analyze(frame, analysis_roi=search)
         positions = det.positions
         spot_flux = np.array([sp.flux for sp in det.spots], float)
         quality: Dict[str, Any] = {"detected": len(positions)}
@@ -821,8 +854,9 @@ class IonCamEngine:
                 quality["ignored"] = int((~keep).sum())
         n_det = len(positions)
         if n_det == 0:
-            raise ProcedureError("no ions found in the long exposure "
-                                 "(lasers on? ions in the field of view?)")
+            raise ProcedureError("no ions found in the long exposure{} (lasers on? ions in the "
+                                 "field of view?)".format(
+                                     " inside {}".format(list(search)) if search else ""))
         hb, vb = applied.hbin, applied.vbin
         guesses = positions
         n_known = expected or (int(snap.get("n_bright") or 0) if snap.get("stable") else 0)
@@ -919,6 +953,7 @@ class IonCamEngine:
             "em_gain": applied.em_gain,
             "n_frames": n_frames,
             "roi": list(applied.roi),
+            "search_region": list(search) if search else None,
             "max_value": int(max(int(f.data.max()) for f in frames)),
             "t": time.time(),
         }
@@ -997,20 +1032,23 @@ class IonCamEngine:
                           roi_size: Optional[Sequence[int]] = None, arm: bool = True,
                           verify: Optional[bool] = None, auto_binning: bool = False,
                           force: bool = False, locate_overrides: Optional[dict] = None,
-                          **readout_overrides) -> dict:
-        """Locate the ions precisely, plan the AQROI + Grabber ROIs, verify, arm."""
+                          aqroi: Optional[Sequence[int]] = None, **readout_overrides) -> dict:
+        """Locate the ions precisely, plan the AQROI + Grabber ROIs, verify, arm.
+        ``aqroi`` (x0, y0, x1, y1): keep this AQROI (set by hand) - the ions
+        are searched for only inside it and their ROIs placed in it."""
         def proc():
             plan = self._calibrate(n_ions, hbin, vbin, roi_size, arm, verify, auto_binning,
-                                   force, locate_overrides or {}, readout_overrides)
+                                   force, locate_overrides or {}, readout_overrides, aqroi)
             return plan.to_dict(), not arm
         return self._procedure_run("calibrate_readout", proc)
 
     def _calibrate(self, n_ions, hbin, vbin, roi_size, arm, verify, auto_binning, force,
-                   locate_overrides, readout_overrides) -> ReadoutPlan:
+                   locate_overrides, readout_overrides, aqroi=None) -> ReadoutPlan:
         cfg = self.config
         cal = cfg.calibration
         expected = n_ions or cal.expected_ions
-        loc = self._locate(expected, None, None, locate_overrides)
+        aqroi = tuple(int(v) for v in aqroi) if aqroi else None
+        loc = self._locate(expected, None, None, locate_overrides, region=aqroi)
         if expected and loc["n_ions"] != expected and not force:
             raise ProcedureError("found {} ions but {} expected".format(loc["n_ions"], expected))
         if readout_overrides:
@@ -1029,14 +1067,17 @@ class IonCamEngine:
                   background_roi=cal.background_roi, halo=halo)
         self._step("plan: {} ions, {}x{} binning".format(len(pos), hb, vb))
         advice = binning_advice(pos, sigma, self.camera.sensor_shape, **kw)
-        if auto_binning:
+        if auto_binning and aqroi is None:
             good = [a for a in advice if a.get("ok")]
             if good:
                 pick = min(good, key=lambda a: (a["pixels"], -a["min_containment"]))
                 hb, vb = pick["binning"]
         plan = plan_readout(pos, sigma, self.camera.sensor_shape, hb, vb,
                             flip_x=cfg.grabber.flip_x, flip_y=cfg.grabber.flip_y,
-                            res_width=cfg.grabber.res_width, ion_states=loc["states"], **kw)
+                            res_width=cfg.grabber.res_width, ion_states=loc["states"],
+                            aqroi=aqroi, **kw)
+        if auto_binning and aqroi is not None:
+            plan.add_note("auto binning not used: the AQROI set by hand fixes the grid")
         for w in loc.get("warnings", []):
             plan.add_note(w)
         if self._temperature[1] != "stabilized":
@@ -1160,19 +1201,11 @@ class IonCamEngine:
         Close ions get overlapping ROIs rather than an error (see warnings).
         Re-arms an armed readout; the plan is not verified (verify_readout)."""
         def run():
-            pos, sigma, halo, states, newer = self._plan_source()
-            cfg = self.config
-            cal = cfg.calibration
-            hb = int(hbin) or (self._plan.hbin if self._plan else self._readout.hbin)
-            vb = int(vbin) or (self._plan.vbin if self._plan else self._readout.vbin)
-            kw = dict(roi_size=tuple(roi_size) if roi_size else tuple(cal.roi_size),
-                      frame_margin=cal.frame_margin, min_containment=cal.min_containment,
-                      max_crosstalk=cal.max_crosstalk, max_rois=cfg.grabber.roi_engine_count,
-                      background_roi=cal.background_roi, halo=halo)
-            plan = plan_readout(pos, sigma, self.camera.sensor_shape, hb, vb,
-                                flip_x=cfg.grabber.flip_x, flip_y=cfg.grabber.flip_y,
-                                res_width=cfg.grabber.res_width, ion_states=states,
-                                aqroi=tuple(int(v) for v in aqroi) if aqroi else None, **kw)
+            pos, sigma, halo, states, newer, source = self._plan_source()
+            hb, vb = self._binning(hbin, vbin)
+            kw = self._plan_kw(roi_size, halo)
+            plan = self._plan_from(pos, sigma, states, hb, vb, kw, source,
+                                   tuple(int(v) for v in aqroi) if aqroi else None)
             plan.binning_advice = binning_advice(pos, sigma, self.camera.sensor_shape, **kw)
             if newer:
                 self._plan_valid = True
@@ -1181,6 +1214,70 @@ class IonCamEngine:
             return plan.to_dict()
         return self._call(run)
 
+    def manual_aqroi(self, cols: int, rows: int = 0, x: Optional[float] = None,
+                     y: Optional[float] = None, hbin: int = 0, vbin: int = 0,
+                     roi_size: Optional[Sequence[int]] = None) -> dict:
+        """An AQROI set by hand: ``cols`` x ``rows`` super-pixels (square if
+        ``rows`` is 0) centred on (``x``, ``y``) sensor px - by default on the
+        located ions - on the binning-grid phase that centres the ions it holds
+        in their super-pixels.  The ions inside get their Grabber ROIs; spots
+        outside are left out.  Positions: the last locate, else the plan, else
+        the live tracking.  Re-arms if armed; not verified."""
+        def run():
+            pos, sigma, halo, states, newer, source = self._plan_source(allow_tracker=True)
+            hb, vb = self._binning(hbin, vbin)
+            kw = self._plan_kw(roi_size, halo)
+            center = None if x is None or y is None else (float(x), float(y))
+            rect = square_aqroi(pos, sigma, self.camera.sensor_shape, hb, vb, int(cols),
+                                int(rows) or int(cols), center, **kw)
+            plan = self._plan_from(pos, sigma, states, hb, vb, kw, source, rect)
+            if newer or source == "tracking":
+                self._plan_valid = True
+            self._set_plan(plan, "AQROI set by hand: {} x {} super-pixels".format(
+                plan.frame_size[0], plan.frame_size[1]))
+            return plan.to_dict()
+        return self._call(run)
+
+    def resize_readout(self, dcols: int = 0, drows: int = 0) -> dict:
+        """``dcols`` / ``drows`` super-pixel columns / rows more (fewer if
+        negative) in the AQROI, one at a time on the side with the narrower
+        margin around the ions' ROIs (taken from the wider one), keeping the
+        binning grid; the ROIs are placed again inside it.  Re-arms if armed."""
+        def run():
+            plan = self._editable_plan()
+            rect = resize_aqroi(plan, int(dcols), int(drows), self.camera.sensor_shape)
+            pos, sigma, halo, states, newer, source = self._plan_source(allow_tracker=True)
+            kw = self._plan_kw(plan.roi_size, halo)
+            new = self._plan_from(pos, sigma, states, plan.hbin, plan.vbin, kw, source, rect)
+            self._set_plan(new, "AQROI resized by hand to {} x {} super-pixels".format(
+                new.frame_size[0], new.frame_size[1]))
+            return new.to_dict()
+        return self._call(run)
+
+    def _binning(self, hbin: int = 0, vbin: int = 0) -> Tuple[int, int]:
+        """The binning asked for, else the plan's, else the [readout] one."""
+        return (int(hbin) or (self._plan.hbin if self._plan else self._readout.hbin),
+                int(vbin) or (self._plan.vbin if self._plan else self._readout.vbin))
+
+    def _plan_kw(self, roi_size, halo) -> dict:
+        cfg = self.config
+        cal = cfg.calibration
+        return dict(roi_size=tuple(roi_size) if roi_size else tuple(cal.roi_size),
+                    frame_margin=cal.frame_margin, min_containment=cal.min_containment,
+                    max_crosstalk=cal.max_crosstalk, max_rois=cfg.grabber.roi_engine_count,
+                    background_roi=cal.background_roi, halo=halo)
+
+    def _plan_from(self, pos, sigma, states, hb, vb, kw, source, aqroi=None) -> ReadoutPlan:
+        cfg = self.config
+        plan = plan_readout(pos, sigma, self.camera.sensor_shape, hb, vb,
+                            flip_x=cfg.grabber.flip_x, flip_y=cfg.grabber.flip_y,
+                            res_width=cfg.grabber.res_width, ion_states=states, aqroi=aqroi,
+                            **kw)
+        if source == "tracking":
+            plan.add_note("ion positions from the live tracking (no locate yet): Calibrate + "
+                          "arm locates them precisely")
+        return plan
+
     def _editable_plan(self) -> ReadoutPlan:
         if self._procedure is not None:
             raise ProcedureError("busy with '{}'".format(self._procedure["name"]))
@@ -1188,21 +1285,29 @@ class IonCamEngine:
             raise ProcedureError("no readout plan - calibrate (or locate, then re-plan) first")
         return self._plan
 
-    def _plan_source(self):
-        """Located ions for a re-plan: the newer of the current plan and the
-        last locate -> (positions, sigma, halo, states, from_new_locate)."""
+    def _plan_source(self, allow_tracker: bool = False):
+        """The ions to plan for without a new locate: those of the last locate
+        (all it found - a plan set by hand may have left some out), else the
+        plan's, else (``allow_tracker``) the live tracking's ->
+        (positions, sigma, halo, states, newer_than_plan, source)."""
         if self._procedure is not None:
             raise ProcedureError("busy with '{}'".format(self._procedure["name"]))
         plan, loc = self._plan, self._last_locate
-        if loc is not None and (plan is None or loc["t"] > plan.created):
+        d = self.config.detection
+        if loc is not None:
             halo = tuple(loc["psf_halo"]) if loc["psf_halo"][0] > 0 else \
-                (self.config.detection.psf_halo_fraction, self.config.detection.psf_halo_sigma)
+                (d.psf_halo_fraction, d.psf_halo_sigma)
             return (np.array(loc["positions"], float), tuple(loc["psf_sigma"]), halo,
-                    list(loc["states"]), True)
-        if plan is None:
-            raise ProcedureError("no located ions - locate them (or calibrate) first")
-        return (np.array(plan.positions, float), tuple(plan.psf_sigma), tuple(plan.psf_halo),
-                list(plan.ion_states), False)
+                    list(loc["states"]), plan is None or loc["t"] > plan.created, "locate")
+        if plan is not None:
+            return (np.array(plan.positions, float), tuple(plan.psf_sigma),
+                    tuple(plan.psf_halo), list(plan.ion_states), False, "plan")
+        sites = self._snapshot.get("sites") or []
+        if allow_tracker and sites:
+            return (np.array([[s_["x"], s_["y"]] for s_ in sites], float),
+                    (d.psf_sigma, d.psf_sigma), (d.psf_halo_fraction, d.psf_halo_sigma),
+                    [s_["state"] for s_ in sites], True, "tracking")
+        raise ProcedureError("no located ions - locate them (or calibrate) first")
 
     def _set_plan(self, plan: ReadoutPlan, what: str) -> None:
         """Adopt a plan changed by hand (re-arming an armed readout)."""
@@ -1310,6 +1415,50 @@ class IonCamEngine:
         with self._tracker_lock:
             self.tracker.reset()
             self._snapshot = self.tracker.snapshot()
+        self._stray_hint = False
+
+    def set_search_region(self, roi: Optional[Sequence[int]] = None) -> Optional[list]:
+        """Look for ions only inside ``roi`` = (x0, y0, x1, y1) sensor px, None:
+        everywhere - in live tracking and in locate / calibrate, so stray light
+        elsewhere on the sensor is never taken for ions.  The crystal is
+        tracked afresh (what was outside is not "lost").  Returns the region."""
+        r = None
+        if roi is not None:
+            sh, sw = self.camera.sensor_shape
+            x0, y0, x1, y1 = (int(round(float(v))) for v in roi)
+            x0, x1 = sorted((min(max(x0, 0), sw), min(max(x1, 0), sw)))
+            y0, y1 = sorted((min(max(y0, 0), sh), min(max(y1, 0), sh)))
+            if x1 - x0 < 4 or y1 - y0 < 4:
+                raise ValueError("a search region of {} x {} px is too small".format(
+                    x1 - x0, y1 - y0))
+            r = (x0, y0, x1, y1)
+        self.config.detection.analysis_roi = r
+        self.reset_tracking()
+        self.events.emit("search_region", "Ions are searched for only inside x {}-{}, y {}-{} "
+                         "- tracking afresh".format(r[0], r[2], r[1], r[3]) if r else
+                         "Ions are searched for everywhere again - tracking afresh", "info",
+                         region=list(r) if r else None)
+        return list(r) if r else None
+
+    def _stray_light_hint(self, snap: dict) -> None:
+        """A crystal is compact: bright "ions" far apart from each other are
+        more likely stray light taken for ions.  Say once what helps."""
+        if self._stray_hint or not snap.get("stable"):
+            return
+        sites = [s_ for s_ in snap.get("sites", []) if s_["state"] == "bright"]
+        if len(sites) < 2:
+            return
+        p = np.array([[s_["x"], s_["y"]] for s_ in sites], float)
+        d = np.hypot(p[:, None, 0] - p[None, :, 0], p[:, None, 1] - p[None, :, 1])
+        np.fill_diagonal(d, np.inf)
+        lonely = float(d.min(axis=1).max())        # the most isolated "ion"
+        if lonely > max(30.0, 15.0 * self.config.detection.psf_sigma):
+            self._stray_hint = True
+            self.events.emit(
+                "stray_light_hint", "{} 'ions' far apart (one is {:.0f} px from the next) - "
+                "not one crystal: stray light taken for ions?  Learn the background (best with "
+                "the repumper off), set a search region around the ions, or raise "
+                "detection.threshold_sigma".format(len(sites), lonely), "warning")
 
     def ion_count_ok(self, n: int, at_least: bool = False, stable_time: Optional[float] = None,
                      bright_only: bool = True) -> Tuple[bool, dict]:
@@ -1363,6 +1512,7 @@ class IonCamEngine:
                 frames, mask, info={"mask_ions": bool(mask_ions)})
             with self._tracker_lock:
                 self.tracker.background_changed()
+            self._stray_hint = False
             info = sb.summary()
             msg = "Static background learned from {} frame(s) of {:.3g} s ({} px of structure" \
                   "{})".format(len(frames), applied.exposure, info["structure_px"],
@@ -1384,6 +1534,7 @@ class IonCamEngine:
         self.detector.clear_static_background()
         with self._tracker_lock:
             self.tracker.background_changed()
+        self._stray_hint = False
 
     def sim_trap_turned(self) -> None:
         """[simulation] The simulated trap was turned in the image, electrodes

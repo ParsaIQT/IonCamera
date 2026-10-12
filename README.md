@@ -1,6 +1,8 @@
 # ioncam — the camera brain of an ion trap
 
-`ioncam` runs an Andor **iXon Ultra 897** for a trapped-ion experiment:
+`ioncam` runs an Andor **iXon Ultra** - the 897 (512 × 512) or the 888 (1024 × 1024), or
+any iXon on Andor SDK2: it reads the sensor, speeds and gains from the camera - for a
+trapped-ion experiment:
 
 * **live view** for beginners, with a large colour-coded "N ions" status and alarms;
 * **intelligent crystal tracking**: it tells an ion that was **trapped**, **lost** (the
@@ -33,7 +35,7 @@
 
 ```
                  ┌───────────────────── camera PC ─────────────────────┐
- iXon Ultra 897 ─┤USB  aqctl_ioncam / ioncam_gui                        │
+ iXon Ultra     ─┤USB  aqctl_ioncam / ioncam_gui                        │
         │        │  camera thread ─ frames ─▶ analysis thread           │
         │        │  (all SDK calls)            detection → tracker →    │
         │        │                             events, readout monitor  │
@@ -52,8 +54,9 @@ pip install -e ".[gui,test]"
 pip install git+https://github.com/m-labs/sipyco      # not on PyPI (ARTIQ envs have it)
 
 ioncam_gui --simulate          # GUI + simulated trap; use the "Simulation" tab to play
+ioncam_gui --simulate --sim-camera 888    # ... as an iXon Ultra 888 (1024 x 1024)
 aqctl_ioncam --simulate        # headless RPC server with the simulator
-pytest                         # 124 tests (~3 min), all on the simulator / emulated SDK
+pytest                         # 128 tests (~3 min), all on the simulator / emulated SDK
 ```
 
 ### The GUI
@@ -67,8 +70,8 @@ in the order of the work:
 | tab | what is there |
 |---|---|
 | **Live** | start / stop, exposure, EM gain, binning, **Snap** (average N frames and save them), the camera ROI (crop to the view, around the ions with a margin, full sensor), display (colormap, levels, orientation) and the live readout electronics (amplifier, horizontal and vertical speed, pre-amp, frame transfer) |
-| **Ions** | the crystal at a glance (bright, dark, state, chain scale and angle, PSF σ, noise), every site, tracking (accept as reference, forget, hold, locate), the learned background, a loading alert |
-| **Readout** | state chips (plan valid or outdated, armed, shots, verified); calibrate and run (Arm, Disarm); adjust by hand; the results: shot histograms with the fidelity estimate, the plan, the ARTIQ snippet |
+| **Ions** | the crystal at a glance (bright, dark, state, chain scale and angle, PSF σ, noise), every site, tracking (accept as reference, forget, hold, locate), ion detection (where to search, threshold), the learned background, a loading alert |
+| **Readout** | state chips (plan valid or outdated, armed, shots, verified); calibrate and run (Arm, Disarm, inside the AQROI set by hand); the AQROI by hand (New AQROI, Place by click, the size pad, the D-pad); the results: shot histograms with the fidelity estimate, the plan (and a typed AQROI), the ARTIQ snippet |
 | **Events** | the event log, filtered by severity or text; save it to a file |
 | **Camera** | cooling, the control lease, configuration (**Settings...**: every option with its help, changed at run time; **Save configuration...**), camera information |
 | **Simulation** | (simulated camera) ions, the lab (lasers, repumper, oven, camera moves, triggers) and the realism knobs |
@@ -78,7 +81,7 @@ Hold, Locate, Calibrate + arm, Verify, Arm, Disarm, Abort, and save image, setti
 the dark / light theme - with what cannot run now greyed out (Abort only while a
 procedure runs). The bar above the image: fit, zoom to the ions, what to show (raw,
 background removed, the learned background), which overlays (markers, numbers, ROIs,
-detected spots) and save the image (the raw data as `.npy` / `.csv` with a `.json` of
+detected spots), where to search for ions, and save the image (the raw data as `.npy` / `.csv` with a `.json` of
 its geometry and camera settings, or the view as `.png`). Keyboard shortcuts (**F1**
 lists them): F5 live, F6 stop, Ctrl+K calibrate + arm, Ctrl+L locate, Ctrl+Shift+V
 verify, Ctrl+R arm, Ctrl+D disarm, Esc abort, Ctrl+B learn background, Ctrl+H hold,
@@ -150,10 +153,12 @@ with their docstrings):
 | `get_ion_count()` / `get_ion_counts()` / `get_ions()` | bright ions / counts / per-ion sites (position, state, brightness) |
 | `wait_for_ions(n, timeout, at_least)` | block until a *stable* crystal of n bright ions |
 | `get_events(since_id)` / `wait_for_event(kinds, since_id, timeout)` | the event stream |
-| `locate_ions(expected)` | long exposure + joint fit: positions (with errors), PSF core + halo, chain fit |
-| `calibrate_readout(n_ions, hbin, vbin, auto_binning, ...)` | locate → plan AQROI/ROIs → verify → arm |
+| `locate_ions(expected, region)` | long exposure + joint fit: positions (with errors), PSF core + halo, chain fit |
+| `calibrate_readout(n_ions, hbin, vbin, auto_binning, aqroi, ...)` | locate → plan AQROI/ROIs → verify → arm; `aqroi`: keep an AQROI set by hand |
+| `set_search_region(x0, y0, x1, y1)` / `clear_search_region()` | look for ions only there (live, locate, calibrate) - stray light elsewhere is never an ion |
+| `manual_aqroi(cols, rows, x, y)` / `resize_readout(dcols, drows)` | an AQROI by hand: N × M super-pixels centred on (x, y); more / fewer columns and rows |
 | `nudge_readout(dx, dy)` | move the AQROI by whole sensor pixels (the ROIs move with it); re-arms |
-| `replan_readout(hbin, vbin, aqroi)` | plan again from the located ions: another binning and/or a fixed AQROI |
+| `replan_readout(hbin, vbin, aqroi)` | plan again from the located ions: another binning and/or a fixed AQROI (ions outside it are left out) |
 | `verify_readout()` | test frames with the current plan (e.g. after adjusting it by hand) |
 | `get_readout_plan()` / `get_grabber_rois()` / `get_grabber_roi_lists()` / `is_readout_valid()` | the plan |
 | `arm_readout()` / `disarm_readout(resume_live)` | external trigger + Camera Link on/off |
@@ -299,27 +304,43 @@ get 58 % / 11 % at 4×4, 80 % / 10 % at 3×3 and 71 % / 4 % at 1×1.
 `auto_binning=True` picks the cheapest binning that meets the targets
 (`calibration.min_containment`, `max_crosstalk`).
 
-### Adjusting by hand
+### The AQROI by hand
 
 On the image every Grabber ROI has its own colour and a label beside it - **ion 0 87 %**
 is Grabber ROI 0 with the share of ion 0's light it contains (chain order, as in the plan
 table), **bg** the background ROI - plus the AQROI (dashed) and the binning grid
-(dotted). The Readout tab's **Adjust by hand** box keeps the located positions and
-re-computes containment and crosstalk at once:
+(dotted). The Readout tab's **AQROI by hand** box keeps the located positions (or, before
+any locate, the tracked ones) and re-computes containment and crosstalk at once:
 
+* **New AQROI**: a square AQROI of N × N super-pixels (5 by default) on the ions in view -
+  zoom to the ion first - or the middle of the view, on the binning-grid phase that
+  centres the ions in their super-pixels (as an automatic plan would). **Place by
+  click**: then click on the image, and the square is centred there.
+* **Size pad** (next to the D-pad): **wider / narrower / taller / shorter** by one
+  super-pixel as seen on screen, through the display rotation. It adds a column or row on
+  the side with the narrower margin around the ions' ROIs (and takes one from the wider
+  side), so the ions stay centred and the grid stays; it never cuts through an ion's
+  ROI. The ROIs are placed again inside.
 * **D-pad** (▲ ▼ ◀ ▶, step 1 px by default; hold to repeat): moves the AQROI - and every
-  ROI with it - on screen, through the display rotation. The Grabber ROI numbers stay
-  the same (they are frame coordinates); the ions shift the other way inside them, at
-  4×4 binning by a quarter super-pixel per step. An armed readout is re-armed.
-* **Undo moves**: back to where the plan put the AQROI.
-* **Re-plan**: plan again with the binning set above, without a new locate.
-* **Use this AQROI**: place the ROIs inside an AQROI you type in (sensor px, `x1`/`y1`
-  exclusive, its size a multiple of the binning).
-* **Verify**: test frames with the plan as it is now; they also refresh the shot
-  histograms below, so you can step with the D-pad and compare the fidelity.
+  ROI with it - on screen. The Grabber ROI numbers stay the same (they are frame
+  coordinates); the ions shift the other way inside them, at 4×4 binning by a quarter
+  super-pixel per step. **Undo moves**: back to where the D-pad found it.
+* **Re-plan**: plan again with the binning set above, without a new locate. **Verify**:
+  test frames with the plan as it is now; they also refresh the shot histograms, so you
+  can step with the D-pad and compare the fidelity.
+* **Use this AQROI** (under the *Plan* tab): place the ROIs inside an AQROI you type in
+  (sensor px, `x1`/`y1` exclusive, its size a multiple of the binning).
 
-From ARTIQ the same is `nudge_readout(dx, dy)`, `replan_readout(hbin, vbin, aqroi)` and
-`verify_readout()`.
+An AQROI set by hand reads out the ions **inside** it: located spots outside it - stray
+light taken for ions, or ions you leave out on purpose - are listed in the plan's
+warnings, not an error. With **inside the AQROI set by hand** ticked (it is, once you
+make one), **Calibrate + arm** keeps that AQROI: it searches for the ions only inside it,
+locates them precisely, places their ROIs in it, verifies and arms. An armed readout is
+re-armed after every change by hand.
+
+From ARTIQ the same is `manual_aqroi(cols, rows, x, y)`, `resize_readout(dcols, drows)`,
+`nudge_readout(dx, dy)`, `replan_readout(hbin, vbin, aqroi)`, `verify_readout()` and
+`calibrate_readout(..., aqroi=...)`.
 
 ### Shot histograms and a quick fidelity estimate
 
@@ -433,6 +454,30 @@ at it when the whole picture shifts).
 On the simulator, a dirty surface with dust near focus gives ~20-50 false "ions" per
 frame without it and none with it; the ions are still found.
 
+### Stray light taken for ions
+
+Light that is not an ion but looks like one - a reflection off an electrode, dust near
+focus, a bright defect - is found as an "ion" on the full sensor. When the "crystal" is
+spread far apart (an "ion" more than 30 px, or 15 PSF σ, from the next) ioncam says so
+once (`stray_light_hint`). What helps, best first:
+
+1. **Learn the background** (Ions tab), best with the repumper off: the ions go dark,
+   the laser still scatters, so everything static that remains is learned and
+   subtracted.
+2. **Search only where the ions are**: *search* in the bar above the image (or the Ions
+   tab, or the Ions menu): **only in the visible area** (zoom to the ions first), **only
+   around the ions**, or **everywhere**. The region is drawn on the image (amber); live
+   tracking, Locate and Calibrate + arm look for ions only inside it, and the crystal is
+   tracked afresh when it changes. (`set_search_region()` over RPC.)
+3. **Raise the detection threshold** (Ions tab, `detection.threshold_sigma`, default
+   6 σ): a bright ion is far above it (SNR of a few hundred), faint stray light is not.
+
+Cropping the camera works too: Locate and Calibrate + arm search for ions only inside the
+live camera ROI. The long exposure still takes at least 64 × 64 px for its background
+statistics, but nothing found in that padding counts. On the 888's 1024 × 1024 sensor a
+search region or a crop also makes the live analysis faster (a full frame takes
+~100 ms).
+
 ## The simulator
 
 `ioncam_gui --simulate` / `aqctl_ioncam --simulate` run on a simulated trap. The
@@ -448,7 +493,16 @@ background is cleared, the crystal is tracked afresh and a readout plan is outda
 plus ions (load, lose, dark, melt), lasers,
 repumper, oven, camera moves and external triggers. The EMCCD model has
 Poisson photo-electrons, clock-induced charge, the gamma-distributed EM register, read
-noise, bias and 16-bit saturation.
+noise, bias and 16-bit saturation. `simulator.camera_model` (or `--sim-camera`) picks the
+camera: `897` (512 × 512 px of 16 µm; 17, 10, 5, 1 MHz) or `888` (1024 × 1024 px of
+13 µm; 30, 20, 10, 1 MHz) - sensor, readout speeds and gains; the emulated SDK
+(`backend = "fake_sdk"`) follows it.
+
+Readout speeds a camera does not have are taken by ratio: the 5 MHz of the default locate
+and readout settings is 10 MHz on an 888 (not 1 MHz, ten times slower). The pre-amp gain
+is by default the highest the camera offers at that speed (`preamp_gain_index = -1`:
+Gain 3 on an 897, Gain 2 on an 888). The plan's `applied` settings show what the camera
+uses.
 
 ## Taking over
 
@@ -515,7 +569,7 @@ These are worth knowing, because several would silently corrupt data:
 
 ## Tests
 
-`pytest` runs 124 tests in about 3 minutes, in the realistic regime (13k photons/s
+`pytest` runs 128 tests in about 3 minutes, in the realistic regime (13k photons/s
 per ion, blurred PSF with halo, laser scatter, surface defects):
 - chain physics against James' published values;
 - detector accuracy (photon-limited) and false-alarm rates at EM gain 1, 50 and 300,
@@ -532,13 +586,18 @@ per ion, blurred PSF with halo, laser scatter, surface defects):
   included), and agreement with the Grabber gateware model, including its `x1` quirk;
   close ions get overlapping ROIs instead of an error, one centred super-pixel per ion
   with a clean background strip, a fixed AQROI, moving the AQROI by hand, every
-  candidate ROI's score against the PSF integrals; locate splitting a merged pair,
+  candidate ROI's score against the PSF integrals, an AQROI set by hand (square on the
+  automatic plan's grid, the size pad, spots outside left out); locate splitting a merged pair,
   merging an ion the detector split in two, keeping to the tracked crystal and fitting
   scattered spots in windows of their own; the quick fidelity estimate from bright
   shots against EMCCD shots with the ions really dark (alone and next to a bright ion);
-- the Andor driver's exact SDK call sequence on the emulated SDK;
-- a full stack over real sipyco RPC with concurrent clients;
+- the Andor driver's exact SDK call sequence on the emulated SDK, and an emulated
+  iXon Ultra 888 (1024 × 1024, 10 MHz for a 5 MHz setting, a missing pre-amp gain);
+- a full stack over real sipyco RPC with concurrent clients; stray light taken for ions
+  (the hint, a tight crop, a search region, a typed AQROI, the AQROI by hand and
+  Calibrate + arm inside it);
 - a headless GUI test (levels set by hand stay put, the D-pad direction through the
   display rotation, ROI labels, the shot histograms, the trap-rotation buttons, the
   overlays one kind at a time, the actions that can run, the event filter, saving the
-  image, both themes, an option changed in the settings dialog).
+  image, both themes, an option changed in the settings dialog, New AQROI, the size pad,
+  Place by click and the search region).

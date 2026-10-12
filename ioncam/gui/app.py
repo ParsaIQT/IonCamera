@@ -20,6 +20,9 @@ def get_argparser():
     p.add_argument("-p", "--port", type=int, default=DEFAULT_PORT, help="RPC port")
     p.add_argument("-c", "--config", default=None, help="TOML configuration (local mode)")
     p.add_argument("--simulate", action="store_true", help="simulated camera + ion trap")
+    p.add_argument("--sim-camera", choices=("897", "888"), default=None,
+                   help="simulated camera model: iXon Ultra 897 (512 x 512) or 888 "
+                        "(1024 x 1024); default: simulator.camera_model")
     p.add_argument("--bind", default=[], action="append",
                    help="additional address for the RPC server to bind to ('*' = all)")
     p.add_argument("--no-localhost-bind", action="store_true")
@@ -81,6 +84,8 @@ def main(argv=None):
     from ioncam.config import Config
     from ioncam.server import build
     config = Config.load(args.config)
+    if args.sim_camera:
+        config.simulator.camera_model = args.sim_camera
     engine, api = build(config, simulate=args.simulate)
     engine.start(auto_live=not args.no_live)
     try:

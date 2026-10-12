@@ -58,7 +58,7 @@ class CameraConfig:
 
 def _live_defaults() -> AcquisitionSettings:
     return AcquisitionSettings(exposure=0.05, em_gain=50, hs_speed_mhz=10.0,
-                               vs_speed_us=0.0, preamp_gain_index=2,
+                               vs_speed_us=0.0, preamp_gain_index=-1,
                                frame_transfer=True, trigger="internal",
                                acquisition="run_till_abort")
 
@@ -68,16 +68,16 @@ def _locate_defaults() -> AcquisitionSettings:
     # gain (not none) keeps the read noise (tens of e-) below the shot noise of
     # ~10^4 photons/s ions - without it the fit is read-noise limited.
     return AcquisitionSettings(exposure=0.5, em_gain=10, hs_speed_mhz=5.0,
-                               vs_speed_us=0.5, preamp_gain_index=2,
+                               vs_speed_us=0.5, preamp_gain_index=-1,
                                frame_transfer=True, trigger="internal",
                                acquisition="run_till_abort")
 
 
 def _readout_defaults() -> AcquisitionSettings:
-    # The typical Grabber readout settings of an iXon Ultra 897 ion experiment.
+    # Typical Grabber readout settings of an iXon Ultra (897 / 888) ion experiment.
     return AcquisitionSettings(exposure=0.0015, em_gain=200, amplifier="em",
                                hs_speed_mhz=5.0, vs_speed_us=0.5, vs_amplitude=0,
-                               preamp_gain_index=2, baseline_clamp=True,
+                               preamp_gain_index=-1, baseline_clamp=True,
                                hbin=4, vbin=4, trigger="external",
                                acquisition="run_till_abort", frame_transfer=False,
                                fast_ext_trigger=False, camera_link=True)
@@ -87,10 +87,12 @@ ACQ_HELP = {
     "exposure": "exposure time [s]",
     "em_gain": "EM gain (in camera.em_gain_mode units); 0 = minimum",
     "amplifier": "'em' or 'conventional' output amplifier",
-    "hs_speed_mhz": "horizontal readout rate [MHz]; nearest available is used",
+    "hs_speed_mhz": "horizontal readout rate [MHz]; the nearest available (by ratio) is "
+                    "used - 5 MHz is 10 MHz on an iXon Ultra 888 (30, 20, 10, 1 MHz)",
     "vs_speed_us": "vertical shift speed [us]; 0 = fastest recommended",
     "vs_amplitude": "vertical clock voltage: 0 = Normal, 1..4 = +1..+4",
-    "preamp_gain_index": "pre-amp gain index (0-based); Solis 'Gain 3' = 2",
+    "preamp_gain_index": "pre-amp gain index (0-based; Solis 'Gain 3' = 2); -1 = the highest "
+                         "the camera offers at this readout speed (897: Gain 3, 888: Gain 2)",
     "baseline_clamp": "keep the baseline (bias) level constant",
     "hbin": "horizontal binning",
     "vbin": "vertical binning",
@@ -252,6 +254,9 @@ class DisplayConfig:
 
 @dataclass
 class SimulatorConfig:
+    camera_model: str = opt("897", "simulated camera: '897' (iXon Ultra 897, 512 x 512 px of "
+                                   "16 um) or '888' (iXon Ultra 888, 1024 x 1024 px of 13 um) "
+                                   "- sensor, readout speeds and gains")
     n_ions: int = opt(3, "ions present at start")
     center: Tuple[float, float] = opt((262.0, 168.0), "chain centre [sensor px]")
     axis_angle_deg: float = opt(0.0, "chain axis angle w.r.t. sensor x [deg]")
@@ -275,7 +280,8 @@ class SimulatorConfig:
     psf_halo_sigma: float = opt(4.5, "halo sigma [px]")
     # -- imaging of the trap surface ---------------------------------------------------
     magnification: float = opt(20.0, "imaging magnification")
-    pixel_size_um: float = opt(16.0, "camera pixel size [um] (iXon Ultra 897: 16)")
+    pixel_size_um: float = opt(0.0, "camera pixel size [um]; 0 = the camera model's "
+                                    "(iXon Ultra 897: 16, 888: 13)")
     numerical_aperture: float = opt(0.25, "collection NA")
     ion_height_um: float = opt(60.0, "ion height above the trap surface [um].  The camera "
                                      "is focused on the ions, so a point on the surface is "

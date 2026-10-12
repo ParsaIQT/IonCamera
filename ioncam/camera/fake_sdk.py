@@ -1,4 +1,5 @@
-"""An in-process emulation of Andor's ``pyAndorSDK2.atmcd`` for an iXon Ultra 897.
+"""An in-process emulation of Andor's ``pyAndorSDK2.atmcd`` for an iXon Ultra 897
+(or 888: ``simulator.camera_model``).
 
 It lets the *real* :class:`ioncam.camera.andor.AndorCamera` driver code run
 without hardware (``backend = "fake_sdk"``) and is what the driver tests use.
@@ -18,8 +19,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 
 from ioncam.camera.base import AcquisitionSettings, CameraError
-from ioncam.camera.simulator import (CONV_HS_SPEEDS, EM_HS_SPEEDS, PREAMP_GAINS,
-                                     SimulatedCamera, VS_FASTEST_RECOMMENDED, VS_SPEEDS)
+from ioncam.camera.simulator import SimulatedCamera
 
 S = 20002            # DRV_SUCCESS
 NO_NEW_DATA = 20024
@@ -92,10 +92,15 @@ class _FakeDll:
 
 
 class FakeAtmcd:
-    """Behaves like ``pyAndorSDK2.atmcd`` connected to an iXon Ultra 897."""
+    """Behaves like ``pyAndorSDK2.atmcd`` connected to an iXon Ultra 897 (or 888)."""
 
     def __init__(self, sim_cfg, serial: int = 12345):
         self.sim = SimulatedCamera(sim_cfg)
+        self.model = m = self.sim.model
+        self._hs = (m["hs"]["em"], m["hs"]["conventional"])
+        self._vs = m["vs"]
+        self._preamp = m["preamp"]
+        self._h, self._w = m["sensor"]
         self.dll = _FakeDll(self)
         self.calls: List[Tuple[str, tuple]] = []
         self.serial = serial
@@ -108,7 +113,7 @@ class FakeAtmcd:
             "read_mode": 4, "acq_mode": 1, "trigger": 0, "amp": 0, "hs": 0, "vs": 0,
             "vs_amp": 0, "preamp": 0, "clamp": 0, "em_gain_mode": 0, "em_gain": 0,
             "em_advanced": 0, "ft": 0, "fast_ext": 0, "invert": 0, "camera_link": 0,
-            "image": (1, 1, 1, 512, 1, 512), "exposure": 0.01, "kinetic": 0.0,
+            "image": (1, 1, 1, self._w, 1, self._h), "exposure": 0.01, "kinetic": 0.0,
             "n_acc": 1, "rotate": 0, "flip": (0, 0), "cooler_mode": 0, "shutter": None,
         }
 
@@ -168,16 +173,16 @@ class FakeAtmcd:
         return S
 
     def GetDetector(self):
-        return S, 512, 512
+        return S, self._w, self._h
 
     def GetHeadModel(self):
-        return S, b"DU897_BV"
+        return S, self.model["head"].encode()
 
     def GetCameraSerialNumber(self):
         return S, self.serial
 
     def GetPixelSize(self):
-        return S, 16.0, 16.0
+        return S, self.model["pixel_um"], self.model["pixel_um"]
 
     def GetNumberAmp(self):
         return S, 2
@@ -186,26 +191,27 @@ class FakeAtmcd:
         return S, 1
 
     def GetNumberHSSpeeds(self, channel, typ):
-        return S, len(EM_HS_SPEEDS if typ == 0 else CONV_HS_SPEEDS)
+        return S, len(self._hs[typ])
 
     def GetHSSpeed(self, channel, typ, index):
-        speeds = EM_HS_SPEEDS if typ == 0 else CONV_HS_SPEEDS
+        speeds = self._hs[typ]
         return (S, speeds[index]) if 0 <= index < len(speeds) else (P3INVALID, 0.0)
 
     def GetNumberVSSpeeds(self):
-        return S, len(VS_SPEEDS)
+        return S, len(self._vs)
 
     def GetVSSpeed(self, index):
-        return (S, VS_SPEEDS[index]) if 0 <= index < len(VS_SPEEDS) else (P1INVALID, 0.0)
+        return (S, self._vs[index]) if 0 <= index < len(self._vs) else (P1INVALID, 0.0)
 
     def GetFastestRecommendedVSSpeed(self):
-        return S, VS_FASTEST_RECOMMENDED, VS_SPEEDS[VS_FASTEST_RECOMMENDED]
+        k = self.model["vs_fastest"]
+        return S, k, self._vs[k]
 
     def GetNumberPreAmpGains(self):
-        return S, len(PREAMP_GAINS)
+        return S, len(self._preamp)
 
     def GetPreAmpGain(self, index):
-        return S, PREAMP_GAINS[index]
+        return S, self._preamp[index]
 
     def GetPreAmpGainText(self, index, length):
         buf = ctypes.create_string_buffer(length)
@@ -240,13 +246,13 @@ class FakeAtmcd:
         return S if channel == 0 else P1INVALID
 
     def SetHSSpeed(self, typ, index):
-        n = len(EM_HS_SPEEDS if typ == 0 else CONV_HS_SPEEDS)
+        n = len(self._hs[typ]) if typ in (0, 1) else 0
         if not 0 <= index < n:
             return P2INVALID
         return self._set("hs", index)
 
     def SetVSSpeed(self, index):
-        return self._set("vs", index, range(len(VS_SPEEDS)))
+        return self._set("vs", index, range(len(self._vs)))
 
     def SetFKVShiftSpeed(self, index):
         return S  # accepted but irrelevant for image mode (the old GUI's bug)
@@ -255,7 +261,7 @@ class FakeAtmcd:
         return self._set("vs_amp", index, range(5))
 
     def SetPreAmpGain(self, index):
-        return self._set("preamp", index, range(len(PREAMP_GAINS)))
+        return self._set("preamp", index, range(len(self._preamp)))
 
     def SetBaselineClamp(self, state):
         return self._set("clamp", state, (0, 1))
@@ -309,9 +315,9 @@ class FakeAtmcd:
             return err
         if hbin < 1 or vbin < 1:
             return P1INVALID
-        if not (1 <= hstart <= hend <= 512):
+        if not (1 <= hstart <= hend <= self._w):
             return P3INVALID
-        if not (1 <= vstart <= vend <= 512):
+        if not (1 <= vstart <= vend <= self._h):
             return 20076  # DRV_P5INVALID
         if (hend - hstart + 1) % hbin or (vend - vstart + 1) % vbin:
             return 20099  # DRV_BINNING_ERROR
@@ -357,10 +363,10 @@ class FakeAtmcd:
         st = self.state
         hb, vb, hs, he, vs, ve = st["image"]
         amp = "em" if st["amp"] == 0 else "conventional"
-        speeds = EM_HS_SPEEDS if st["amp"] == 0 else CONV_HS_SPEEDS
+        speeds = self._hs[0 if st["amp"] == 0 else 1]
         return AcquisitionSettings(
             exposure=st["exposure"], em_gain=st["em_gain"], amplifier=amp,
-            hs_speed_mhz=speeds[st["hs"]], vs_speed_us=VS_SPEEDS[st["vs"]],
+            hs_speed_mhz=speeds[st["hs"]], vs_speed_us=self._vs[st["vs"]],
             vs_amplitude=st["vs_amp"], preamp_gain_index=st["preamp"],
             baseline_clamp=bool(st["clamp"]), hbin=hb, vbin=vb, roi=(hs - 1, vs - 1, he, ve),
             trigger=_TRIG[st["trigger"]], acquisition=_ACQ.get(st["acq_mode"], "single"),

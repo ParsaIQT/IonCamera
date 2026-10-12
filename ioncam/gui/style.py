@@ -174,6 +174,29 @@ def _draw(name, painter, color):
         pen.setWidthF(2.6)
         painter.setPen(pen)
         painter.drawPolyline(QtGui.QPolygonF([P(*p) for p in pts]))
+    elif name in ("wider", "narrower", "taller", "shorter"):   # AQROI size
+        out = name in ("wider", "taller")
+        pen.setWidthF(2.2)
+        painter.setPen(pen)
+        for sgn in (-1, 1):                       # chevrons out (<|>) or in (>|<)
+            tip, tail = 12 + sgn * (9.5 if out else 2.5), 12 + sgn * 6.0
+            if name in ("wider", "narrower"):
+                painter.drawPolyline(QtGui.QPolygonF([P(tail, 7.5), P(tip, 12), P(tail, 16.5)]))
+            else:
+                painter.drawPolyline(QtGui.QPolygonF([P(7.5, tail), P(12, tip), P(16.5, tail)]))
+        if name in ("wider", "narrower"):
+            painter.drawLine(P(12, 6), P(12, 18))
+        else:
+            painter.drawLine(P(6, 12), P(18, 12))
+    elif name == "place":                      # a square with a cross-hair
+        painter.drawRect(QtCore.QRectF(6, 6, 12, 12))
+        for a_, b_ in (((12, 2.5), (12, 8.5)), ((12, 15.5), (12, 21.5)),
+                       ((2.5, 12), (8.5, 12)), ((15.5, 12), (21.5, 12))):
+            painter.drawLine(P(*a_), P(*b_))
+    elif name == "square":                     # a new AQROI
+        painter.drawRect(QtCore.QRectF(5, 5, 14, 14))
+        painter.setBrush(fill)
+        painter.drawEllipse(P(12, 12), 2.2, 2.2)
     elif name == "zoom":
         painter.drawEllipse(P(10.5, 10.5), 5.5, 5.5)
         painter.drawLine(P(14.6, 14.6), P(20, 20))
