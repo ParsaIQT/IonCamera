@@ -146,6 +146,43 @@ def roi_from_sdk(hstart: int, hend: int, vstart: int, vend: int) -> Roi:
     return hstart - 1, vstart - 1, hend, vend
 
 
+def nearest_index(values, target) -> int:
+    """Index of the value closest to ``target`` by ratio: readout speeds go in
+    factors, so 5 MHz asked of an iXon Ultra 888 (30, 20, 10, 1 MHz) is 10 MHz,
+    not 1 MHz (ten times slower); the 897 has 5 MHz itself."""
+    v = np.asarray(values, float)
+    t = float(target)
+    if t <= 0 or np.any(v <= 0):
+        return int(np.argmin(np.abs(v - t)))
+    return int(np.argmin(np.abs(np.log(v / t))))
+
+
+def vs_speed_index(speeds, fastest_recommended: int, requested_us: float,
+                   amplitude: int) -> Tuple[int, str]:
+    """The vertical shift speed to use: ``(index into speeds, warning or "")``.
+
+    ``requested_us`` 0 is the camera's fastest recommended speed (the SDK's
+    ``GetFastestRecommendedVSSpeed``).  At normal vertical clock voltage
+    (``amplitude`` 0) nothing faster is used: an over-clocked speed only shifts
+    the charge cleanly with a higher clock voltage - an iXon Ultra 888 does not
+    transfer it at all at 0.6 us (Andor's hardware guide) and every image
+    (long exposure, verification, armed readout) comes out garbled.
+    """
+    rec = min(max(int(fastest_recommended), 0), len(speeds) - 1)
+    if requested_us <= 0:
+        return rec, ""
+    i = nearest_index(speeds, requested_us)
+    if amplitude > 0 or speeds[i] >= speeds[rec]:
+        return i, ""
+    here = "" if abs(speeds[i] - requested_us) <= 1e-6 * requested_us else \
+        " ({:g} us on this camera)".format(speeds[i])
+    return rec, ("vertical shift speed {:g} us{} needs a higher vertical clock voltage "
+                 "(at normal voltage the charge is not shifted cleanly: garbled images); "
+                 "using {:g} us, the fastest recommended - vs_speed_us = 0 asks for it, "
+                 "vs_amplitude +1..+4 allows faster (more clock-induced charge)".format(
+                     requested_us, here, speeds[rec]))
+
+
 @dataclass
 class AppliedSettings:
     """What the camera actually ended up with after :meth:`CameraBase.configure`."""

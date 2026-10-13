@@ -40,7 +40,7 @@ from scipy.special import erfc, ndtr
 
 from ioncam.analysis.chain import equilibrium_positions
 from ioncam.camera.base import (AcquisitionSettings, AppliedSettings, CameraBase,
-                                CameraError, normalize_roi)
+                                CameraError, nearest_index, normalize_roi, vs_speed_index)
 
 # The simulated camera (``simulator.camera_model``): sensor, readout speeds and gains.
 CAMERA_MODELS = {
@@ -52,7 +52,8 @@ CAMERA_MODELS = {
     "888": {"name": "iXon Ultra 888 (DU-888U3)", "head": "DU888_BV", "sensor": (1024, 1024),
             "pixel_um": 13.0,
             "hs": {"em": [30.0, 20.0, 10.0, 1.0], "conventional": [1.0, 0.1]},
-            "vs": [0.6, 1.13, 2.2, 4.33], "vs_fastest": 0,
+            # 0.6 us needs a higher vertical clock voltage to transfer charge at all
+            "vs": [0.6, 1.13, 2.2, 4.33], "vs_fastest": 1,
             "preamp": [1.0, 2.0], "em_gain": (1, 300)},
 }
 _897 = CAMERA_MODELS["897"]
@@ -563,16 +564,6 @@ def readout_time(roi, hbin: int, vbin: int, hs_mhz: float, vs_us: float) -> floa
     return y1 * vs_us * 1e-6 + rows * (x1 + 20) / (hs_mhz * 1e6) + 2e-4
 
 
-def nearest_index(values, target) -> int:
-    """Index of the value closest to ``target`` by ratio (readout speeds: 5 MHz
-    on a camera with 30, 20, 10 and 1 MHz is 10 MHz, not 1)."""
-    v = np.asarray(values, float)
-    t = float(target)
-    if t <= 0 or np.any(v <= 0):
-        return int(np.argmin(np.abs(v - t)))
-    return int(np.argmin(np.abs(np.log(v / t))))
-
-
 class SimulatedCamera(CameraBase):
     """Simulated iXon Ultra (897 or 888, ``camera_model``) with an ion trap in
     front of it."""
@@ -627,6 +618,7 @@ class SimulatedCamera(CameraBase):
         m = self.model
         return {"hs_speeds_mhz": {k: list(v) for k, v in m["hs"].items()},
                 "vs_speeds_us": list(m["vs"]), "vs_fastest_recommended": m["vs"][m["vs_fastest"]],
+                "vs_fastest_recommended_index": m["vs_fastest"],
                 "preamp_gains": list(m["preamp"]), "em_gain_range": list(m["em_gain"]),
                 "temperature_range": [-100, 20]}
 
@@ -640,9 +632,10 @@ class SimulatedCamera(CameraBase):
         speeds = m["hs"]["em" if em else "conventional"]
         hs = speeds[nearest_index(speeds, settings.hs_speed_mhz)]
         vs_list = m["vs"]
-        vs = (vs_list[m["vs_fastest"]] if settings.vs_speed_us <= 0
-              else vs_list[nearest_index(vs_list, settings.vs_speed_us)])
-        warnings = []
+        vs_idx, note = vs_speed_index(vs_list, m["vs_fastest"], settings.vs_speed_us,
+                                      settings.vs_amplitude)
+        vs = vs_list[vs_idx]
+        warnings = [note] if note else []
         gains = m["preamp"]
         pa_index = len(gains) - 1 if settings.preamp_gain_index < 0 else \
             min(settings.preamp_gain_index, len(gains) - 1)

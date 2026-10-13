@@ -787,9 +787,20 @@ class MainWindow(QtWidgets.QMainWindow):
             self.hs.setCurrentIndex(i)
         if live is not None:
             self.vs.clear()
-            self.vs.addItem("fastest recommended", 0.0)
-            for v in caps.get("vs_speeds_us") or []:
-                self.vs.addItem("{:g} us".format(v), float(v))
+            speeds = caps.get("vs_speeds_us") or []
+            rec = caps.get("vs_fastest_recommended_index", 0)
+            self.vs.addItem("fastest recommended" + (
+                " ({:g} us)".format(speeds[rec]) if rec < len(speeds) else ""), 0.0)
+            for k, v in enumerate(speeds):
+                # over-clocked, as Solis brackets them: at normal clock voltage the
+                # camera uses the fastest recommended one instead (garbled images)
+                self.vs.addItem("[{:g} us] needs a higher clock voltage".format(v) if k < rec
+                                else "{:g} us".format(v), float(v))
+            self.vs.setToolTip("speeds in brackets are over-clocked: they need a higher "
+                               "vertical clock voltage (vs_amplitude of live, locate or "
+                               "readout in the settings) "
+                               "to shift the charge cleanly; without it the fastest "
+                               "recommended speed is used")
             vs = live.get("vs_speed_us", 0.0) or 0.0
             self.vs.setCurrentIndex(max(0, self.vs.findData(float(vs))))
             self.preamp.clear()

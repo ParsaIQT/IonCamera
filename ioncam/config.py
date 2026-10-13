@@ -68,7 +68,7 @@ def _locate_defaults() -> AcquisitionSettings:
     # gain (not none) keeps the read noise (tens of e-) below the shot noise of
     # ~10^4 photons/s ions - without it the fit is read-noise limited.
     return AcquisitionSettings(exposure=0.5, em_gain=10, hs_speed_mhz=5.0,
-                               vs_speed_us=0.5, preamp_gain_index=-1,
+                               vs_speed_us=0.0, preamp_gain_index=-1,
                                frame_transfer=True, trigger="internal",
                                acquisition="run_till_abort")
 
@@ -76,7 +76,7 @@ def _locate_defaults() -> AcquisitionSettings:
 def _readout_defaults() -> AcquisitionSettings:
     # Typical Grabber readout settings of an iXon Ultra (897 / 888) ion experiment.
     return AcquisitionSettings(exposure=0.0015, em_gain=200, amplifier="em",
-                               hs_speed_mhz=5.0, vs_speed_us=0.5, vs_amplitude=0,
+                               hs_speed_mhz=5.0, vs_speed_us=0.0, vs_amplitude=0,
                                preamp_gain_index=-1, baseline_clamp=True,
                                hbin=4, vbin=4, trigger="external",
                                acquisition="run_till_abort", frame_transfer=False,
@@ -89,7 +89,9 @@ ACQ_HELP = {
     "amplifier": "'em' or 'conventional' output amplifier",
     "hs_speed_mhz": "horizontal readout rate [MHz]; the nearest available (by ratio) is "
                     "used - 5 MHz is 10 MHz on an iXon Ultra 888 (30, 20, 10, 1 MHz)",
-    "vs_speed_us": "vertical shift speed [us]; 0 = fastest recommended",
+    "vs_speed_us": "vertical shift speed [us]; 0 = the camera's fastest recommended one "
+                   "(iXon Ultra 888: 1.13 us).  Faster ones are used only with vs_amplitude "
+                   "> 0: at normal voltage they garble the image (an 888 at 0.6 us)",
     "vs_amplitude": "vertical clock voltage: 0 = Normal, 1..4 = +1..+4",
     "preamp_gain_index": "pre-amp gain index (0-based; Solis 'Gain 3' = 2); -1 = the highest "
                          "the camera offers at this readout speed (897: Gain 3, 888: Gain 2)",

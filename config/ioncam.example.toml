@@ -37,7 +37,7 @@ em_gain = 50
 amplifier = "em"
 # horizontal readout rate [MHz]; the nearest available (by ratio) is used - 5 MHz is 10 MHz on an iXon Ultra 888 (30, 20, 10, 1 MHz)
 hs_speed_mhz = 10.0
-# vertical shift speed [us]; 0 = fastest recommended
+# vertical shift speed [us]; 0 = the camera's fastest recommended one (iXon Ultra 888: 1.13 us).  Faster ones are used only with vs_amplitude > 0: at normal voltage they garble the image (an 888 at 0.6 us)
 vs_speed_us = 0.0
 # vertical clock voltage: 0 = Normal, 1..4 = +1..+4
 vs_amplitude = 0
@@ -78,8 +78,8 @@ em_gain = 10
 amplifier = "em"
 # horizontal readout rate [MHz]; the nearest available (by ratio) is used - 5 MHz is 10 MHz on an iXon Ultra 888 (30, 20, 10, 1 MHz)
 hs_speed_mhz = 5.0
-# vertical shift speed [us]; 0 = fastest recommended
-vs_speed_us = 0.5
+# vertical shift speed [us]; 0 = the camera's fastest recommended one (iXon Ultra 888: 1.13 us).  Faster ones are used only with vs_amplitude > 0: at normal voltage they garble the image (an 888 at 0.6 us)
+vs_speed_us = 0.0
 # vertical clock voltage: 0 = Normal, 1..4 = +1..+4
 vs_amplitude = 0
 # pre-amp gain index (0-based; Solis 'Gain 3' = 2); -1 = the highest the camera offers at this readout speed (897: Gain 3, 888: Gain 2)
@@ -119,8 +119,8 @@ em_gain = 200
 amplifier = "em"
 # horizontal readout rate [MHz]; the nearest available (by ratio) is used - 5 MHz is 10 MHz on an iXon Ultra 888 (30, 20, 10, 1 MHz)
 hs_speed_mhz = 5.0
-# vertical shift speed [us]; 0 = fastest recommended
-vs_speed_us = 0.5
+# vertical shift speed [us]; 0 = the camera's fastest recommended one (iXon Ultra 888: 1.13 us).  Faster ones are used only with vs_amplitude > 0: at normal voltage they garble the image (an 888 at 0.6 us)
+vs_speed_us = 0.0
 # vertical clock voltage: 0 = Normal, 1..4 = +1..+4
 vs_amplitude = 0
 # pre-amp gain index (0-based; Solis 'Gain 3' = 2); -1 = the highest the camera offers at this readout speed (897: Gain 3, 888: Gain 2)

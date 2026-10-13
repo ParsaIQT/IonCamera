@@ -56,7 +56,7 @@ pip install git+https://github.com/m-labs/sipyco      # not on PyPI (ARTIQ envs 
 ioncam_gui --simulate          # GUI + simulated trap; use the "Simulation" tab to play
 ioncam_gui --simulate --sim-camera 888    # ... as an iXon Ultra 888 (1024 x 1024)
 aqctl_ioncam --simulate        # headless RPC server with the simulator
-pytest                         # 129 tests (~3 min), all on the simulator / emulated SDK
+pytest                         # 130 tests (~3 min), all on the simulator / emulated SDK
 ```
 
 ### The GUI
@@ -396,7 +396,7 @@ Your Solis readout settings map onto `[readout]` (the defaults):
 | Trigger: external | `trigger = "external"` (`fast_ext_trigger` optional) |
 | Readout mode: image | always image |
 | Exposure 0.0015 | `exposure = 0.0015` |
-| Vertical pixel shift speed 0.5 | `vs_speed_us = 0.5` (matched by value) |
+| Vertical pixel shift speed 0.5 | `vs_speed_us = 0`: the fastest speed the camera recommends at normal clock voltage (1.13 µs on an 888). A number is matched by ratio; a speed faster than recommended is used only with `vs_amplitude` > 0 |
 | Vertical clock voltage amplitude Normal | `vs_amplitude = 0` |
 | Horizontal readout rate 5 MHz | `hs_speed_mhz = 5.0` (matched by value) |
 | Pre-amplifier gain 3 | `preamp_gain_index = 2` |
@@ -521,6 +521,17 @@ start-up and the console say why. Usually either:
 
 A `terminate` request (from `artiq_ctlmgr`) closes `ioncam_gui` like any ARTIQ controller.
 
+**iXon Ultra 888: the long exposure, Verify and the armed readout look like nonsense,
+while live video is fine.** At 0.6 µs the 888 does not shift the charge unless the
+vertical clock voltage is raised (Andor's iXon Ultra 888 hardware guide). The 0.5 µs of
+the old locate and readout settings was 0.6 µs on the 888, so every one of those images
+was garbled, and the plan built from the garbled long exposure put the AQROI anywhere.
+Live video used the camera's fastest recommended speed, 1.13 µs. Now ioncam never shifts
+faster than the camera's fastest recommended speed at normal voltage, and says so once in
+the Events tab. To silence that, set `vs_speed_us = 0` under `[locate]` and `[readout]`
+in your `ioncam.toml`, or delete those lines. Then calibrate again. The GUI's vertical
+shift menu shows over-clocked speeds in brackets, as Solis does.
+
 **Every button fails with "Event loop is closed"** (versions before October 2026). The
 RPC server had failed to start, usually because sipyco was missing, and the GUI ran its
 actions through the server's event loop. The GUI hid the failure: start-up hung for 10 s,
@@ -592,7 +603,7 @@ These are worth knowing, because several would silently corrupt data:
 
 ## Tests
 
-`pytest` runs 129 tests in about 3 minutes, in the realistic regime (13k photons/s
+`pytest` runs 130 tests in about 3 minutes, in the realistic regime (13k photons/s
 per ion, blurred PSF with halo, laser scatter, surface defects):
 - chain physics against James' published values;
 - detector accuracy (photon-limited) and false-alarm rates at EM gain 1, 50 and 300,
@@ -615,7 +626,8 @@ per ion, blurred PSF with halo, laser scatter, surface defects):
   scattered spots in windows of their own; the quick fidelity estimate from bright
   shots against EMCCD shots with the ions really dark (alone and next to a bright ion);
 - the Andor driver's exact SDK call sequence on the emulated SDK, and an emulated
-  iXon Ultra 888 (1024 × 1024, 10 MHz for a 5 MHz setting, a missing pre-amp gain);
+  iXon Ultra 888 (1024 × 1024, 10 MHz for a 5 MHz setting, a missing pre-amp gain, no
+  vertical shift faster than recommended at normal clock voltage, said once);
 - a full stack over real sipyco RPC with concurrent clients; stray light taken for ions
   (the hint, a tight crop, a search region, a typed AQROI, the AQROI by hand and
   Calibrate + arm inside it);

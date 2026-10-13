@@ -281,6 +281,7 @@ class IonCamEngine:
 
         self._mode = IDLE
         self._applied: Optional[AppliedSettings] = None
+        self._camera_warned: set = set()    # camera settings warnings shown so far
         self._live = dataclasses.replace(config.live)
         self._readout = dataclasses.replace(config.readout)
         self._plan: Optional[ReadoutPlan] = None
@@ -452,6 +453,11 @@ class IonCamEngine:
             self.camera.stop()
         applied = self.camera.configure(settings, tag)
         old, self._applied = self._applied, applied
+        for w in applied.warnings:
+            # e.g. a readout speed this camera does not have: said once, not at every start
+            if w not in self._camera_warned:
+                self._camera_warned.add(w)
+                self.events.emit("camera_settings", "{} settings: {}".format(tag, w), "warning")
         if tag == "live" and _rebaseline_needed(old if old and old.tag == "live" else None,
                                                 applied):
             with self._tracker_lock:

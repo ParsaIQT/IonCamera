@@ -31,7 +31,8 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from ioncam.camera.base import (AcquisitionSettings, AppliedSettings, CameraBase,
-                                CameraError, normalize_roi, roi_to_sdk)
+                                CameraError, nearest_index as _nearest, normalize_roi,
+                                roi_to_sdk, vs_speed_index)
 
 logger = logging.getLogger(__name__)
 
@@ -92,17 +93,6 @@ def _text(value) -> str:
     if isinstance(v, bytes):
         return v.decode("ascii", errors="replace").strip("\x00 ")
     return str(v)
-
-
-def _nearest(values, target) -> int:
-    """Index of the value closest to ``target`` by ratio: readout speeds go in
-    factors, so 5 MHz asked of an iXon Ultra 888 (30, 20, 10, 1 MHz) is 10 MHz,
-    not 1 MHz (ten times slower); the 897 has 5 MHz itself."""
-    v = np.asarray(values, float)
-    t = float(target)
-    if t <= 0 or np.any(v <= 0):
-        return int(np.argmin(np.abs(v - t)))
-    return int(np.argmin(np.abs(np.log(v / t))))
 
 
 class AndorCamera(CameraBase):
@@ -252,6 +242,9 @@ class AndorCamera(CameraBase):
                                 for i in range(n_vs)]
         fast = self._try("GetFastestRecommendedVSSpeed", default=None)
         caps["vs_fastest_recommended_index"] = int(fast[0]) if fast else 0
+        if caps["vs_speeds_us"]:
+            caps["vs_fastest_recommended"] = caps["vs_speeds_us"][
+                min(caps["vs_fastest_recommended_index"], len(caps["vs_speeds_us"]) - 1)]
         n_pa = self._try("GetNumberPreAmpGains", default=1) or 1
         caps["preamp_gains"] = [float(self._try("GetPreAmpGain", i, default=1.0))
                                 for i in range(n_pa)]
@@ -317,10 +310,10 @@ class AndorCamera(CameraBase):
         self._call("SetHSSpeed", amp, hs_idx)
 
         vs_list = caps.get("vs_speeds_us") or [0.0]
-        if s.vs_speed_us <= 0:
-            vs_idx = caps.get("vs_fastest_recommended_index", 0)
-        else:
-            vs_idx = _nearest(vs_list, s.vs_speed_us)
+        vs_idx, note = vs_speed_index(vs_list, caps.get("vs_fastest_recommended_index", 0),
+                                      s.vs_speed_us, s.vs_amplitude)
+        if note:
+            warnings.append(note)
         self._call("SetVSSpeed", vs_idx)
         self._call("SetVSAmplitude", int(s.vs_amplitude),
                    tolerate=(DRV_NOT_AVAILABLE, DRV_NOT_SUPPORTED) if s.vs_amplitude == 0 else ())
@@ -399,8 +392,8 @@ class AndorCamera(CameraBase):
             preamp_gain=float(pa_values[pa]) if pa < len(pa_values) else 1.0,
             em_gain=em_gain, em_gain_range=em_range, tag=tag, warnings=warnings)
         self._applied = applied
-        for w_ in warnings:
-            logger.warning("configure(%s): %s", tag, w_)
+        for w_ in warnings:     # the engine reports them (once each)
+            logger.debug("configure(%s): %s", tag, w_)
         return applied
 
     def _choose_preamp(self, amp: int, hs_idx: int, requested: int, warnings: List[str]) -> int:

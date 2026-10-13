@@ -22,7 +22,9 @@ def test_config_roundtrip(tmp_path):
 
 def test_config_defaults_match_typical_grabber_settings():
     r = Config().readout
-    assert (r.exposure, r.em_gain, r.hs_speed_mhz, r.vs_speed_us) == (0.0015, 200, 5.0, 0.5)
+    # vertical shift: the camera's fastest recommended speed (0.5 us on an 897, 1.13 us on
+    # an 888, which garbles every image at 0.6 us and normal clock voltage)
+    assert (r.exposure, r.em_gain, r.hs_speed_mhz, r.vs_speed_us) == (0.0015, 200, 5.0, 0.0)
     assert (r.vs_amplitude, r.preamp_gain_index, r.hbin, r.vbin) == (0, -1, 4, 4)
     assert r.trigger == "external" and r.camera_link and r.baseline_clamp
     assert not r.frame_transfer       # exposure = set time, not trigger spacing
