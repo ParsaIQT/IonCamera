@@ -162,20 +162,25 @@ def test_ixon_ultra_888_readout_speeds():
 def test_ixon_ultra_888_vertical_shift_speed(tmp_path):
     """An iXon Ultra 888 does not shift the charge at 0.6 us without a higher
     vertical clock voltage (Andor's hardware guide), and the 0.5 us of the old
-    locate / readout settings was 0.6 us on it: the long exposure, the
-    verification and the armed readout were garbled while live video (the
-    fastest recommended speed) was fine.  At normal voltage nothing faster than
-    the camera's fastest recommended speed (1.13 us) is used, and it says so,
-    once; with a higher voltage it is the user's choice.  The 897 keeps 0.5 us."""
+    locate / readout settings was matched to 0.6 us on it: the long exposure,
+    the verification and the armed readout were garbled.  Now a speed the
+    camera has is used exactly as set (one faster than recommended at normal
+    voltage with a warning, never replaced), one it does not have is never
+    guessed (the fastest recommended, with a warning), and the default is the
+    fastest recommended.  Each warning is said once.  The 897 keeps 0.5 us."""
     from ioncam.camera.base import vs_speed_index
     from ioncam.camera.simulator import SimulatedCamera
     from ioncam.server import build
     s888, s897 = [0.6, 1.13, 2.2, 4.33], [0.3, 0.5, 0.9, 1.7, 3.3]
     assert vs_speed_index(s888, 1, 0.0, 0) == (1, "")
-    i, note = vs_speed_index(s888, 1, 0.5, 0)
-    assert i == 1 and "(0.6 us on this camera)" in note and "using 1.13 us" in note
-    assert vs_speed_index(s888, 1, 0.6, 2) == (0, "")        # a higher voltage: as asked
-    assert vs_speed_index(s888, 1, 2.0, 0) == (2, "")        # slower: as asked
+    i, note = vs_speed_index(s888, 1, 0.5, 0)                 # an 897 value: not guessed
+    assert i == 1 and "not one of this camera's" in note and "using 1.13 us" in note
+    i, note = vs_speed_index(s888, 1, 0.6, 0)                 # as set, with a warning
+    assert i == 0 and "faster than the 1.13 us" in note
+    assert vs_speed_index(s888, 1, 0.6, 2) == (0, "")         # a higher voltage: no warning
+    assert vs_speed_index(s888, 1, 2.2, 0) == (2, "")
+    i, note = vs_speed_index(s888, 3, 1.13, 0)                # a camera recommending 4.33 us
+    assert i == 1 and "faster than the 4.33 us" in note       # still gets the 1.13 us asked
     assert vs_speed_index(s897, 1, 0.5, 0) == (1, "")
     assert vs_speed_index(s897, 1, 0.0, 0) == (1, "")
 
@@ -191,15 +196,22 @@ def test_ixon_ultra_888_vertical_shift_speed(tmp_path):
             assert a.vs_speed_us == 1.13 and not any("vertical" in w for w in a.warnings)
         old = c.configure(cfg.readout.replace(vs_speed_us=0.5, **where), "readout")
         assert old.vs_speed_us == 1.13
-        assert any("needs a higher vertical clock voltage" in w for w in old.warnings)
+        assert any("not one of this camera's" in w for w in old.warnings)
+        fast = c.configure(cfg.readout.replace(vs_speed_us=0.6, **where), "readout")
+        assert fast.vs_speed_us == 0.6 and ("SetVSSpeed", (0,)) in c._sdk.calls
+        assert any("faster than the 1.13 us" in w for w in fast.warnings)
         boost = c.configure(cfg.readout.replace(vs_speed_us=0.6, vs_amplitude=2, **where),
                             "readout")
         assert boost.vs_speed_us == 0.6 and not any("vertical" in w for w in boost.warnings)
+        slow = c.configure(cfg.readout.replace(vs_speed_us=4.33, **where), "readout")
+        assert slow.vs_speed_us == 4.33 and not any("vertical" in w for w in slow.warnings)
     finally:
         c.close()
     sim = SimulatedCamera(cfg.simulator)
     a = sim.configure(cfg.readout.replace(vs_speed_us=0.5, **where), "readout")
-    assert a.vs_speed_us == 1.13 and any("vertical clock voltage" in w for w in a.warnings)
+    assert a.vs_speed_us == 1.13 and any("not one of this camera's" in w for w in a.warnings)
+    assert sim.configure(cfg.readout.replace(vs_speed_us=2.2, **where), "readout").vs_speed_us \
+        == 2.2
 
     # an old configuration file on an 888: said once in the event log, not at every start
     cfg.storage.data_dir = str(tmp_path)
@@ -211,7 +223,7 @@ def test_ixon_ultra_888_vertical_shift_speed(tmp_path):
         engine.update_live(exposure=0.04)
         engine.update_live(exposure=0.05)
         notes = [e for e in engine.events.since(0) if e["kind"] == "camera_settings"]
-        vs = [e for e in notes if "vertical clock voltage" in e["message"]]
+        vs = [e for e in notes if "vertical shift speed" in e["message"]]
         assert len(vs) == 1 and vs[0]["severity"] == "warning"
         assert engine.camera._applied.vs_speed_us == 1.13
     finally:

@@ -161,26 +161,31 @@ def vs_speed_index(speeds, fastest_recommended: int, requested_us: float,
                    amplitude: int) -> Tuple[int, str]:
     """The vertical shift speed to use: ``(index into speeds, warning or "")``.
 
-    ``requested_us`` 0 is the camera's fastest recommended speed (the SDK's
-    ``GetFastestRecommendedVSSpeed``).  At normal vertical clock voltage
-    (``amplitude`` 0) nothing faster is used: an over-clocked speed only shifts
-    the charge cleanly with a higher clock voltage - an iXon Ultra 888 does not
-    transfer it at all at 0.6 us (Andor's hardware guide) and every image
-    (long exposure, verification, armed readout) comes out garbled.
+    * 0: the camera's fastest recommended speed (``GetFastestRecommendedVSSpeed``).
+    * One of the camera's speeds: exactly that one.  Faster than recommended
+      at normal vertical clock voltage (``amplitude`` 0) it is still used, with
+      a warning: an over-clocked speed may need a higher voltage to shift the
+      charge cleanly (an iXon Ultra 888 at 0.6 us does not transfer it at all
+      and every image is garbled).
+    * A speed the camera does not have (an 897's 0.5 us on an 888): never
+      guessed - the fastest recommended one, with a warning.
     """
     rec = min(max(int(fastest_recommended), 0), len(speeds) - 1)
     if requested_us <= 0:
         return rec, ""
-    i = nearest_index(speeds, requested_us)
-    if amplitude > 0 or speeds[i] >= speeds[rec]:
-        return i, ""
-    here = "" if abs(speeds[i] - requested_us) <= 1e-6 * requested_us else \
-        " ({:g} us on this camera)".format(speeds[i])
-    return rec, ("vertical shift speed {:g} us{} needs a higher vertical clock voltage "
-                 "(at normal voltage the charge is not shifted cleanly: garbled images); "
-                 "using {:g} us, the fastest recommended - vs_speed_us = 0 asks for it, "
-                 "vs_amplitude +1..+4 allows faster (more clock-induced charge)".format(
-                     requested_us, here, speeds[rec]))
+    exact = [k for k, v in enumerate(speeds) if abs(v - requested_us) <= 0.02 * requested_us]
+    if not exact:
+        return rec, ("vertical shift speed {:g} us is not one of this camera's ({} us): using "
+                     "{:g} us, its fastest recommended - choose one in the Readout tab".format(
+                         requested_us, ", ".join("{:g}".format(v) for v in speeds),
+                         speeds[rec]))
+    i = exact[0]
+    if amplitude == 0 and speeds[i] < speeds[rec]:
+        return i, ("vertical shift speed {:g} us is faster than the {:g} us this camera "
+                   "recommends at normal vertical clock voltage: if images look smeared or "
+                   "garbled, raise the vertical clock voltage or choose a slower "
+                   "speed".format(speeds[i], speeds[rec]))
+    return i, ""
 
 
 @dataclass

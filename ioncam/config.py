@@ -414,6 +414,23 @@ class Config:
         setattr(sec, key, coerced)
         return coerced
 
+    def update(self, section: str, values: dict) -> dict:
+        """Set several options of one section together: coerced, an acquisition
+        section validated as a whole (nothing is changed if a value is
+        rejected), changed in place.  Returns the stored values."""
+        sec = self.section(section)
+        fdefs = {f.name: f for f in dataclasses.fields(sec)}
+        unknown = sorted(k for k in values if k not in fdefs)
+        if unknown:
+            raise KeyError("unknown key(s) {} in [{}]".format(", ".join(unknown), section))
+        coerced = {k: _coerce(v, _field_default(fdefs[k]), "{}.{}".format(section, k))
+                   for k, v in values.items()}
+        if isinstance(sec, AcquisitionSettings):
+            dataclasses.replace(sec, **coerced).validate()
+        for k, v in coerced.items():
+            setattr(sec, k, v)
+        return coerced
+
     def to_dict(self) -> dict:
         out = {}
         for name in SECTIONS:

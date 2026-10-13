@@ -16,6 +16,7 @@ import time
 import numpy as np
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
+from ioncam.camera.base import nearest_index, vs_speed_index
 from ioncam.gui import style
 from ioncam.gui.widgets import (EventList, ImagePanel, ShotHistogramPlot, SiteTable,
                                 StatTile, StatusBanner, TracePlot)
@@ -254,13 +255,18 @@ def format_plan(plan):
     if a:
         s = a["settings"]
         lines.append("")
-        lines.append("camera: exposure {:.4g} s, EM gain {}, {} MHz, VS {} us, pre-amp {}x".format(
-            a["exposure"], a["em_gain"], a["hs_speed_mhz"], a["vs_speed_us"], a["preamp_gain"]))
+        lines.append("camera (armed): exposure {:.4g} s, EM gain {}, {} MHz, VS {} us ({}), "
+                     "pre-amp {}x".format(
+                         a["exposure"], a["em_gain"], a["hs_speed_mhz"], a["vs_speed_us"],
+                         "Normal" if not s.get("vs_amplitude") else "+{}".format(
+                             s["vs_amplitude"]), a["preamp_gain"]))
         lines.append("        trigger {}, {}, Camera Link {}, frame transfer {}".format(
             s["trigger"], s["acquisition"], "on" if s["camera_link"] else "off",
             "on" if s["frame_transfer"] else "off"))
         lines.append("        readout {:.3g} ms -> minimum trigger period {:.3g} ms".format(
             1e3 * a["readout_time"], 1e3 * a["min_trigger_period"]))
+        for wtxt in a.get("warnings") or []:
+            lines.append("camera note: " + wtxt)
     adv = plan.get("binning_advice")
     if adv:
         lines.append("")
@@ -467,7 +473,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "verify": A("Verify", self._verify, "Ctrl+Shift+V", "verify",
                         "test frames with the current plan: every ion in its ROI, and the "
                         "shot histograms with a quick fidelity estimate"),
-            "arm": A("Arm", lambda: c("arm_readout"), "Ctrl+R", "bolt",
+            "arm": A("Arm", self._arm, "Ctrl+R", "bolt",
                      "external trigger + Camera Link with the current plan"),
             "disarm": A("Disarm", lambda: c("disarm_readout"), "Ctrl+D", "power",
                         "end the readout and go back to live video"),
@@ -792,15 +798,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.vs.addItem("fastest recommended" + (
                 " ({:g} us)".format(speeds[rec]) if rec < len(speeds) else ""), 0.0)
             for k, v in enumerate(speeds):
-                # over-clocked, as Solis brackets them: at normal clock voltage the
-                # camera uses the fastest recommended one instead (garbled images)
-                self.vs.addItem("[{:g} us] needs a higher clock voltage".format(v) if k < rec
-                                else "{:g} us".format(v), float(v))
-            self.vs.setToolTip("speeds in brackets are over-clocked: they need a higher "
-                               "vertical clock voltage (vs_amplitude of live, locate or "
-                               "readout in the settings) "
-                               "to shift the charge cleanly; without it the fastest "
-                               "recommended speed is used")
+                # faster than recommended, bracketed as Solis does: used as chosen
+                self.vs.addItem("[{:g} \u00b5s] faster than recommended".format(v) if k < rec
+                                else "{:g} \u00b5s".format(v), float(v))
+            self.vs.setToolTip("in brackets: faster than the camera recommends at normal "
+                               "vertical clock voltage - used as chosen, but if the image "
+                               "looks smeared or garbled raise the clock voltage "
+                               "(vs_amplitude) or choose a slower speed")
             vs = live.get("vs_speed_us", 0.0) or 0.0
             self.vs.setCurrentIndex(max(0, self.vs.findData(float(vs))))
             self.preamp.clear()
@@ -901,26 +905,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self.verify = QtWidgets.QCheckBox("verify")
         self.verify.setChecked(True)
         self.verify.setToolTip("test frames with the final settings before arming")
-        self.ro_exp = _spin(1e-5, 1.0, ro.get("exposure", 0.0015), 0.0005, " s", 5, width=110)
-        self.ro_gain = _spin(0, 1000, ro.get("em_gain", 200), width=80)
         self.keep_aqroi = QtWidgets.QCheckBox("inside the AQROI set by hand")
         self.keep_aqroi.setToolTip("Calibrate + arm keeps the AQROI made by hand: the ions "
                                    "are searched for only inside it and read out in it.  "
                                    "(Ions are always searched for only inside the camera ROI "
                                    "and the search region.)")
         calibrate = _group("Calibrate and run", [
-            _grid([["ions", self.n_ions, 12, "exposure", self.ro_exp],
-                   ["binning", _row(self.hbin, "x", self.vbin, None), 12, "EM gain",
-                    self.ro_gain],
-                   ["ROI per ion", _row(self.roi_w, "x", self.roi_h, None), 12, self.auto_bin,
-                    self.verify]]),
+            _grid([["ions", self.n_ions, 12, self.auto_bin],
+                   ["binning", _row(self.hbin, "x", self.vbin, None), 12, self.verify],
+                   ["ROI per ion", _row(self.roi_w, "x", self.roi_h, None)]]),
             _row(self.keep_aqroi, None),
             _row(_button("Calibrate + arm", self._calibrate, "locate -> plan AQROI/ROIs -> "
                          "verify -> external trigger + Camera Link (Ctrl+K)", "check",
                          "primary"), _tool(self.act["locate"]), None,
                  _tool(self.act["arm"]), _tool(self.act["disarm"])),
         ])
-        top = _page(chips, calibrate, self._manual_box())
+        top = _page(chips, calibrate, self._camera_box(), self._manual_box())
         self.plan_text = QtWidgets.QPlainTextEdit()
         self.plan_text.setReadOnly(True)
         f = QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.SystemFont.FixedFont)
@@ -955,6 +955,193 @@ class MainWindow(QtWidgets.QMainWindow):
         split.setSizes([500, 430])
         self.readout_split = split
         return split
+
+    def _camera_box(self):
+        """The camera settings of the long exposure (Locate, Calibrate) and of
+        the readout (Verify, armed), side by side.  Every choice is one the
+        camera has, and what is shown is what it uses: Apply stores them (an
+        armed readout is re-armed at once); Locate, Calibrate + arm, Verify and
+        Arm apply pending changes first.  The line below says what the camera
+        runs with now."""
+        self.acq = {}
+        self._acq_dirty = False
+        self._acq_filling = False
+        self._acq_shown = {}
+        self._acq_notes = {}
+        self._acq_now_key = None
+        for section in ("locate", "readout"):
+            long_exp = section == "locate"
+            c = {"exposure": _spin(1e-5, 60.0 if long_exp else 1.0, 0.01, 0.05 if long_exp
+                                   else 0.0005, " s", 5, width=110),
+                 "em_gain": _spin(0, 1000, 0, width=80, special="min",
+                                  tip="EM gain (camera.em_gain_mode units); min: the lowest"),
+                 "hs_speed_mhz": QtWidgets.QComboBox(),
+                 "vs_speed_us": QtWidgets.QComboBox(),
+                 "vs_amplitude": QtWidgets.QComboBox(),
+                 "preamp_gain_index": QtWidgets.QComboBox()}
+            c["vs_speed_us"].setToolTip(
+                "the camera's own vertical shift speeds.  In brackets: faster than the camera "
+                "recommends at normal vertical clock voltage - used as chosen, but if the "
+                "image looks smeared or garbled raise the clock voltage or choose a slower one")
+            c["vs_amplitude"].setToolTip("vertical clock voltage: Normal, or raised to shift "
+                                         "the charge cleanly at a fast vertical speed (more "
+                                         "clock-induced charge)")
+            for w in c.values():
+                sig = w.valueChanged if isinstance(w, QtWidgets.QAbstractSpinBox) else \
+                    w.currentIndexChanged
+                sig.connect(self._acq_edited)
+            self.acq[section] = c
+            self._fill_acq(section, self.config.get(section, {}))
+        rows = [[None, _muted("long exposure"), _muted("readout (verify, armed)")]]
+        for key, label in (("exposure", "exposure"), ("em_gain", "EM gain"),
+                           ("hs_speed_mhz", "horizontal readout"),
+                           ("vs_speed_us", "vertical shift"),
+                           ("vs_amplitude", "vertical clock voltage"),
+                           ("preamp_gain_index", "pre-amp")):
+            rows.append([label, self.acq["locate"][key], self.acq["readout"][key]])
+        self.acq_apply = _button("Apply", self._apply_acq, "store these settings: the long "
+                                 "exposure uses them from the next Locate / Calibrate, an armed "
+                                 "readout is re-armed with them at once", "check")
+        self.acq_state = style.chip(QtWidgets.QLabel(""))
+        self.acq_notes = QtWidgets.QLabel("")
+        self.acq_notes.setWordWrap(True)
+        self.acq_notes.setProperty("role", "warn")
+        self.acq_now = _muted("", wrap=True)
+        self._show_acq_state()
+        return _group("Camera: long exposure and readout", [
+            _grid(rows), _row(self.acq_apply, self.acq_state, None), self.acq_notes,
+            self.acq_now])
+
+    def _fill_acq(self, section, values):
+        """Show ``values`` (a [locate] / [readout] dict) with the camera's own
+        choices, selected as the camera will use them."""
+        caps = self._caps
+        c = self.acq[section]
+        notes = []
+        self._acq_filling = True
+        try:
+            c["exposure"].setValue(float(values.get("exposure", 0.0)))
+            c["em_gain"].setValue(int(values.get("em_gain", 0)))
+            want = float(values.get("hs_speed_mhz", 10.0))
+            hs = [float(v) for v in (caps.get("hs_speeds_mhz") or {}).get(
+                values.get("amplifier", "em"), [])] or [want]
+            box = c["hs_speed_mhz"]
+            box.clear()
+            for v in hs:
+                box.addItem("{:g} MHz".format(v), v)
+            k = nearest_index(hs, want)
+            box.setCurrentIndex(k)
+            if abs(hs[k] - want) > 0.02 * want:
+                notes.append("horizontal readout {:g} MHz is not one of this camera's; {:g} MHz "
+                             "is used".format(want, hs[k]))
+            want = float(values.get("vs_speed_us", 0.0))
+            vs = [float(v) for v in caps.get("vs_speeds_us") or []] or [max(want, 1.0)]
+            rec = min(int(caps.get("vs_fastest_recommended_index", 0)), len(vs) - 1)
+            box = c["vs_speed_us"]
+            box.clear()
+            for k, v in enumerate(vs):
+                box.addItem("[{:g} \u00b5s] faster than recommended".format(v) if k < rec else
+                            "{:g} \u00b5s{}".format(v, " (recommended)" if k == rec else ""), v)
+            k, note = vs_speed_index(vs, rec, want, 1)
+            box.setCurrentIndex(k)
+            if note:
+                notes.append("vertical shift {:g} \u00b5s is not one of this camera's; {:g} "
+                             "\u00b5s (recommended) is used".format(want, vs[k]))
+            box = c["vs_amplitude"]
+            box.clear()
+            for k in range(max(1, int(caps.get("n_vs_amplitudes", 5)))):
+                box.addItem("Normal" if k == 0 else "+{}".format(k), k)
+            box.setCurrentIndex(max(0, box.findData(int(values.get("vs_amplitude", 0)))))
+            box = c["preamp_gain_index"]
+            box.clear()
+            gains = caps.get("preamp_gains") or [1.0]
+            texts = caps.get("preamp_gain_texts") or []
+            box.addItem("highest ({:g}x)".format(gains[-1]), -1)
+            for k, g in enumerate(gains):
+                box.addItem("{} ({:g}x)".format(texts[k], g) if k < len(texts)
+                            else "{:g}x".format(g), k)
+            box.setCurrentIndex(max(0, box.findData(int(values.get("preamp_gain_index", -1)))))
+        finally:
+            self._acq_filling = False
+        self._acq_shown[section] = values
+        self._acq_notes[section] = notes
+
+    def _acq_values(self, section):
+        c = self.acq[section]
+        return {"exposure": float(c["exposure"].value()), "em_gain": int(c["em_gain"].value()),
+                "hs_speed_mhz": float(c["hs_speed_mhz"].currentData()),
+                "vs_speed_us": float(c["vs_speed_us"].currentData()),
+                "vs_amplitude": int(c["vs_amplitude"].currentData()),
+                "preamp_gain_index": int(c["preamp_gain_index"].currentData())}
+
+    def _acq_edited(self, *_):
+        if self._acq_filling:
+            return
+        self._acq_dirty = True
+        self._show_acq_state()
+
+    def _show_acq_state(self):
+        notes = ["{}: {}".format("long exposure" if s == "locate" else s, n)
+                 for s in ("locate", "readout") for n in self._acq_notes.get(s, [])]
+        if self._acq_dirty:
+            text, tone = "changed: Apply (Locate, Calibrate, Verify and Arm apply it first)", \
+                "warn"
+        elif notes:
+            text, tone = "in use, but the configuration differs: Apply stores what is shown", \
+                "warn"
+        else:
+            text, tone = "in use", "good"
+        self.acq_state.setText(text)
+        style.chip(self.acq_state, tone)
+        # what the configuration asks for and this camera does not have, said plainly
+        self.acq_notes.setText("\n".join(notes))
+        self.acq_notes.setVisible(bool(notes))
+
+    def _apply_acq(self):
+        """Store the camera settings of both columns (an armed readout is
+        re-armed with them at once)."""
+        for section in ("locate", "readout"):
+            self._cmd("set_acquisition", section, callback=self._acq_applied,
+                      **self._acq_values(section))
+        self._acq_dirty = False
+        self.acq_state.setText("applying...")
+
+    def _apply_pending(self):
+        """Pending camera settings first: the action after this uses them (the
+        calls run in order)."""
+        if self._acq_dirty:
+            self._apply_acq()
+
+    def _acq_applied(self, res):
+        section = res["section"]
+        self._acq_filling = True
+        try:
+            self._fill_acq(section, res["settings"])
+        finally:
+            self._acq_filling = False
+        self._show_acq_state()
+
+    def _show_acq_now(self, a):
+        """What the camera runs with now (the applied settings)."""
+        key = None if not a else (a.get("tag"), a.get("exposure"), a.get("em_gain"),
+                                  a.get("hs_speed_mhz"), a.get("vs_speed_us"),
+                                  tuple(a.get("warnings") or ()))
+        if key == self._acq_now_key:
+            return
+        self._acq_now_key = key
+        if not a:
+            self.acq_now.setText("")
+            return
+        amp = int((a.get("settings") or {}).get("vs_amplitude", 0))
+        h, w = a.get("frame_shape") or (0, 0)
+        text = ("camera now ({}): exposure {:.4g} s, EM gain {}, {:g} MHz, vertical {:g} \u00b5s "
+                "({}), pre-amp {:g}x, frame {}x{}".format(
+                    a.get("tag"), a["exposure"], a["em_gain"], a["hs_speed_mhz"],
+                    a["vs_speed_us"], "Normal" if amp == 0 else "+{}".format(amp),
+                    a["preamp_gain"], w, h))
+        for wtxt in a.get("warnings") or []:
+            text += "\n! " + wtxt
+        self.acq_now.setText(text)
 
     def _shots_box(self):
         """Histograms of the shots - the verification frames or the externally
@@ -1439,13 +1626,18 @@ class MainWindow(QtWidgets.QMainWindow):
             self._cmd("resume_tracking")
 
     def _locate(self):
+        self._apply_pending()
         self._cmd("locate_ions", self.n_ions.value(), callback=self._located)
 
+    def _arm(self):
+        self._apply_pending()
+        self._cmd("arm_readout", callback=self._got_plan)
+
     def _calibrate(self):
+        self._apply_pending()
         kw = dict(n_ions=self.n_ions.value(), hbin=self.hbin.value(), vbin=self.vbin.value(),
                   roi_size=self._roi_size(), auto_binning=self.auto_bin.isChecked(),
-                  verify=self.verify.isChecked(), exposure=self.ro_exp.value(),
-                  em_gain=self.ro_gain.value())
+                  verify=self.verify.isChecked())
         if self.keep_aqroi.isChecked() and self._plan:
             kw["aqroi"] = list(self._plan["aqroi"])
         self._cmd("calibrate_readout", callback=self._got_plan, **kw)
@@ -1478,6 +1670,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._cmd("resize_readout", dcols, drows, callback=self._got_plan)
 
     def _verify(self):
+        self._apply_pending()
         self._cmd("verify_readout", callback=self._got_plan)
 
     def _located(self, res):
@@ -1753,6 +1946,16 @@ class MainWindow(QtWidgets.QMainWindow):
         st = out["status"]
         self._status = st
         self.banner.update_status(st)
+        if not self._acq_dirty:
+            changed = False
+            for section in ("locate", "readout"):
+                cfg = st.get(section + "_settings")
+                if cfg and cfg != self._acq_shown.get(section):
+                    self._fill_acq(section, cfg)
+                    changed = True
+            if changed:
+                self._show_acq_state()
+        self._show_acq_now(st.get("settings"))
         self.bg_label.setText(_background_text(st.get("background")))
         fr = out.get("frame")
         if fr is not None:

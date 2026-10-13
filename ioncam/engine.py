@@ -283,7 +283,6 @@ class IonCamEngine:
         self._applied: Optional[AppliedSettings] = None
         self._camera_warned: set = set()    # camera settings warnings shown so far
         self._live = dataclasses.replace(config.live)
-        self._readout = dataclasses.replace(config.readout)
         self._plan: Optional[ReadoutPlan] = None
         self._plan_valid = False
         self._last_locate: Optional[dict] = None
@@ -643,6 +642,8 @@ class IonCamEngine:
             "frame_index": self._frame_index,
             "settings": a.to_dict() if a is not None else None,
             "live_settings": self._live.to_dict(),
+            "locate_settings": self.config.locate.to_dict(),
+            "readout_settings": self.config.readout.to_dict(),
             "ions": {k: snap.get(k) for k in ("state", "n_bright", "n_dark", "n_ions", "stable",
                                                "stable_for", "fluorescence_level",
                                                "marker_radius", "chain",
@@ -1058,8 +1059,7 @@ class IonCamEngine:
         if expected and loc["n_ions"] != expected and not force:
             raise ProcedureError("found {} ions but {} expected".format(loc["n_ions"], expected))
         if readout_overrides:
-            self._readout = self._readout.replace(**readout_overrides)
-            self._readout.validate()
+            self.config.update("readout", readout_overrides)
         rs = self._readout
         hb, vb = int(hbin or rs.hbin), int(vbin or rs.vbin)
         pos = np.array(loc["positions"], float)
@@ -1601,14 +1601,38 @@ class IonCamEngine:
     def temperature(self) -> Tuple[float, str]:
         return self._temperature
 
+    @property
+    def _readout(self) -> AcquisitionSettings:
+        """The readout settings: [readout] of the configuration, the one place
+        they are kept (the settings dialog, the Readout tab and calibrate's
+        overrides all change it)."""
+        return self.config.readout
+
+    def set_acquisition(self, section: str, **values) -> dict:
+        """Camera settings of the long exposure (``locate``) or the readout
+        (``readout``), several at once.  An armed readout is re-armed with them
+        at once, so the camera runs with what was set; the long exposure uses
+        them from the next Locate / Calibrate.  Returns the stored settings and
+        what the camera applied (when re-armed, else None)."""
+        if section not in ("locate", "readout"):
+            raise ValueError("section must be 'locate' or 'readout', not {!r}".format(section))
+
+        def run():
+            self.config.update(section, values)
+            applied = None
+            if section == "readout" and self._mode == READOUT and self._plan is not None:
+                self._arm_internal(self._plan)
+                applied = self._applied.to_dict() if self._applied is not None else None
+            return {"section": section, "settings": self.config.section(section).to_dict(),
+                    "applied": applied}
+        return self._call(run)
+
     def set_config(self, section: str, key: str, value) -> Any:
         v = self.config.set(section, key, value)
         if section == "live":
             self._live = self._live.replace(**{key: v})
             if self._mode == LIVE:
                 self._call(self._start_live_internal)
-        elif section == "readout":
-            self._readout = self._readout.replace(**{key: v})
         elif section == "camera" and key == "target_temperature":
             self._call(self.camera.set_temperature, v)
         return v

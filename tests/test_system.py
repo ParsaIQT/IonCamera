@@ -434,6 +434,49 @@ def test_stray_light_and_the_aqroi_by_hand(tmp_path):
         engine.shutdown()
 
 
+def test_readout_camera_settings_are_enforced(tmp_path):
+    """The camera settings of the readout are used exactly as set, on an
+    (emulated) iXon Ultra 888 whose camera recommends a slow vertical shift:
+    a speed it has is never replaced; set while armed it is re-armed at once;
+    calibrate's overrides, the settings dialog and set_acquisition all change
+    the one [readout] section."""
+    engine, server, port = make_system(tmp_path, backend="fake_sdk", camera_model="888")
+    sdk = engine.camera._sdk
+    try:
+        # a camera recommending its slowest speed (4.33 us): 1.13 us is still 1.13 us
+        engine.camera._caps["vs_fastest_recommended_index"] = 3
+        res = engine.set_acquisition("readout", vs_speed_us=1.13, vs_amplitude=0,
+                                     hs_speed_mhz=30.0)
+        assert res["applied"] is None and res["settings"]["vs_speed_us"] == 1.13
+        assert engine.config.readout.hs_speed_mhz == 30.0
+        assert engine.wait_for_ions(3, timeout=20)["ok"]
+        plan = engine.calibrate_readout(n_ions=3, exposure=0.002)
+        assert engine.config.readout.exposure == 0.002          # one [readout], not a copy
+        a = plan["applied"]
+        assert (a["vs_speed_us"], a["hs_speed_mhz"], a["exposure"]) == (1.13, 30.0, 0.002)
+        assert any("faster than the 4.33 us" in w for w in a["warnings"])
+        # set while armed: re-armed at once with them
+        start = len(sdk.calls)
+        res = engine.set_acquisition("readout", vs_speed_us=2.2, em_gain=150)
+        assert engine.status()["readout"]["armed"]
+        assert res["applied"]["vs_speed_us"] == 2.2 and res["applied"]["em_gain"] == 150
+        assert ("SetVSSpeed", (2,)) in sdk.calls[start:]
+        assert engine.readout_plan()["applied"]["vs_speed_us"] == 2.2
+        # the settings dialog (set_config) changes the same section
+        engine.set_config("readout", "vs_speed_us", 4.33)
+        assert engine.status()["readout_settings"]["vs_speed_us"] == 4.33
+        with pytest.raises(ValueError):
+            engine.set_acquisition("live", exposure=1.0)
+        with pytest.raises(KeyError):
+            engine.set_acquisition("readout", vs_speed=1.0)
+        with pytest.raises(ValueError):                         # rejected: nothing changes
+            engine.set_acquisition("readout", exposure=-1.0, em_gain=10)
+        assert engine.config.readout.em_gain == 150
+    finally:
+        server.stop()
+        engine.shutdown()
+
+
 def test_calibration_files_written(system, tmp_path_factory):
     engine, port = system
     d = os.path.join(engine.config.storage.data_dir, "calibrations")
@@ -454,9 +497,11 @@ def test_gui_smoke(tmp_path):
         pytest.skip("Qt not usable: {}".format(e))
     engine, server, port = make_system(tmp_path)
     backend = LocalBackend(server.api, server)
-    # error dialogs are modal: recorded instead (a test must not block on one)
+    # dialogs are modal: recorded instead (a test must not block on one)
     errors, warning = [], QtWidgets.QMessageBox.warning
+    infos, information = [], QtWidgets.QMessageBox.information
     QtWidgets.QMessageBox.warning = staticmethod(lambda *a, **k: errors.append(a[1:]))
+    QtWidgets.QMessageBox.information = staticmethod(lambda *a, **k: infos.append(a[1:]))
     try:
         win = MainWindow(backend, backend.call("get_config").result(10),
                          backend.call("get_info").result(10))
@@ -591,10 +636,52 @@ def test_gui_smoke(tmp_path):
             time.sleep(0.01)
         assert engine.config.calibration.verify_frames == 150
         dlg.close()
+        # the camera settings of the long exposure and the readout (Readout tab): the
+        # camera's own choices, and what is applied is what is used
+        vs = win.acq["readout"]["vs_speed_us"]
+        labels = [vs.itemText(k) for k in range(vs.count())]
+        assert labels[0].startswith("[0.3") and labels[1].endswith("(recommended)")
+        assert [vs.itemData(k) for k in range(vs.count())] == [0.3, 0.5, 0.9, 1.7, 3.3]
+        hs = win.acq["readout"]["hs_speed_mhz"]
+        assert [hs.itemData(k) for k in range(hs.count())] == [17.0, 10.0, 5.0, 1.0]
+        assert win.acq_state.text() == "in use"
+        vs.setCurrentIndex(vs.findData(0.9))
+        win.acq["locate"]["em_gain"].setValue(12)
+        assert win._acq_dirty and win.acq_state.text().startswith("changed")
+        win._apply_acq()
+        t = time.time()
+        while time.time() - t < 5.0 and (engine.config.readout.vs_speed_us != 0.9
+                                         or win.acq_state.text() != "in use"):
+            app.processEvents()
+            time.sleep(0.01)
+        assert engine.config.readout.vs_speed_us == 0.9 and engine.config.locate.em_gain == 12
+        assert win.acq_state.text() == "in use" and not win._acq_dirty
+        assert win.acq_now.text().startswith("camera now (live)")
+        # changed elsewhere (the settings dialog, ARTIQ): the tab follows
+        engine.set_config("readout", "vs_speed_us", 1.7)
+        t = time.time()
+        while time.time() - t < 5.0 and vs.currentData() != 1.7:
+            app.processEvents()
+            time.sleep(0.01)
+        assert vs.currentData() == 1.7
+        # pending changes go first: Locate uses what is shown
+        win.acq["locate"]["exposure"].setValue(0.3)
+        win._locate()
+        t = time.time()
+        while time.time() - t < 20.0 and engine.config.locate.exposure != 0.3:
+            app.processEvents()
+            time.sleep(0.01)
+        assert engine.config.locate.exposure == 0.3
+        t = time.time()
+        while time.time() - t < 30.0 and not infos:
+            app.processEvents()
+            time.sleep(0.02)
+        assert infos and "Located" in infos[0][1]
         assert not errors, errors
         win.close()
     finally:
         QtWidgets.QMessageBox.warning = warning
+        QtWidgets.QMessageBox.information = information
         backend.close()
         server.stop()
         engine.shutdown()

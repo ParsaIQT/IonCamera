@@ -377,6 +377,7 @@ QProgressBar {{ background: {input}; border: 1px solid {border}; border-radius: 
     max-height: 8px; text-align: center; }}
 QProgressBar::chunk {{ background: {accent}; border-radius: 3px; }}
 QLabel[role="muted"] {{ color: {muted}; }}
+QLabel[role="warn"] {{ color: {warning}; }}
 QLabel[role="heading"] {{ font-weight: 600; }}
 QLabel[role="chip"] {{ background: {surface2}; border: 1px solid {border}; border-radius: 9px;
     padding: 1px 9px; }}

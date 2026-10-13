@@ -489,6 +489,15 @@ class IonCamAPI:
         section's own description under ``""``."""
         return config_help()
 
+    async def set_acquisition(self, section, **settings):
+        """Camera settings of the long exposure ("locate") or the readout
+        ("readout"), several at once, e.g. set_acquisition("readout",
+        vs_speed_us=1.13, vs_amplitude=0, hs_speed_mhz=10.0).  A speed the
+        camera has is used exactly as given.  An armed readout is re-armed with
+        them at once.  Returns {"section", "settings", "applied"}."""
+        return _plain(await self._run(self._engine.set_acquisition, str(section),
+                                      **_settings(settings)))
+
     async def set_config(self, section, key, value):
         """Change one configuration option at runtime (not saved)."""
         return _plain(await self._run(self._engine.set_config, str(section), str(key), value))
