@@ -5,12 +5,17 @@ frame/status refresh, "cmd" for user actions) has one worker thread - for
 the remote backend each worker owns its own sipyco ``Client`` (clients are not
 thread-safe).  Results are delivered back to the GUI thread through a Qt
 signal.
+
+In the embedded mode the GUI does not depend on the RPC server it runs for
+ARTIQ: coroutine API methods run on an event loop of the worker's own, so the
+GUI works whether or not the server could start (``rpc_state`` says).
 """
 
 import asyncio
 import concurrent.futures
 import inspect
 import logging
+import threading
 import traceback
 
 from pyqtgraph.Qt import QtCore
@@ -34,6 +39,12 @@ class Backend:
 
     def describe(self):
         return ""
+
+    def rpc_state(self):
+        """The RPC server ARTIQ talks to, as seen from here: None, or a dict
+        with "state" (running / starting / failed / stopped / off / remote) and
+        "text"."""
+        return None
 
     def call(self, name, *args, callback=None, error=None, channel="cmd", **kwargs):
         """Call API method ``name`` in a worker; ``callback(result)`` runs in the GUI thread."""
@@ -86,26 +97,88 @@ class Backend:
 
 
 class LocalBackend(Backend):
-    """The API object lives in this process (embedded mode)."""
+    """The API object lives in this process (embedded mode).
+
+    ``server_thread``: the RPC server for ARTIQ (a ``ServerThread``, which
+    may have failed to start) or None.  ``on_rpc_stop(state, reason)`` is
+    called in the GUI thread when it stops on its own."""
 
     def __init__(self, api, server_thread=None):
         super().__init__()
         self.api = api
         self.server_thread = server_thread
+        self.on_rpc_stop = None
+        self._lock = threading.Lock()
+        self._tasks = set()             # (loop, task) of the coroutines running
+        self._closed = False
+        if server_thread is not None:
+            server_thread.on_stop = self._rpc_stopped
+
+    def _rpc_stopped(self, state, reason):      # in the server thread
+        def deliver():
+            if self.on_rpc_stop is not None:
+                self.on_rpc_stop(state, reason)
+        self._bridge.deliver.emit(deliver)
+
+    def rpc_state(self):
+        from ioncam.server import failure_hint
+        st = self.server_thread
+        if st is None:
+            return {"state": "off", "port": None, "reason": "started with --no-server",
+                    "hint": "", "text": "no RPC server (--no-server): ARTIQ cannot connect"}
+        out = {"state": st.state, "port": st.port, "reason": st.reason, "hint": ""}
+        if st.state == "running":
+            out["text"] = "RPC server on port {}: ARTIQ connects to target 'ioncam'".format(
+                st.port)
+        elif st.state == "starting":
+            out["text"] = "RPC server on port {} starting".format(st.port)
+        else:
+            out["text"] = "RPC server on port {} {}, ARTIQ cannot connect: {}".format(
+                st.port, st.state, st.reason)
+            if st.error is not None:
+                out["hint"] = failure_hint(st.error, st.port)
+        return out
 
     def describe(self):
-        if self.server_thread is not None:
-            return "local camera, RPC on port {}".format(self.server_thread.port)
-        return "local camera"
+        st = self.server_thread
+        if st is not None and st.state in ("running", "starting"):
+            return "local camera, RPC on port {}".format(st.port)
+        return "local camera, no RPC server"
 
     def _invoke(self, channel, name, args, kwargs):
         res = getattr(self.api, name)(*args, **kwargs)
         if inspect.iscoroutine(res):
-            if self.server_thread is not None and self.server_thread.loop is not None:
-                res = self.server_thread.run_coroutine(res)
-            else:
-                res = asyncio.run(res)
+            try:
+                res = asyncio.run(self._tracked(res))
+            except asyncio.CancelledError:
+                raise RuntimeError("{} cancelled: the GUI is closing".format(name)) from None
         return res
+
+    async def _tracked(self, coro):
+        """Run ``coro`` on this worker's own event loop, cancelled by close()."""
+        me = (asyncio.get_running_loop(), asyncio.current_task())
+        with self._lock:
+            if self._closed:
+                coro.close()
+                raise RuntimeError("the GUI is closing")
+            self._tasks.add(me)
+        try:
+            return await coro
+        finally:
+            with self._lock:
+                self._tasks.discard(me)
+
+    def close(self):
+        super().close()
+        with self._lock:
+            self._closed = True
+            tasks = list(self._tasks)
+        # e.g. a wait for ions: the process would otherwise not exit until it ends
+        for loop, task in tasks:
+            try:
+                loop.call_soon_threadsafe(task.cancel)
+            except RuntimeError:        # finished meanwhile
+                pass
 
 
 class RemoteBackend(Backend):
@@ -119,6 +192,9 @@ class RemoteBackend(Backend):
 
     def describe(self):
         return "remote {}:{}".format(self.host, self.port)
+
+    def rpc_state(self):
+        return {"state": "remote", "text": "connected to {}:{}".format(self.host, self.port)}
 
     def _client(self, channel):
         from sipyco.pc_rpc import Client

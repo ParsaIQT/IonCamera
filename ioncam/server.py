@@ -20,6 +20,7 @@ ARTIQ ``device_db.py``::
 
 import argparse
 import asyncio
+import errno
 import logging
 import sys
 import threading
@@ -87,59 +88,125 @@ async def serve(api, host, port, stop_event=None):
         await server.stop()
 
 
-class ServerThread:
-    """RPC server in a background thread (used by the GUI's embedded mode/tests)."""
+def failure_hint(exc, port):
+    """What to do about an RPC server that cannot start with ``exc``."""
+    if "sipyco" in str(exc):
+        return ("Install sipyco into this Python environment "
+                "(pip install git+https://github.com/m-labs/sipyco) and start ioncam again.")
+    if isinstance(exc, OSError) and exc.errno in (errno.EADDRINUSE, 10048):
+        return ("Another program listens on port {} - another ioncam_gui or aqctl_ioncam "
+                "(perhaps started by artiq_ctlmgr)?  Close it, or start ioncam with "
+                "another port (-p).".format(port))
+    return ""
 
-    def __init__(self, api, host, port):
+
+class ServerThread:
+    """RPC server in a background thread (the GUI's embedded mode, tests).
+
+    ``start`` waits until the server listens and raises when it cannot (sipyco
+    missing, the port in use, ...).  ``state`` is "starting", "running",
+    "failed" or "stopped" and ``reason`` says why it is not running.  A server
+    that stops on its own afterwards (a ``terminate`` request, an error) is
+    logged and reported to ``on_stop(state, reason)``, called in the server
+    thread.  Nothing else depends on the server's event loop: whoever embeds
+    it keeps working when it is gone.
+    """
+
+    def __init__(self, api, host, port, on_stop=None):
         self.api, self.host, self.port = api, host, port
+        self.on_stop = on_stop
         self.loop = None
-        self._stop = None
-        self._ready = threading.Event()
         self.error = None
+        self.state, self.reason = "starting", ""
+        self._stop = None
+        self._stopping = False
+        self._late = False          # start() gave up waiting: the thread reports
+        self._lock = threading.Lock()
+        self._ready = threading.Event()
         self.thread = threading.Thread(target=self._run, name="ioncam-rpc", daemon=True)
 
-    def start(self, timeout=10.0):
+    def start(self, timeout=30.0):
+        """Start the server and wait until it listens; raises if it cannot start.
+        After ``timeout`` (a very slow computer) it carries on starting in the
+        background and a failure is logged and reported to ``on_stop``."""
         self.thread.start()
-        self._ready.wait(timeout)
+        if not self._ready.wait(timeout):
+            with self._lock:
+                self._late = not self._ready.is_set()
+            if self._late:
+                logger.warning("the RPC server on port %d takes more than %.0f s to start; "
+                               "carrying on without waiting for it", self.port, timeout)
+                return self
         if self.error is not None:
             raise self.error
         return self
 
     def _run(self):
-        self.loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self.loop)
-        self._stop = asyncio.Event()
-
-        async def main():
-            server = make_server(self.api)
-            try:
-                await server.start(self.host, self.port)
-            except Exception as e:
-                self.error = e
-                self._ready.set()
-                return
-            self._ready.set()
-            waits = [asyncio.ensure_future(server.wait_terminate()),
-                     asyncio.ensure_future(self._stop.wait())]
-            try:
-                await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
-            finally:
-                for w in waits:
-                    w.cancel()
-                await server.stop()
+        how, exc = "error", None
         try:
-            self.loop.run_until_complete(main())
-        finally:
-            self.loop.close()
+            how = asyncio.run(self._main())
+        except BaseException as e:      # SystemExit too: _sipyco() when sipyco is missing
+            exc = RuntimeError(str(e.code)) if isinstance(e, SystemExit) else e
+        self._ended(how, exc)
 
-    def run_coroutine(self, coro, timeout=None):
-        """Run a coroutine (e.g. an async API method) on the server loop."""
-        return asyncio.run_coroutine_threadsafe(coro, self.loop).result(timeout)
+    async def _main(self):
+        self.loop = asyncio.get_running_loop()
+        self._stop = asyncio.Event()
+        server = make_server(self.api)
+        await server.start(self.host, self.port)
+        with self._lock:
+            self.state = "running"
+            self._ready.set()
+        if self._stopping:
+            await server.stop()
+            return "stop"
+        waits = [asyncio.ensure_future(server.wait_terminate()),
+                 asyncio.ensure_future(self._stop.wait())]
+        try:
+            done, _ = await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for w in waits:
+                w.cancel()
+            await server.stop()
+        return "terminate" if waits[0] in done and not self._stopping else "stop"
+
+    def _ended(self, how, exc):
+        with self._lock:
+            starting = not self._ready.is_set()
+            if exc is not None:
+                self.state, self.error = "failed", exc
+                self.reason = str(exc) or type(exc).__name__
+            elif how == "terminate":
+                self.state, self.reason = "stopped", "terminated by an RPC client"
+            else:
+                self.state, self.reason = "stopped", "stopped"
+            # start() raises a failure to start, unless it gave up waiting
+            report = (not self._stopping and self.reason != "stopped"
+                      and (self._late or not starting))
+            self._ready.set()
+        if not report:
+            return
+        if self.state == "failed":
+            logger.error("the RPC server on port %d failed, ARTIQ cannot connect: %s",
+                         self.port, self.reason, exc_info=None if starting else exc)
+        else:
+            logger.warning("the RPC server on port %d stopped: %s", self.port, self.reason)
+        if self.on_stop is not None:
+            try:
+                self.on_stop(self.state, self.reason)
+            except Exception:
+                logger.exception("RPC server on_stop callback failed")
 
     def stop(self):
-        if self.loop is not None and self._stop is not None and not self.loop.is_closed():
-            self.loop.call_soon_threadsafe(self._stop.set)
-        self.thread.join(timeout=5.0)
+        self._stopping = True
+        loop, ev = self.loop, self._stop
+        if loop is not None and ev is not None:
+            try:
+                loop.call_soon_threadsafe(ev.set)
+            except RuntimeError:        # the loop is already closed
+                pass
+        if self.thread.ident is not None:
+            self.thread.join(timeout=5.0)
 
 
 def build(config, simulate=False):

@@ -393,10 +393,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.busy_bar.setFixedWidth(120)
         self.busy_bar.setTextVisible(False)
         self.busy_bar.hide()
+        self.rpc_chip = style.chip(QtWidgets.QLabel(""))
         self.statusBar().addWidget(self.hover_label, 1)
         self.statusBar().addPermanentWidget(self.busy_bar)
         self.statusBar().addPermanentWidget(self.msg_label)
+        self.statusBar().addPermanentWidget(self.rpc_chip)
         self._restore_layout()
+        backend.on_rpc_stop = self._rpc_stopped
+        self._show_rpc()
+        if (backend.rpc_state() or {}).get("state") == "failed":
+            QtCore.QTimer.singleShot(0, self._rpc_warning)
 
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self._poll)
@@ -1305,6 +1311,45 @@ class MainWindow(QtWidgets.QMainWindow):
         if name != "refresh":
             QtWidgets.QMessageBox.warning(self, "ioncam", "{} failed:\n{}".format(name, exc))
 
+    # ------------------------------------------------------------ RPC server
+    def _show_rpc(self):
+        """The status-bar chip of the RPC server ARTIQ talks to."""
+        rpc = self.backend.rpc_state()
+        if rpc is None:
+            self.rpc_chip.hide()
+            return
+        state = rpc["state"]
+        text, tone = {"running": ("RPC :{}".format(rpc.get("port")), "good"),
+                      "starting": ("RPC starting", "warn"),
+                      "failed": ("RPC failed", "bad"),
+                      "stopped": ("RPC stopped", "bad"),
+                      "remote": ("remote", "")}.get(state, ("RPC off", ""))
+        tip = rpc["text"] + ("\n" + rpc["hint"] if rpc.get("hint") else "")
+        if (self.rpc_chip.text(), self.rpc_chip.toolTip()) != (text, tip):
+            self.rpc_chip.setText(text)
+            self.rpc_chip.setToolTip(tip)
+            style.chip(self.rpc_chip, tone)
+
+    def _rpc_warning(self):
+        rpc = self.backend.rpc_state() or {}
+        QtWidgets.QMessageBox.warning(
+            self, "ioncam",
+            "The RPC server on port {} is not running, so ARTIQ cannot connect to ioncam:\n\n"
+            "{}\n\n{}The camera and this window work without it.".format(
+                rpc.get("port"), rpc.get("reason"),
+                rpc["hint"] + "\n\n" if rpc.get("hint") else ""))
+
+    def _rpc_stopped(self, state, reason):
+        """The RPC server stopped on its own: a terminate request (from
+        artiq_ctlmgr) closes ioncam like any ARTIQ controller; anything else
+        is reported."""
+        self._show_rpc()
+        if state == "stopped":
+            self.msg_label.setText("RPC server: {}; closing".format(reason))
+            self.close()
+        else:
+            self._rpc_warning()
+
     def _learn_background(self):
         self._cmd("learn_background", self.bg_frames.value(), not self.bg_dark.isChecked())
 
@@ -1823,6 +1868,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _slow_tick(self):
         self.trace.redraw()
+        self._show_rpc()
         if self.tabs.currentWidget() is self.readout_page:
             self._refresh_hist()
 

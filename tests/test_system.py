@@ -1,7 +1,9 @@
 """End to end: engine + sipyco RPC server + clients (as ARTIQ would use it)."""
 
+import errno
 import os
 import socket
+import sys
 import threading
 import time
 
@@ -359,6 +361,12 @@ def test_turning_the_trap_starts_afresh(tmp_path):
         server.api.sim_set_params(trap_angle_deg=90)
         assert engine.background_info() is None
         time.sleep(4.0)
+        # a cloud candidate of a frame or two is never reported, but may still be
+        # counted at this instant on a busy computer
+        t = time.time()
+        while time.time() - t < 8.0 and not (engine.tracker.n_bright == 3
+                                              and engine.tracker.n_clouds == 0):
+            time.sleep(0.05)
         kinds = [e["kind"] for e in engine.events.since(last)]
         assert "background_cleared" in kinds and "ions_detected" in kinds
         assert not {"cloud_detected", "ion_lost", "ion_trapped"} & set(kinds)
@@ -459,6 +467,7 @@ def test_gui_smoke(tmp_path):
             time.sleep(0.01)
         assert win.image.img.image is not None
         assert "ion" in win.banner.count.text()
+        assert win.rpc_chip.text() == "RPC :{}".format(port)
         x0, y0, x1, y1 = win.image.visible_sensor_rect()
         assert x0 <= 170 and x1 >= 350          # whole live ROI visible
         # brightness levels dragged by hand stay put (auto levels switch off)
@@ -588,4 +597,133 @@ def test_gui_smoke(tmp_path):
         QtWidgets.QMessageBox.warning = warning
         backend.close()
         server.stop()
+        engine.shutdown()
+
+
+def _pump(app, until, timeout=5.0):
+    t = time.time()
+    while time.time() - t < timeout and not until():
+        app.processEvents()
+        time.sleep(0.01)
+    return until()
+
+
+def test_gui_works_without_the_rpc_server(tmp_path, monkeypatch, caplog):
+    """The GUI does not depend on the RPC server it runs for ARTIQ: with
+    sipyco missing, the port in use, a server that fails after a slow start or
+    one stopped by a terminate request, every action still works and the
+    reason is shown.  (It used to hang 10 s at start-up and then fail every
+    action with "Event loop is closed".)"""
+    pytest.importorskip("pyqtgraph")
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    try:
+        import pyqtgraph as pg
+        from pyqtgraph.Qt import QtWidgets
+        from ioncam.gui.backend import LocalBackend
+        from ioncam.gui.main_window import MainWindow
+        app = pg.mkQApp("ioncam-test")
+    except Exception as e:  # pragma: no cover - no usable Qt
+        pytest.skip("Qt not usable: {}".format(e))
+    from ioncam import server as server_mod
+    cfg = Config()
+    cfg.storage.data_dir = str(tmp_path)
+    cfg.simulator.seed = 5
+    engine, api = build(cfg, simulate=True)
+    engine.start()
+    errors, warning = [], QtWidgets.QMessageBox.warning
+    QtWidgets.QMessageBox.warning = staticmethod(lambda *a, **k: errors.append(a[1:]))
+    backends, servers = [], []
+
+    def backend_for(st):
+        b = LocalBackend(api, st)
+        backends.append(b)
+        if st is not None:
+            servers.append(st)
+        return b
+
+    def actions_work(b):
+        b.call("stop").result(10)
+        assert b.call("start_live").result(10)["frame_shape"]
+        b.call("set_exposure", 0.04).result(10)
+        b.call("set_config", "detection", "threshold_sigma", 7.0).result(10)
+
+    try:
+        # sipyco missing: fails at once, says so, the GUI works
+        with monkeypatch.context() as m:
+            m.setitem(sys.modules, "sipyco.pc_rpc", None)
+            st = ServerThread(api, ["localhost"], free_port())
+            b = backend_for(st)
+            t = time.time()
+            with pytest.raises(RuntimeError, match="sipyco"):
+                st.start()
+            assert time.time() - t < 5.0
+        rpc = b.rpc_state()
+        assert rpc["state"] == "failed" and "pip install" in rpc["hint"]
+        actions_work(b)
+        win = MainWindow(b, b.call("get_config").result(10), b.call("get_info").result(10))
+        win.show()
+        assert _pump(app, lambda: errors)               # told once, at start-up
+        assert "ARTIQ cannot connect" in errors[0][1] and "sipyco" in errors[0][1]
+        assert win.rpc_chip.text() == "RPC failed"
+        errors.clear()
+        win._cmd("set_exposure", 0.05)
+        assert _pump(app, lambda: win.msg_label.text() == "set_exposure: ok")
+        assert not errors, errors
+        win.close()
+
+        # the port in use
+        port = free_port()
+        st1 = ServerThread(api, ["localhost"], port).start()
+        servers.append(st1)
+        st2 = ServerThread(api, ["localhost"], port)
+        b = backend_for(st2)
+        with pytest.raises(OSError):
+            st2.start()
+        assert "port {}".format(port) in b.rpc_state()["hint"]
+        actions_work(b)
+
+        # a terminate request (artiq_ctlmgr) closes ioncam like any controller
+        b = backend_for(st1)
+        win = MainWindow(b, b.call("get_config").result(10), b.call("get_info").result(10))
+        win.show()
+        assert _pump(app, lambda: win.rpc_chip.text() == "RPC :{}".format(port))
+        c = Client("localhost", port, "ioncam", timeout=10)
+        c.terminate()
+        c.close_rpc()
+        assert _pump(app, lambda: not win.isVisible())
+        assert st1.state == "stopped" and not errors
+        actions_work(b)
+
+        # a server that fails after start() gave up waiting: logged and reported
+        def slow_failure(api):
+            time.sleep(0.4)
+            raise OSError(errno.EADDRINUSE, "address already in use")
+        monkeypatch.setattr(server_mod, "make_server", slow_failure)
+        st = ServerThread(api, ["localhost"], free_port())
+        b = backend_for(st)
+        stopped = []
+        b.on_rpc_stop = lambda *a: stopped.append(a)
+        st.start(timeout=0.05)
+        assert st.state == "starting" and b.rpc_state()["state"] == "starting"
+        assert _pump(app, lambda: stopped)
+        assert stopped[0][0] == "failed" and "already in use" in stopped[0][1]
+        assert "ARTIQ cannot connect" in caplog.text
+        actions_work(b)
+
+        # closing the GUI cancels a long wait (the process could not exit)
+        b = backend_for(None)
+        assert b.rpc_state()["state"] == "off"
+        fut = b.call("wait_for_ions", 50, 3600.0, channel="wait")
+        time.sleep(0.3)
+        t = time.time()
+        b.close()
+        with pytest.raises(RuntimeError, match="closing"):
+            fut.result(5)
+        assert time.time() - t < 5.0
+    finally:
+        QtWidgets.QMessageBox.warning = warning
+        for b in backends:
+            b.close()
+        for st in servers:
+            st.stop()
         engine.shutdown()

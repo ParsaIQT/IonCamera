@@ -55,11 +55,21 @@ def show(backend):
 
 
 def run_embedded(engine, api, bind, port, server=True):
-    """GUI + RPC server in this process for an already started engine."""
+    """GUI + RPC server in this process for an already started engine.
+
+    The GUI does not need the RPC server: when the server cannot start
+    (sipyco missing, the port in use, ...) the GUI runs and says why ARTIQ
+    cannot connect."""
     from ioncam.gui.backend import LocalBackend
     from ioncam.server import ServerThread
-    st = ServerThread(api, bind, port).start() if server else None
+    st = ServerThread(api, bind, port) if server else None
     backend = LocalBackend(api, st)
+    if st is not None:
+        try:
+            st.start()
+        except Exception as e:
+            logging.getLogger("ioncam").error(
+                "the RPC server could not start on port %d, ARTIQ cannot connect: %s", port, e)
     try:
         show(backend)
     finally:

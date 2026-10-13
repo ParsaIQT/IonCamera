@@ -56,7 +56,7 @@ pip install git+https://github.com/m-labs/sipyco      # not on PyPI (ARTIQ envs 
 ioncam_gui --simulate          # GUI + simulated trap; use the "Simulation" tab to play
 ioncam_gui --simulate --sim-camera 888    # ... as an iXon Ultra 888 (1024 x 1024)
 aqctl_ioncam --simulate        # headless RPC server with the simulator
-pytest                         # 128 tests (~3 min), all on the simulator / emulated SDK
+pytest                         # 129 tests (~3 min), all on the simulator / emulated SDK
 ```
 
 ### The GUI
@@ -101,13 +101,16 @@ With the real camera on the camera PC (Windows):
    `pip install -e ".[gui]"` (if you installed it with `pip install .` before, first
    `pip uninstall ioncam`). Then a `git pull` is all an update takes - just restart
    `ioncam_gui` / `aqctl_ioncam`; re-run the pip command only if the dependencies
-   changed. The window title (and `get_version()`) shows the commit that is running,
+   changed. Install sipyco into the same Python too
+   (`pip install git+https://github.com/m-labs/sipyco`, which needs git; ARTIQ
+   environments already have it): without it ARTIQ cannot connect, and the GUI says so. The window title (and `get_version()`) shows the commit that is running,
    e.g. `1.0.0 (git dd10636)`; `installed copy` means a copy in site-packages that does
    not follow the checkout. (Without installing at all, `python -m ioncam.gui.app` and
    `python -m ioncam.server` run straight from the checkout.)
 2. `aqctl_ioncam --write-config ioncam.toml`, then edit it. Every option is commented.
 3. `ioncam_gui -c ioncam.toml` opens the camera, starts live video and serves RPC on port
-   3270. Alternatively run `aqctl_ioncam -c ioncam.toml --bind '*'` headless, and from
+   3270: the chip at the right end of the status bar reads **RPC :3270** when ARTIQ can
+   connect (see [Troubleshooting](#troubleshooting) otherwise). Alternatively run `aqctl_ioncam -c ioncam.toml --bind '*'` headless, and from
    any PC `ioncam_gui --host <camera-pc>`.
 4. Add the controller to ARTIQ's `device_db.py` (see `examples/artiq/device_db_ioncam.py`):
 
@@ -504,6 +507,26 @@ is by default the highest the camera offers at that speed (`preamp_gain_index = 
 Gain 3 on an 897, Gain 2 on an 888). The plan's `applied` settings show what the camera
 uses.
 
+## Troubleshooting
+
+**The status bar says *RPC failed* or *RPC stopped*.** The GUI and the camera work, but
+ARTIQ cannot connect: the RPC server on port 3270 is not running. Its tooltip, a dialog at
+start-up and the console say why. Usually either:
+- sipyco is not installed in the Python that runs ioncam. Check with
+  `python -c "import sipyco.pc_rpc"`, and install it as in step 1 above.
+- Another program listens on the port: a second `ioncam_gui`, or an `aqctl_ioncam`
+  started by `artiq_ctlmgr` from the `command` of the device_db entry. Either let
+  `artiq_ctlmgr` run `aqctl_ioncam` and watch it with `ioncam_gui --host localhost`, or
+  drop the `command` and run `ioncam_gui` yourself. `-p` picks another port.
+
+A `terminate` request (from `artiq_ctlmgr`) closes `ioncam_gui` like any ARTIQ controller.
+
+**Every button fails with "Event loop is closed"** (versions before October 2026). The
+RPC server had failed to start, usually because sipyco was missing, and the GUI ran its
+actions through the server's event loop. The GUI hid the failure: start-up hung for 10 s,
+then the image kept updating but every button failed. The GUI now runs its actions
+itself and says why the server is not running, as above.
+
 ## Taking over
 
 * `hold_tracking("shuttle", 30)` … `resume_tracking()`: no loss alarms while ions move
@@ -569,7 +592,7 @@ These are worth knowing, because several would silently corrupt data:
 
 ## Tests
 
-`pytest` runs 128 tests in about 3 minutes, in the realistic regime (13k photons/s
+`pytest` runs 129 tests in about 3 minutes, in the realistic regime (13k photons/s
 per ion, blurred PSF with halo, laser scatter, surface defects):
 - chain physics against James' published values;
 - detector accuracy (photon-limited) and false-alarm rates at EM gain 1, 50 and 300,
@@ -600,4 +623,6 @@ per ion, blurred PSF with halo, laser scatter, surface defects):
   display rotation, ROI labels, the shot histograms, the trap-rotation buttons, the
   overlays one kind at a time, the actions that can run, the event filter, saving the
   image, both themes, an option changed in the settings dialog, New AQROI, the size pad,
-  Place by click and the search region).
+  Place by click and the search region), and the GUI without its RPC server (sipyco
+  missing, the port in use, a server failing after a slow start, a terminate request)
+  and closing it during a long wait.
