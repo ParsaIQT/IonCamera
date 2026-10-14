@@ -228,3 +228,47 @@ def test_ixon_ultra_888_vertical_shift_speed(tmp_path):
         assert engine.camera._applied.vs_speed_us == 1.13
     finally:
         engine.shutdown()
+
+
+def test_shutter_fan_and_electrons_per_count(cam):
+    """Shutter and fan through the real driver (SetShutterEx when the camera
+    controls the internal and external shutters separately), and the
+    electrons per count of the readout speed and pre-amp gain in use, asked of
+    the camera (GetSensitivity in the argument order of Andor's header:
+    channel, horizontal speed index, amplifier, pre-amp) unless configured."""
+    c, sdk, cfg = cam
+    caps = c.capabilities()
+    assert caps["shutter"] == {"control": True, "independent": True, "internal": True,
+                               "min_close_ms": 27, "min_open_ms": 27}
+    assert caps["fan"] == {"control": True, "low": True}
+    start = len(sdk.calls)
+    c.set_shutter("closed", "series", False, 27, 30)
+    # SetShutterEx(typ, mode, closingtime, openingtime, extmode)
+    assert ("SetShutterEx", (0, 2, 30, 27, 5)) in sdk.calls[start:]
+    assert sdk.sim.shutter == "closed"
+    c.set_shutter("open")
+    c.set_fan("low")
+    c.set_fan("full")
+    assert [a for n, a in sdk.calls[start:] if n == "SetFanMode"] == [(1,), (0,)]
+    with pytest.raises(CameraError):
+        c.set_shutter("ajar")
+    with pytest.raises(CameraError):
+        c.set_fan("turbo")
+
+    where = dict(roi=(244, 156, 284, 180), trigger="internal")
+    a = c.configure(cfg.readout.replace(**where), "readout")       # 5 MHz, "Gain 3"
+    assert ("GetSensitivity", (0, 2, 0, 2)) in sdk.calls
+    assert (a.sensitivity, a.sensitivity_source, a.em_gain_real) == (4.0, "camera", True)
+    assert a.pe_factor == pytest.approx(4.0 / (a.exposure * a.em_gain))
+    b = c.configure(cfg.readout.replace(preamp_gain_index=0, **where), "readout")
+    assert b.sensitivity == 12.0                                  # "Gain 1": 3x the electrons
+    # normalised brightness is photoelectrons/s: the same whatever the gain settings
+    assert a.gain_factor * a.pe_factor == pytest.approx(1.0)
+    assert b.gain_factor * b.pe_factor == pytest.approx(1.0)
+    c.cfg.sensitivity = 3.7                                       # the performance sheet's
+    d = c.configure(cfg.readout.replace(**where), "readout")
+    assert (d.sensitivity, d.sensitivity_source) == (3.7, "configuration")
+    c.cfg.sensitivity = 0.0
+    c.cfg.em_gain_mode = 0                                        # DAC units: not the gain
+    e = c.configure(cfg.readout.replace(**where), "readout")
+    assert not e.em_gain_real and e.pe_factor == 0.0

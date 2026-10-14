@@ -39,8 +39,9 @@ from scipy.signal import fftconvolve
 from scipy.special import erfc, ndtr
 
 from ioncam.analysis.chain import equilibrium_positions
-from ioncam.camera.base import (AcquisitionSettings, AppliedSettings, CameraBase,
-                                CameraError, nearest_index, normalize_roi, vs_speed_index)
+from ioncam.camera.base import (FAN_MODES, SHUTTER_MODES, AcquisitionSettings,
+                                AppliedSettings, CameraBase, CameraError, nearest_index,
+                                normalize_roi, vs_speed_index)
 
 # The simulated camera (``simulator.camera_model``): sensor, readout speeds and gains.
 CAMERA_MODELS = {
@@ -482,8 +483,9 @@ class IonTrapScene:
         return sub.reshape(h, vbin, w, hbin).sum(axis=(1, 3), dtype=np.float64)
 
     def expected_electrons(self, roi, hbin: int, vbin: int, exposure: float,
-                           now: Optional[float] = None) -> np.ndarray:
-        """Mean photo-electrons (and dark electrons) per (binned) pixel for one exposure."""
+                           now: Optional[float] = None, light: bool = True) -> np.ndarray:
+        """Mean photo-electrons (and dark electrons) per (binned) pixel for one
+        exposure; ``light`` False: the shutter is closed (dark electrons only)."""
         now = self.clock() if now is None else now
         cfg = self.cfg
         x0, y0, x1, y1 = roi
@@ -498,6 +500,8 @@ class IonTrapScene:
                 laser = max(0.0, cfg.laser_power *
                             (1.0 + cfg.laser_noise * float(self.rng.standard_normal())))
             img = self._bin(self.dark_map, roi, hbin, vbin) * exposure
+            if not light:
+                return img
             img += self.background_rate * exposure * qe * hbin * vbin
             if laser > 0:
                 img += self._bin(self.laser_map, roi, hbin, vbin) * (laser * exposure * qe)
@@ -597,6 +601,8 @@ class SimulatedCamera(CameraBase):
         self._read_noise = cfg.read_noise_e
         self.last_frame: Optional[np.ndarray] = None
         self.camera_link_enabled = False
+        self.shutter = "open"
+        self.fan = "full"
         # thermal model
         self._temp = 20.0
         self._target = -60.0
@@ -619,6 +625,9 @@ class SimulatedCamera(CameraBase):
         return {"hs_speeds_mhz": {k: list(v) for k, v in m["hs"].items()},
                 "vs_speeds_us": list(m["vs"]), "vs_fastest_recommended": m["vs"][m["vs_fastest"]],
                 "vs_fastest_recommended_index": m["vs_fastest"],
+                "shutter": {"control": True, "independent": True, "internal": True,
+                            "min_close_ms": 27, "min_open_ms": 27},
+                "fan": {"control": True, "low": True},
                 "preamp_gains": list(m["preamp"]), "em_gain_range": list(m["em_gain"]),
                 "temperature_range": [-100, 20]}
 
@@ -668,8 +677,20 @@ class SimulatedCamera(CameraBase):
             accumulate_cycle=cycle, kinetic_cycle=cycle, readout_time=ro,
             keep_clean_time=0.0 if (settings.frame_transfer and internal) else keep_clean,
             hs_speed_mhz=hs, vs_speed_us=vs, preamp_gain=gains[pa_index],
-            em_gain=gain, em_gain_range=em_range, tag=tag, warnings=warnings)
+            em_gain=gain, em_gain_range=em_range, tag=tag, warnings=warnings,
+            sensitivity=self._sensitivity, sensitivity_source="simulator")
         return self._applied
+
+    def set_shutter(self, mode: str = "open", external: str = "open", ttl_high: bool = True,
+                    open_ms: int = 0, close_ms: int = 0) -> None:
+        if mode not in SHUTTER_MODES or external not in SHUTTER_MODES:
+            raise CameraError("shutter mode must be one of {}".format(", ".join(SHUTTER_MODES)))
+        self.shutter = mode
+
+    def set_fan(self, mode: str) -> None:
+        if mode not in FAN_MODES:
+            raise CameraError("fan mode must be one of {}".format(", ".join(FAN_MODES)))
+        self.fan = mode
 
     def start(self) -> None:
         if self._applied is None:
@@ -798,7 +819,9 @@ class SimulatedCamera(CameraBase):
     def _render(self, applied: AppliedSettings, t: float) -> np.ndarray:
         s = applied.settings
         self.scene.advance(t)
-        el = self.scene.expected_electrons(applied.roi, s.hbin, s.vbin, applied.exposure, now=t)
+        # a closed shutter: dark frames (auto and series are open while acquiring)
+        el = self.scene.expected_electrons(applied.roi, s.hbin, s.vbin, applied.exposure, now=t,
+                                           light=self.shutter != "closed")
         cic = self.cfg.cic * s.hbin * s.vbin
         img = emccd_counts(el, self._em_gain, self._use_em, self._sensitivity, self._read_noise,
                            self.cfg.bias, cic, self.rng)

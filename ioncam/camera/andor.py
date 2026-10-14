@@ -30,9 +30,10 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from ioncam.camera.base import (AcquisitionSettings, AppliedSettings, CameraBase,
-                                CameraError, nearest_index as _nearest, normalize_roi,
-                                roi_to_sdk, vs_speed_index)
+from ioncam.camera.base import (FAN_MODES, SHUTTER_MODES, AcquisitionSettings,
+                                AppliedSettings, CameraBase, CameraError,
+                                nearest_index as _nearest, normalize_roi, roi_to_sdk,
+                                vs_speed_index)
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +78,11 @@ ACQ_MODE = {"single": 1, "accumulate": 2, "run_till_abort": 5}
 TRIGGER_MODE = {"internal": 0, "external": 1, "external_start": 6,
                 "external_exposure": 7, "software": 10}
 AMPLIFIER = {"em": 0, "conventional": 1}
+# GetCapabilities ulFeatures bits
+AC_FEATURES_SHUTTER = 1 << 3
+AC_FEATURES_SHUTTEREX = 1 << 4
+AC_FEATURES_FANCONTROL = 1 << 7
+AC_FEATURES_MIDFANCONTROL = 1 << 8
 EXTERNAL_TRIGGERS = ("external", "external_start", "external_exposure")
 
 
@@ -208,12 +214,17 @@ class AndorCamera(CameraBase):
             self._call("CoolerON")
         self._call("SetCoolerMode", int(self.cfg.keep_cooler_on_exit),
                    tolerate=(DRV_NOT_SUPPORTED, DRV_NOT_AVAILABLE, DRV_P1INVALID))
-        self._call("SetFanMode", int(self.cfg.fan_mode),
-                   tolerate=(DRV_NOT_SUPPORTED, DRV_NOT_AVAILABLE, DRV_P1INVALID))
-        mode = {"auto": 0, "open": 1, "closed": 2}.get(self.cfg.shutter, 1)
-        ret = self._sdk.SetShutter(int(self.cfg.shutter_ttl_high), mode, 0, 0)
-        if ret != DRV_SUCCESS:
-            logger.info("SetShutter: %s (camera has no shutter control?)", error_name(ret))
+        fan = {v: k for k, v in FAN_MODES.items()}.get(int(self.cfg.fan_mode), "full")
+        try:
+            self.set_fan(fan)
+        except CameraError as e:
+            logger.info("fan: %s", e)
+        try:
+            self.set_shutter(self.cfg.shutter, self.cfg.external_shutter,
+                             self.cfg.shutter_ttl_high, self.cfg.shutter_open_ms,
+                             self.cfg.shutter_close_ms)
+        except CameraError as e:
+            logger.info("shutter: %s", e)
 
         serial = self._try("GetCameraSerialNumber", default=0)
         head = _text(self._try("GetHeadModel", default=b"iXon"))
@@ -255,6 +266,19 @@ class AndorCamera(CameraBase):
         caps["readout_flipped"] = {name: bool(self._try("IsReadoutFlippedByAmplifier", amp,
                                                         default=0))
                                    for name, amp in AMPLIFIER.items() if amp < n_amp}
+        caps_struct = self._try("GetCapabilities", default=None)
+        feats = getattr(caps_struct, "ulFeatures", None)
+        known = feats is not None
+        internal = self._try("IsInternalMechanicalShutter", default=None)
+        mins = self._try("GetShutterMinTimes", default=None)
+        caps["shutter"] = {
+            "control": not known or bool(feats & (AC_FEATURES_SHUTTER | AC_FEATURES_SHUTTEREX)),
+            "independent": known and bool(feats & AC_FEATURES_SHUTTEREX),
+            "internal": None if internal is None else bool(internal),
+            "min_close_ms": int(mins[0]) if mins else 0,
+            "min_open_ms": int(mins[1]) if mins else 0}
+        caps["fan"] = {"control": not known or bool(feats & AC_FEATURES_FANCONTROL),
+                       "low": not known or bool(feats & AC_FEATURES_MIDFANCONTROL)}
         trange = self._try("GetTemperatureRange", default=None)
         caps["temperature_range"] = tuple(int(v) for v in trange) if trange else (-100, 30)
         self._caps = caps
@@ -320,6 +344,7 @@ class AndorCamera(CameraBase):
 
         pa = self._choose_preamp(amp, hs_idx, s.preamp_gain_index, warnings)
         self._call("SetPreAmpGain", pa)
+        sensitivity, source = self._sensitivity(amp, hs_idx, pa)
         ret = self._sdk.SetBaselineClamp(int(s.baseline_clamp))
         if ret != DRV_SUCCESS and s.baseline_clamp:
             warnings.append("baseline clamp not available ({})".format(error_name(ret)))
@@ -390,11 +415,53 @@ class AndorCamera(CameraBase):
             keep_clean_time=keep_clean, hs_speed_mhz=float(speeds[hs_idx]),
             vs_speed_us=float(vs_list[vs_idx]) if vs_idx < len(vs_list) else 0.0,
             preamp_gain=float(pa_values[pa]) if pa < len(pa_values) else 1.0,
-            em_gain=em_gain, em_gain_range=em_range, tag=tag, warnings=warnings)
+            em_gain=em_gain, em_gain_range=em_range, tag=tag, warnings=warnings,
+            sensitivity=sensitivity, sensitivity_source=source,
+            # the set gain is the multiplication only in RealGain mode (3)
+            em_gain_real=s.amplifier != "em" or int(self.cfg.em_gain_mode) == 3)
         self._applied = applied
         for w_ in warnings:     # the engine reports them (once each)
             logger.debug("configure(%s): %s", tag, w_)
         return applied
+
+    def _sensitivity(self, amp: int, hs_idx: int, pa: int) -> Tuple[float, str]:
+        """Electrons per count at this readout: as configured (your camera's
+        System Performance Sheet) or as the camera reports it - GetSensitivity
+        (channel, horzShift, amplifier, pa), the argument order of Andor's
+        header - else unknown (0)."""
+        if self.cfg.sensitivity > 0:
+            return float(self.cfg.sensitivity), "configuration"
+        got = self._try("GetSensitivity", 0, hs_idx, amp, pa, default=None)
+        try:
+            value = float(got)
+        except (TypeError, ValueError):
+            return 0.0, ""
+        return (value, "camera") if 0.01 < value < 1000.0 else (0.0, "")
+
+    def set_shutter(self, mode: str = "open", external: str = "open", ttl_high: bool = True,
+                    open_ms: int = 0, close_ms: int = 0) -> None:
+        if mode not in SHUTTER_MODES or external not in SHUTTER_MODES:
+            raise CameraError("shutter mode must be one of {}".format(", ".join(SHUTTER_MODES)))
+        sh = self._caps.get("shutter") or {}
+        if not sh.get("control", True):
+            raise CameraError("this camera has no shutter control")
+        if sh.get("independent"):
+            # SetShutterEx(typ, mode, closingtime, openingtime, extmode): internal + external
+            self._call("SetShutterEx", int(bool(ttl_high)), SHUTTER_MODES[mode], int(close_ms),
+                       int(open_ms), SHUTTER_MODES[external])
+        else:
+            self._call("SetShutter", int(bool(ttl_high)), SHUTTER_MODES[mode], int(close_ms),
+                       int(open_ms))
+
+    def set_fan(self, mode: str) -> None:
+        if mode not in FAN_MODES:
+            raise CameraError("fan mode must be one of {}".format(", ".join(FAN_MODES)))
+        fan = self._caps.get("fan") or {}
+        if not fan.get("control", True):
+            raise CameraError("this camera has no fan control")
+        if mode == "low" and not fan.get("low", True):
+            raise CameraError("this camera's fan has no low setting")
+        self._call("SetFanMode", FAN_MODES[mode])
 
     def _choose_preamp(self, amp: int, hs_idx: int, requested: int, warnings: List[str]) -> int:
         """The pre-amp gain index: as requested if available at this speed, else

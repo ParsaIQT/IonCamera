@@ -829,6 +829,16 @@ class MainWindow(QtWidgets.QMainWindow):
             t = StatTile(caption)
             self.tiles[key] = t
             grid.addWidget(t, k // 4, k % 4)
+        self.tiles["pe"] = StatTile("photoelectrons/s per bright ion")
+        self.tiles["pe"].setToolTip(
+            "Andor's conversion: (counts - offset) x electrons per count / EM gain gives the "
+            "photoelectrons of an exposure; per second, divided by the exposure.  The counts "
+            "are each ion's (deblended) light above its local background, which takes the "
+            "offset; smoothed over ~10 frames.  Photons: divide by the quantum efficiency at "
+            "the ion's wavelength.")
+        self.pe_label = _muted("", wrap=True)
+        grid.addWidget(self.tiles["pe"], 2, 0, 1, 2)
+        grid.addWidget(self.pe_label, 2, 2, 1, 2)
         self.crystal_label = _muted("", wrap=True)
         tracking = _group("Tracking", [
             _row(_tool(self.act["accept"]), _tool(self.act["forget"]), None),
@@ -1331,9 +1341,122 @@ class MainWindow(QtWidgets.QMainWindow):
                    "(start with -c <file>).", wrap=True),
             _row(_tool(self.act["settings"]), _tool(self.act["save_config"]), None),
         ])
-        w = _page(cooling, control, configuration,
+        w = _page(cooling, self._shutter_box(), self._fan_box(), control, configuration,
                   _group("Camera", [self.info_text]))
         return _scroll(w)
+
+    def _shutter_box(self):
+        """The camera's shutter: the internal one and the external shutter
+        output (Shutter TTL of the I/O connector) where the camera controls
+        them separately."""
+        caps = self._caps.get("shutter") or {}
+        cam = self.config.get("camera", {})
+        modes = [("permanently open", "open"), ("permanently closed", "closed"),
+                 ("open while acquiring", "series"),
+                 ("fully auto (opens around every exposure)", "auto")]
+
+        def combo(current, tip):
+            c = QtWidgets.QComboBox()
+            for text, data in modes:
+                c.addItem(text, data)
+            c.setCurrentIndex(max(0, c.findData(current)))
+            c.setToolTip(tip)
+            return c
+        self.sh_mode = combo(cam.get("shutter", "open"), "the camera's own shutter")
+        self.sh_ext = combo(cam.get("external_shutter", "open"),
+                            "the external shutter output (Shutter TTL of the I/O connector)")
+        self.sh_ttl = QtWidgets.QComboBox()
+        self.sh_ttl.addItem("high opens", True)
+        self.sh_ttl.addItem("low opens", False)
+        self.sh_ttl.setCurrentIndex(0 if cam.get("shutter_ttl_high", True) else 1)
+        self.sh_open = _spin(0, 5000, int(cam.get("shutter_open_ms", 0)), suffix=" ms",
+                             width=90, tip="time the shutter takes to open")
+        self.sh_close = _spin(0, 5000, int(cam.get("shutter_close_ms", 0)), suffix=" ms",
+                              width=90, tip="time the shutter takes to close")
+        self.sh_state = _muted("", wrap=True)
+        rows = [["shutter", self.sh_mode]]
+        if caps.get("independent"):
+            rows.append(["external output", self.sh_ext])
+        rows += [["output", self.sh_ttl],
+                 ["opening / closing", _row(self.sh_open, self.sh_close, None)]]
+        minimum = max(int(caps.get("min_open_ms", 0) or 0), int(caps.get("min_close_ms", 0)
+                                                                  or 0))
+        box = _group("Shutter", [
+            _grid(rows),
+            _row(_button("Apply", self._apply_shutter, "set the shutter; live video or the "
+                         "armed readout carries on", "check"),
+                 _button("Open", lambda: self._set_shutter("open"), "permanently open"),
+                 _button("Close", lambda: self._set_shutter("closed"),
+                         "permanently closed - dark frames"), None),
+            self.sh_state,
+            _muted("Andor: in normal use permanently open, with 0 ms opening and closing "
+                   "times; for automatic operation {} ms each.  The shutter is for "
+                   "background frames and protection from light and dust, at most ~2 Hz - "
+                   "not for video.".format(minimum or 27), wrap=True),
+        ])
+        if not caps.get("control", True):
+            for w in (self.sh_mode, self.sh_ext, self.sh_ttl, self.sh_open, self.sh_close):
+                w.setEnabled(False)
+            self.sh_state.setText("this camera has no shutter control")
+        return box
+
+    def _show_shutter_fan(self, st):
+        sh, fan = st.get("shutter"), st.get("fan")
+        names = {"open": "permanently open", "closed": "permanently closed",
+                 "series": "open while acquiring", "auto": "fully auto"}
+        if sh and (self._caps.get("shutter") or {}).get("control", True):
+            ext = ", external output {}".format(names.get(sh["external"], sh["external"])) \
+                if (self._caps.get("shutter") or {}).get("independent") else ""
+            self.sh_state.setText("now: {}{}; output {} opens; {} / {} ms".format(
+                names.get(sh["mode"], sh["mode"]), ext, "high" if sh["ttl_high"] else "low",
+                sh["open_ms"], sh["close_ms"]))
+        if fan and (self._caps.get("fan") or {}).get("control", True):
+            self.fan_state.setText("now: {}".format(fan))
+
+    def _set_shutter(self, mode):
+        self.sh_mode.setCurrentIndex(max(0, self.sh_mode.findData(mode)))
+        self._apply_shutter()
+
+    def _apply_shutter(self):
+        self._cmd("set_shutter", self.sh_mode.currentData(), self.sh_ext.currentData(),
+                  bool(self.sh_ttl.currentData()), self.sh_open.value(), self.sh_close.value())
+
+    def _fan_box(self):
+        caps = self._caps.get("fan") or {}
+        self.fan = QtWidgets.QComboBox()
+        for text, data in (("full", "full"), ("low", "low"), ("off", "off")):
+            self.fan.addItem(text, data)
+        if not caps.get("low", True):
+            self.fan.model().item(1).setEnabled(False)
+        fan = {0: "full", 1: "low", 2: "off"}.get(
+            int(self.config.get("camera", {}).get("fan_mode", 0)), "full")
+        self.fan.setCurrentIndex(max(0, self.fan.findData(fan)))
+        self.fan_state = _muted("", wrap=True)
+        box = _group("Cooling fan", [
+            _row("fan", self.fan, _button("Apply", self._apply_fan, "set the fan", "check"),
+                 None),
+            self.fan_state,
+            _muted("Lower or off only against vibration, and off only for short periods "
+                   "unless the camera is water-cooled: the body warms up (the camera beeps "
+                   "when too hot) and the sensor needs a warmer set point; let its "
+                   "temperature settle before measuring.", wrap=True),
+        ])
+        if not caps.get("control", True):
+            self.fan.setEnabled(False)
+            self.fan_state.setText("this camera has no fan control")
+        return box
+
+    def _apply_fan(self):
+        mode = self.fan.currentData()
+        if mode == "off" and QtWidgets.QMessageBox.question(
+                self, "ioncam", "Turn the cooling fan off?\n\nOnly for short periods unless "
+                "the camera is water-cooled: the camera body warms up and beeps when too hot.",
+                QtWidgets.QMessageBox.StandardButton.Yes |
+                QtWidgets.QMessageBox.StandardButton.No,
+                QtWidgets.QMessageBox.StandardButton.No) != \
+                QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        self._cmd("set_fan", mode)
 
     def _sim_tab(self):
         self.sim_idx = _spin(0, 63, 0, width=64)
@@ -1956,6 +2079,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if changed:
                 self._show_acq_state()
         self._show_acq_now(st.get("settings"))
+        self._show_shutter_fan(st)
         self.bg_label.setText(_background_text(st.get("background")))
         fr = out.get("frame")
         if fr is not None:
@@ -2034,6 +2158,20 @@ class MainWindow(QtWidgets.QMainWindow):
                 "%H:%M:%S", time.localtime(ver))) if ver else "not verified")
             style.chip(ch["verified"], "good" if ver else "")
 
+    def _show_brightness(self, b):
+        """The brightness in photoelectrons/s and how it was converted."""
+        mean = b.get("mean_bright")
+        self.tiles["pe"].set("-" if mean is None else "{:,.0f}".format(mean))
+        if not b.get("available"):
+            self.pe_label.setText(b.get("why") or "")
+            return
+        exp = b.get("exposure") or 0.0
+        self.pe_label.setText(
+            "(counts - offset) x {:.3g} e\u207b/count ({}) / EM gain {} / {:.4g} ms exposure; "
+            "every ion in the table".format(b.get("sensitivity") or 0.0,
+                                            b.get("sensitivity_source") or "?",
+                                            b.get("em_gain"), 1e3 * exp))
+
     def _update_ions(self, st, sites):
         self.sites.set_sites(sites)
         ions = st["ions"]
@@ -2051,6 +2189,7 @@ class MainWindow(QtWidgets.QMainWindow):
         t["angle"].set(num(chain.get("angle_deg"), "{:.1f}"))
         t["focus"].set(num(det.get("focus"), "{:.2f}"))
         t["noise"].set(num(det.get("noise"), "{:.1f}"))
+        self._show_brightness(st.get("brightness") or {})
         self.crystal_label.setText("background {} counts · {} spot(s), {} cloud(s) in the "
                                    "last frame · analysis {} ms".format(
                                        det.get("background", "-"), ions.get("n_spots", 0),

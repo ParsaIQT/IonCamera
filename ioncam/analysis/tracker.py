@@ -42,6 +42,7 @@ from ioncam.analysis.detection import DetectionResult, deblend_patch
 from ioncam.analysis.fitting import PSF, fit_fixed_psf, fit_gaussians
 
 BRIGHT, DARK = "bright", "dark"
+_PE_SMOOTH = 0.1          # per frame, the brightness in photoelectrons/s (~10 frames)
 
 # crystal states
 EMPTY = "empty"
@@ -63,11 +64,13 @@ class Site:
     snr: float = 0.0
     since: float = 0.0             # time of the last state change
     inferred: bool = False         # dark ion whose position comes from the chain model
+    pe_rate: Optional[float] = None    # photoelectrons per second (smoothed; None: unknown)
 
     def to_dict(self, index: int) -> dict:
         return {"index": index, "id": self.id, "x": round(self.x, 3), "y": round(self.y, 3),
                 "state": self.state, "level": round(float(self.level), 3),
-                "snr": round(float(self.snr), 1), "since": self.since, "inferred": self.inferred}
+                "snr": round(float(self.snr), 1), "since": self.since, "inferred": self.inferred,
+                "pe_rate": None if self.pe_rate is None else round(float(self.pe_rate), 1)}
 
 
 @dataclass
@@ -1332,6 +1335,14 @@ class ChainTracker:
                 s.level = float(levels[k])
             if np.isfinite(noise[k]) and noise[k] > 0:
                 s.snr = float(vals[k] / noise[k])
+            # photoelectrons/s: the deblended counts above the background (offset
+            # included) x electrons per count / EM gain / exposure, smoothed over
+            # ~10 frames; converted frame by frame, so a settings change is no jump
+            pe = float(vals[k]) * det.pe_factor
+            if det.pe_factor > 0 and math.isfinite(pe):
+                s.pe_rate = pe if s.pe_rate is None else s.pe_rate + _PE_SMOOTH * (pe - s.pe_rate)
+            elif det.pe_factor <= 0:
+                s.pe_rate = None
 
     def _update_refs(self, obs) -> None:
         """Brightness references follow slow drifts (laser power, focus) on

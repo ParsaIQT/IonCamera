@@ -477,6 +477,64 @@ def test_readout_camera_settings_are_enforced(tmp_path):
         engine.shutdown()
 
 
+def test_brightness_in_photoelectrons_shutter_and_fan(tmp_path):
+    """The ions' brightness in photoelectrons/s over RPC matches the simulated
+    truth (photons reaching the camera x quantum efficiency), whatever the EM
+    gain, exposure and pre-amp gain; the shutter darkens live video and opens
+    again (live carries on); the fan."""
+    engine, server, port = make_system(tmp_path, laser_noise=0.0)
+    c = client(port)
+    sim = engine.config.simulator
+    truth = sim.photon_rate * sim.quantum_efficiency * sim.laser_power
+
+    def ion_signal():
+        """The frame's counts at the ions above its median."""
+        f = engine.latest_frame()
+        x0, y0 = f.applied.roi[:2]
+        return [float(f.data[int(round(y)) - y0, int(round(x)) - x0] - np.median(f.data))
+                for x, y in engine.tracker.positions()]
+    try:
+        assert c.wait_for_ions(3, timeout=15)["ok"]
+        for live in ({}, {"em_gain": 200, "exposure": 0.02, "preamp_gain_index": 0}):
+            if live:
+                c.set_live(**live)
+            time.sleep(3.0)
+            b = c.get_ion_brightness()
+            assert b["available"] and b["sensitivity_source"] == "simulator"
+            assert abs(b["mean_bright"] / truth - 1.0) < 0.12, (b, truth)
+            assert all(abs(i["pe_rate"] / truth - 1.0) < 0.25 for i in b["ions"]), b
+        assert engine.status()["brightness"]["mean_bright"] == pytest.approx(
+            b["mean_bright"], rel=0.2)
+        assert all(s["pe_rate"] for s in c.get_status()["sites"])
+        c.set_live(em_gain=50, exposure=0.05, preamp_gain_index=-1)
+        time.sleep(1.0)
+        assert np.mean(ion_signal()) > 150
+        # the shutter: dark frames while closed, the ions back when open
+        sh = c.set_shutter("closed")
+        assert sh["mode"] == "closed" and engine.config.camera.shutter == "closed"
+        assert c.get_status()["mode"] == "live"
+        time.sleep(1.0)
+        assert np.mean(ion_signal()) < 50
+        assert c.set_shutter("open", open_ms=0)["mode"] == "open"
+        time.sleep(1.0)
+        assert np.mean(ion_signal()) > 150
+        assert c.get_shutter() == {"mode": "open", "external": "open", "ttl_high": True,
+                                   "open_ms": 0, "close_ms": 0}
+        with pytest.raises(Exception):
+            c.set_shutter("ajar")
+        # the fan
+        assert c.set_fan("off") == "off" and c.get_status()["fan"] == "off"
+        assert any(e["kind"] == "camera_settings" and "fan off" in e["message"]
+                   for e in engine.events.since(0))
+        assert c.set_fan("full") == "full" and engine.config.camera.fan_mode == 0
+        with pytest.raises(Exception):
+            c.set_fan("turbo")
+    finally:
+        c.close_rpc()
+        server.stop()
+        engine.shutdown()
+
+
 def test_calibration_files_written(system, tmp_path_factory):
     engine, port = system
     d = os.path.join(engine.config.storage.data_dir, "calibrations")
@@ -500,8 +558,11 @@ def test_gui_smoke(tmp_path):
     # dialogs are modal: recorded instead (a test must not block on one)
     errors, warning = [], QtWidgets.QMessageBox.warning
     infos, information = [], QtWidgets.QMessageBox.information
+    questions, question = [], QtWidgets.QMessageBox.question
     QtWidgets.QMessageBox.warning = staticmethod(lambda *a, **k: errors.append(a[1:]))
     QtWidgets.QMessageBox.information = staticmethod(lambda *a, **k: infos.append(a[1:]))
+    QtWidgets.QMessageBox.question = staticmethod(   # "No" to every question
+        lambda *a, **k: questions.append(a[1:]) or QtWidgets.QMessageBox.StandardButton.No)
     try:
         win = MainWindow(backend, backend.call("get_config").result(10),
                          backend.call("get_info").result(10))
@@ -664,6 +725,41 @@ def test_gui_smoke(tmp_path):
             app.processEvents()
             time.sleep(0.01)
         assert vs.currentData() == 1.7
+        # the brightness in photoelectrons/s (Ions tab) and its conversion
+        assert win.sites.horizontalHeaderItem(5).text() == "e\u207b/s"
+        win.tabs.setCurrentWidget(win.ions_page)       # (refreshed while shown)
+        t = time.time()       # (the trap was just turned: tracked afresh)
+        while time.time() - t < 15.0 and win.tiles["pe"].value.text() in ("", "-"):
+            app.processEvents()
+            time.sleep(0.01)
+        assert win.tiles["pe"].value.text() not in ("", "-")
+        assert "(simulator)" in win.pe_label.text()
+        # the shutter and the fan (Camera tab)
+        assert [win.sh_mode.itemData(k) for k in range(win.sh_mode.count())] == \
+            ["open", "closed", "series", "auto"]
+        win._set_shutter("closed")
+        t = time.time()
+        while time.time() - t < 5.0 and engine.config.camera.shutter != "closed":
+            app.processEvents()
+            time.sleep(0.01)
+        assert engine.config.camera.shutter == "closed"
+        win._set_shutter("open")
+        t = time.time()
+        while time.time() - t < 5.0 and (engine.config.camera.shutter != "open" or not
+                                         win.sh_state.text().startswith("now: permanently open")):
+            app.processEvents()
+            time.sleep(0.01)
+        assert win.sh_state.text().startswith("now: permanently open")
+        win.fan.setCurrentIndex(win.fan.findData("off"))
+        win._apply_fan()                                  # asked first: "No" - nothing changes
+        assert questions and "fan off" in questions[-1][1].lower()
+        win.fan.setCurrentIndex(win.fan.findData("low"))
+        win._apply_fan()
+        t = time.time()
+        while time.time() - t < 5.0 and win.fan_state.text() != "now: low":
+            app.processEvents()
+            time.sleep(0.01)
+        assert engine.config.camera.fan_mode == 1 and win.fan_state.text() == "now: low"
         # pending changes go first: Locate uses what is shown
         win.acq["locate"]["exposure"].setValue(0.3)
         win._locate()
@@ -682,6 +778,7 @@ def test_gui_smoke(tmp_path):
     finally:
         QtWidgets.QMessageBox.warning = warning
         QtWidgets.QMessageBox.information = information
+        QtWidgets.QMessageBox.question = question
         backend.close()
         server.stop()
         engine.shutdown()

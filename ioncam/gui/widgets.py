@@ -697,7 +697,7 @@ class EventList(QtWidgets.QListWidget):
 
 
 class SiteTable(QtWidgets.QTableWidget):
-    COLS = ["#", "x", "y", "state", "brightness", "SNR"]
+    COLS = ["#", "x", "y", "state", "brightness", "e\u207b/s", "SNR"]
 
     def __init__(self, parent=None):
         super().__init__(0, len(self.COLS), parent)
@@ -712,9 +712,11 @@ class SiteTable(QtWidgets.QTableWidget):
         t = style.current()
         self.setRowCount(len(sites))
         for r, s in enumerate(sites):
+            pe = s.get("pe_rate")
             vals = [s["index"], "{:.2f}".format(s["x"]), "{:.2f}".format(s["y"]),
                     s["state"] + (" (inferred)" if s.get("inferred") else ""),
-                    "{:.0%}".format(s.get("level", 0)), "{:.0f}".format(s.get("snr", 0))]
+                    "{:.0%}".format(s.get("level", 0)),
+                    "-" if pe is None else "{:,.0f}".format(pe), "{:.0f}".format(s.get("snr", 0))]
             for c, v in enumerate(vals):
                 it = QtWidgets.QTableWidgetItem(str(v))
                 if c == 3:

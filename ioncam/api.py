@@ -97,6 +97,34 @@ class IonCamAPI:
         """Switch the TEC cooler on/off."""
         await self._run(self._engine.set_cooler, bool(on))
 
+    async def set_shutter(self, mode=None, external=None, ttl_high=None, open_ms=None,
+                          close_ms=None):
+        """The camera's shutter (None keeps a setting): ``mode`` of the internal
+        shutter and ``external`` of the external shutter output, each "open",
+        "closed", "auto" (opens and closes around every exposure - at most ~2 Hz
+        on an iXon Ultra, not for video) or "series" (open while acquiring);
+        ``ttl_high``: the output goes high to open; opening / closing times [ms].
+        Live video or an armed readout carries on.  Returns the settings."""
+        return _plain(await self._run(self._engine.set_shutter, mode, external, ttl_high,
+                                      open_ms, close_ms))
+
+    def get_shutter(self):
+        """The shutter settings: mode, external, ttl_high, open_ms, close_ms."""
+        return _plain(self._engine.shutter_settings())
+
+    async def set_fan(self, mode):
+        """The cooling fan: "full", "low" or "off" (off only for short periods
+        unless the camera is water-cooled)."""
+        return await self._run(self._engine.set_fan, str(mode))
+
+    def get_ion_brightness(self):
+        """Every ion's brightness in photoelectrons per second, and the mean of
+        the bright ones: (counts above the local background) x electrons per
+        count / EM gain / exposure, smoothed over ~10 frames.  With the inputs
+        (sensitivity and where it comes from, EM gain, exposure) and, when it
+        cannot be given, why."""
+        return _plain(self._engine.brightness())
+
     # ------------------------------------------------------------- acquisition
 
     async def start_live(self, **settings):

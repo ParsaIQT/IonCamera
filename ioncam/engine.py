@@ -41,9 +41,9 @@ from ioncam.analysis.readout import (PlanError, ReadoutPlan, binning_advice,
                                      compare_grabber_frame, dark_pixel_mask, fit_threshold,
                                      plan_readout, reposition_plan, resize_aqroi,
                                      shot_histograms, square_aqroi, verify_plan)
-from ioncam.analysis.tracker import ChainTracker, adopt_learned_psf, align
-from ioncam.camera.base import (AcquisitionSettings, AppliedSettings, CameraBase, CameraError,
-                                Frame)
+from ioncam.analysis.tracker import BRIGHT, ChainTracker, adopt_learned_psf, align
+from ioncam.camera.base import (FAN_MODES, SHUTTER_MODES, AcquisitionSettings,
+                                AppliedSettings, CameraBase, CameraError, Frame)
 from ioncam.config import Config
 from ioncam.events import EventLog
 
@@ -61,8 +61,9 @@ class Aborted(ProcedureError):
 
 
 def _rebaseline_needed(old: Optional[AppliedSettings], new: AppliedSettings) -> bool:
-    """Brightness is normalised by exposure x EM gain; anything else that changes
-    counts per photon (binning, amplifier, speed, pre-amp) needs new references."""
+    """Brightness is normalised by exposure x EM gain (/ electrons per count,
+    when known); a change of binning, amplifier, speed or pre-amp gets new
+    references all the same (an unknown sensitivity changes with them)."""
     if old is None:
         return True
     a, b = old.settings, new.settings
@@ -642,6 +643,9 @@ class IonCamEngine:
             "frame_index": self._frame_index,
             "settings": a.to_dict() if a is not None else None,
             "live_settings": self._live.to_dict(),
+            "shutter": self.shutter_settings(),
+            "fan": self.fan_mode(),
+            "brightness": self.brightness(),
             "locate_settings": self.config.locate.to_dict(),
             "readout_settings": self.config.readout.to_dict(),
             "ions": {k: snap.get(k) for k in ("state", "n_bright", "n_dark", "n_ions", "stable",
@@ -1597,6 +1601,110 @@ class IonCamEngine:
 
     def set_cooler(self, on: bool) -> None:
         self._call(self.camera.set_cooler, bool(on))
+
+    def _while_idle(self, fn: Callable) -> None:
+        """Run ``fn`` with the camera idle (the SDK refuses shutter and fan
+        changes while acquiring), then carry on with what was running: live
+        video, or the armed readout (re-armed)."""
+        mode = self._mode
+        if self.camera.is_acquiring():
+            self.camera.stop()
+        try:
+            fn()
+        finally:
+            if mode == LIVE:
+                self._start_live_internal()
+            elif mode == READOUT and self._plan is not None:
+                self._arm_internal(self._plan)
+
+    def set_shutter(self, mode: Optional[str] = None, external: Optional[str] = None,
+                    ttl_high: Optional[bool] = None, open_ms: Optional[int] = None,
+                    close_ms: Optional[int] = None) -> dict:
+        """The shutter (None keeps a setting): ``mode`` of the internal shutter
+        and ``external`` of the external shutter output - "open", "closed",
+        "auto" or "series" (open while acquiring) - the output's polarity and
+        the opening / closing times [ms].  Returns the shutter settings."""
+        c = self.config.camera
+        new = {"shutter": c.shutter if mode is None else str(mode),
+               "external_shutter": c.external_shutter if external is None else str(external),
+               "shutter_ttl_high": c.shutter_ttl_high if ttl_high is None else bool(ttl_high),
+               "shutter_open_ms": c.shutter_open_ms if open_ms is None else int(open_ms),
+               "shutter_close_ms": c.shutter_close_ms if close_ms is None else int(close_ms)}
+        for key in ("shutter", "external_shutter"):
+            if new[key] not in SHUTTER_MODES:
+                raise ValueError("{} must be one of {}".format(key, ", ".join(SHUTTER_MODES)))
+        if new["shutter_open_ms"] < 0 or new["shutter_close_ms"] < 0:
+            raise ValueError("shutter times must be >= 0 ms")
+
+        def run():
+            self._while_idle(lambda: self.camera.set_shutter(
+                new["shutter"], new["external_shutter"], new["shutter_ttl_high"],
+                new["shutter_open_ms"], new["shutter_close_ms"]))
+            self.config.update("camera", new)
+            self.events.emit("camera_settings", "shutter {}{}".format(
+                new["shutter"], "" if new["external_shutter"] == "open" else
+                ", external {}".format(new["external_shutter"])), "info")
+            return self.shutter_settings()
+        return self._call(run)
+
+    def shutter_settings(self) -> dict:
+        c = self.config.camera
+        return {"mode": c.shutter, "external": c.external_shutter, "ttl_high": c.shutter_ttl_high,
+                "open_ms": c.shutter_open_ms, "close_ms": c.shutter_close_ms}
+
+    def set_fan(self, mode: str) -> str:
+        """The cooling fan: "full", "low" or "off".  Off only for short periods
+        unless the camera is water-cooled: the body warms up (the camera beeps
+        when too hot) and the sensor may not hold its temperature."""
+        if mode not in FAN_MODES:
+            raise ValueError("fan mode must be one of {}".format(", ".join(FAN_MODES)))
+
+        def run():
+            self._while_idle(lambda: self.camera.set_fan(mode))
+            self.config.camera.fan_mode = FAN_MODES[mode]
+            if mode == "off":
+                self.events.emit("camera_settings", "fan off: only for short periods unless "
+                                 "the camera is water-cooled (the body warms up; it beeps when "
+                                 "too hot) - let the temperature settle before measuring",
+                                 "warning")
+            else:
+                self.events.emit("camera_settings", "fan {}".format(mode), "info")
+            return mode
+        return self._call(run)
+
+    def fan_mode(self) -> str:
+        return {v: k for k, v in FAN_MODES.items()}.get(int(self.config.camera.fan_mode), "full")
+
+    def brightness(self) -> dict:
+        """Every ion's brightness in photoelectrons per second (smoothed over
+        ~10 frames) and how it is converted: Andor's (counts - offset) x
+        sensitivity / EM gain per exposure, with the deblended counts of each
+        ion above its local background (which takes the offset)."""
+        a = self._applied
+        with self._tracker_lock:
+            sites = [(k, s.state, s.pe_rate) for k, s in enumerate(self.tracker.sites)]
+        out = {"ions": [{"index": k, "state": st, "pe_rate": None if r is None else round(r, 1)}
+                        for k, st, r in sites],
+               "mean_bright": None, "available": False, "why": "", "sensitivity": None,
+               "sensitivity_source": "", "em_gain": None, "exposure": None}
+        if a is None:
+            out["why"] = "no camera settings yet"
+            return out
+        out.update(sensitivity=a.sensitivity or None, sensitivity_source=a.sensitivity_source,
+                   em_gain=a.em_gain if a.settings.amplifier == "em" else 1,
+                   exposure=a.exposure, amplifier=a.settings.amplifier)
+        if a.sensitivity <= 0:
+            out["why"] = ("the camera does not report its electrons per count: set "
+                          "camera.sensitivity from its System Performance Sheet")
+        elif not a.em_gain_real:
+            out["why"] = ("the EM gain is in DAC units, not the real gain: set "
+                          "camera.em_gain_mode = 3 (RealGain)")
+        else:
+            out["available"] = True
+            bright = [r for _, st, r in sites if st == BRIGHT and r is not None]
+            if bright:
+                out["mean_bright"] = round(float(np.mean(bright)), 1)
+        return out
 
     def temperature(self) -> Tuple[float, str]:
         return self._temperature

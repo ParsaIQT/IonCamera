@@ -56,7 +56,7 @@ pip install git+https://github.com/m-labs/sipyco      # not on PyPI (ARTIQ envs 
 ioncam_gui --simulate          # GUI + simulated trap; use the "Simulation" tab to play
 ioncam_gui --simulate --sim-camera 888    # ... as an iXon Ultra 888 (1024 x 1024)
 aqctl_ioncam --simulate        # headless RPC server with the simulator
-pytest                         # 131 tests (~3 min), all on the simulator / emulated SDK
+pytest                         # 133 tests (~3 min), all on the simulator / emulated SDK
 ```
 
 ### The GUI
@@ -70,10 +70,10 @@ in the order of the work:
 | tab | what is there |
 |---|---|
 | **Live** | start / stop, exposure, EM gain, binning, **Snap** (average N frames and save them), the camera ROI (crop to the view, around the ions with a margin, full sensor), display (colormap, levels, orientation) and the live readout electronics (amplifier, horizontal and vertical speed, pre-amp, frame transfer) |
-| **Ions** | the crystal at a glance (bright, dark, state, chain scale and angle, PSF σ, noise), every site, tracking (accept as reference, forget, hold, locate), ion detection (where to search, threshold), the learned background, a loading alert |
+| **Ions** | the crystal at a glance (bright, dark, state, chain scale and angle, PSF σ, noise, the brightness in photoelectrons/s), every site (with its photoelectrons/s), tracking (accept as reference, forget, hold, locate), ion detection (where to search, threshold), the learned background, a loading alert |
 | **Readout** | state chips (plan valid or outdated, armed, shots, verified); calibrate and run (Arm, Disarm, inside the AQROI set by hand); the camera settings of the long exposure and of the readout side by side (see below); the AQROI by hand (New AQROI, Place by click, the size pad, the D-pad); the results: shot histograms with the fidelity estimate, the plan (and a typed AQROI), the ARTIQ snippet |
 | **Events** | the event log, filtered by severity or text; save it to a file |
-| **Camera** | cooling, the control lease, configuration (**Settings...**: every option with its help, changed at run time; **Save configuration...**), camera information |
+| **Camera** | cooling, the shutter (internal and external output, polarity, opening and closing times; Open / Close), the cooling fan (full, low, off), the control lease, configuration (**Settings...**: every option with its help, changed at run time; **Save configuration...**), camera information |
 | **Simulation** | (simulated camera) ions, the lab (lasers, repumper, oven, camera moves, triggers) and the realism knobs |
 
 The toolbar holds what is needed from everywhere - Live, Stop, Snap, Learn background,
@@ -170,6 +170,8 @@ with their docstrings):
 | `hold_tracking(reason, timeout)` / `resume_tracking()` | "ions will move on purpose" (shuttling, camera) |
 | `take_control(owner, reason, timeout)` / `release_control(owner)` | advisory lease shown in all GUIs |
 | `start_live(**settings)` / `set_live(...)` / `set_exposure` / `set_em_gain` / `set_roi` / `stop()` | live video |
+| `get_ion_brightness()` | every ion's brightness in photoelectrons/s, the mean of the bright ones, and the conversion's inputs (see below) |
+| `set_shutter(mode, external, ttl_high, open_ms, close_ms)` / `get_shutter()` / `set_fan(mode)` | the shutter (`"open"`, `"closed"`, `"auto"`, `"series"`: open while acquiring) and the cooling fan (`"full"`, `"low"`, `"off"`); live video or the armed readout carries on |
 | `get_frame(since_index, bin, roi, view)` | newest image (raw orientation); `view="corrected"`: background removed, as the detector sees it; `view="background"`: the learned background |
 | `learn_background(n, mask_ions)` / `get_background()` / `clear_background()` | learn / inspect / forget the static surface light (see below) |
 | `set_acquisition(section, **settings)` | camera settings of the long exposure (`"locate"`) or the readout (`"readout"`), several at once, e.g. `vs_speed_us=1.13, hs_speed_mhz=10`; an armed readout is re-armed with them at once |
@@ -429,6 +431,54 @@ Some points that matter when using the Grabber:
   falls outside the ROIs, you get `readout_geometry_changed`; any crystal change in live
   mode marks the plan **outdated** (`is_readout_valid()` returns False).
 
+## The ions' brightness in photoelectrons per second
+
+The Ions tab shows every ion's brightness in photoelectrons per second (and the mean of the
+bright ones), from Andor's conversion (technical note FAQ040, and Count Convert in the iXon
+Ultra hardware guides):
+
+    photoelectrons = (counts - offset) x sensitivity / EM gain        (per exposure)
+    photoelectrons/s = that / exposure
+
+* **counts - offset**: each ion's light in counts, fitted with the PSF (core and halo) above
+  its local background. The background takes the offset (about 200 counts on an iXon Ultra,
+  with the baseline clamp), the scattered light and the dark current. A neighbour's light is
+  attributed to the neighbour.
+* **sensitivity**: electrons per count. It depends on the readout speed, the amplifier and the
+  pre-amp gain, and ioncam asks the camera for it at the settings in use (the SDK's
+  `GetSensitivity`). If your camera does not answer, or you want the number of its System
+  Performance Sheet, set `camera.sensitivity`. The Ions tab says which one is used.
+* **EM gain**: the set gain is the multiplication only in RealGain mode (`camera.em_gain_mode
+  = 3`, the default). In the DAC modes the brightness is not given, and the Ions tab says why.
+  RealGain is calibrated, but an EM register ages with heavy use; Andor's EMCAL recalibrates
+  it.
+* **exposure**: the camera's actual exposure (`GetAcquisitionTimings`).
+
+The value is smoothed over about 10 frames, and stays the same when you change the exposure,
+EM gain, pre-amp gain or readout speed. For photons arriving at the camera, divide by the
+sensor's quantum efficiency at the ion's wavelength. A saturated ion (EM register or 16-bit
+ADC) reads too low; the overexposure protection warns of that. In the simulator the
+measurement matches the truth (photons reaching the camera × quantum efficiency) to a few
+per cent at any EM gain, exposure, pre-amp gain and binning.
+
+The tracker normalises the ions' brightness the same way: it is in photoelectrons/s, so a
+change of pre-amp gain or readout speed no longer looks like a fluorescence drop.
+
+## The shutter and the fan
+
+The iXon Ultra has its own shutter, and an external shutter output (Shutter TTL on the I/O
+connector) that it controls separately (`SetShutterEx`). Andor's advice (iXon Ultra 897
+hardware guide): in normal use permanently open, with 0 ms opening and closing times. If it
+must open and close automatically, use 27 ms each. It is for background frames and protection
+from light and dust, at most about 2 Hz, so it is not for video. **Close** in the Camera tab
+gives dark frames while live video carries on, and **Open** brings the light back. "Open while
+acquiring" keeps the sensor dark between acquisitions.
+
+The cooling fan runs full, low or off. Lower it, or switch it off, only against vibration,
+and off only for short periods unless the camera is water-cooled: the body warms up and the
+camera beeps when it is too hot. The sensor may need a warmer set point, and its temperature
+should settle before you measure (transient dark current otherwise).
+
 ## Learning the background (dirty traps)
 
 Surface traps scatter the cooling laser: a broad, Gaussian-ish glow along the beam
@@ -613,7 +663,7 @@ These are worth knowing, because several would silently corrupt data:
 
 ## Tests
 
-`pytest` runs 131 tests in about 3 minutes, in the realistic regime (13k photons/s
+`pytest` runs 133 tests in about 3 minutes, in the realistic regime (13k photons/s
 per ion, blurred PSF with halo, laser scatter, surface defects):
 - chain physics against James' published values;
 - detector accuracy (photon-limited) and false-alarm rates at EM gain 1, 50 and 300,
@@ -639,8 +689,11 @@ per ion, blurred PSF with halo, laser scatter, surface defects):
   iXon Ultra 888 (1024 × 1024, 10 MHz for a 5 MHz setting, a missing pre-amp gain, a
   vertical shift speed used exactly as set and an 897 one never guessed, said once), and
   the readout camera settings enforced (set while armed, calibrate's overrides, the
-  settings dialog: one `[readout]`);
-- a full stack over real sipyco RPC with concurrent clients; stray light taken for ions
+  settings dialog: one `[readout]`); shutter (SetShutterEx's argument order), fan, and the
+  electrons per count asked of the camera in the header's argument order (or configured);
+- a full stack over real sipyco RPC with concurrent clients; the brightness in
+  photoelectrons/s against the simulated truth at different gain settings, the shutter
+  darkening live video and opening again, the fan; stray light taken for ions
   (the hint, a tight crop, a search region, a typed AQROI, the AQROI by hand and
   Calibrate + arm inside it);
 - a headless GUI test (levels set by hand stay put, the D-pad direction through the
@@ -649,6 +702,7 @@ per ion, blurred PSF with halo, laser scatter, surface defects):
   image, both themes, an option changed in the settings dialog, New AQROI, the size pad,
   Place by click, the search region, and the camera settings of the long exposure and
   readout: the camera's own choices, Apply, a change made elsewhere shown, Locate applying
-  pending changes first), and the GUI without its RPC server (sipyco
+  pending changes first; the photoelectrons/s tile and column; the shutter's Close and
+  Open; the fan, asked before it goes off), and the GUI without its RPC server (sipyco
   missing, the port in use, a server failing after a slow start, a terminate request)
   and closing it during a long wait.

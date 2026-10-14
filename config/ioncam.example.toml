@@ -20,10 +20,18 @@ fan_mode = 0
 em_gain_mode = 3
 # allow EM gains above 300 (ages the sensor; photon counting only)
 em_advanced = false
-# 'open', 'auto' or 'closed' (external shutter TTL)
+# shutter: 'open' (permanently), 'closed', 'auto' (opens and closes around every exposure: at most ~2 Hz on an iXon Ultra, not for video) or 'series' (open while acquiring)
 shutter = "open"
-# shutter opens on TTL high
+# the external shutter output (Shutter TTL of the I/O connector), on cameras that control it separately: same choices
+external_shutter = "open"
+# the shutter output goes high to open
 shutter_ttl_high = true
+# shutter opening time [ms] (Andor: 0 when permanently open, 27 for an iXon Ultra in 'auto')
+shutter_open_ms = 0
+# shutter closing time [ms]
+shutter_close_ms = 0
+# electrons per count of your camera at the readout speed and pre-amp gain in use (its System Performance Sheet), for the brightness in photoelectrons/s; 0 = ask the camera (GetSensitivity)
+sensitivity = 0.0
 # how often to read the temperature [s]
 temperature_poll_s = 2.0
 

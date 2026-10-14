@@ -34,6 +34,14 @@ _ACQ = {1: "single", 2: "accumulate", 5: "run_till_abort"}
 _TRIG = {0: "internal", 1: "external", 6: "external_start", 7: "external_exposure",
          10: "software"}
 RING_BUFFER = 64
+_SHUTTER = {0: "auto", 1: "open", 2: "closed", 4: "series", 5: "series"}
+
+
+class _Capabilities:
+    """The part of AndorCapabilities the driver reads."""
+
+    def __init__(self, features: int):
+        self.ulFeatures = features
 
 
 class _FakeDll:
@@ -352,11 +360,50 @@ class FakeAtmcd:
         return S
 
     def SetFanMode(self, mode):
+        if mode not in (0, 1, 2):
+            return P1INVALID
+        self.state["fan"] = mode
         return S
 
     def SetShutter(self, typ, mode, closing, opening):
+        if typ not in (0, 1):
+            return P1INVALID
+        if mode not in _SHUTTER:
+            return P2INVALID
         self.state["shutter"] = (typ, mode)
+        self.sim.set_shutter(_SHUTTER[mode])
         return S
+
+    def SetShutterEx(self, typ, mode, closing, opening, extmode):
+        if extmode not in _SHUTTER:
+            return 20076                    # DRV_P5INVALID
+        ret = self.SetShutter(typ, mode, closing, opening)
+        if ret == S:
+            self.state["shutter"] = (typ, mode, extmode)
+        return ret
+
+    def IsInternalMechanicalShutter(self):
+        return S, 1
+
+    def GetShutterMinTimes(self):
+        return S, 27, 27
+
+    def GetCapabilities(self):
+        # shutter (SetShutter + SetShutterEx), fan control with a low setting
+        return S, _Capabilities((1 << 3) | (1 << 4) | (1 << 7) | (1 << 8))
+
+    def GetSensitivity(self, channel, horz_shift, amplifier, pa):
+        # Andor's header: (channel, horzShift, amplifier, pa)
+        if channel != 0:
+            return P1INVALID, 0.0
+        if amplifier not in (0, 1):
+            return P3INVALID, 0.0
+        if not 0 <= horz_shift < len(self._hs[amplifier]):
+            return P2INVALID, 0.0
+        if not 0 <= pa < len(self._preamp):
+            return P4INVALID, 0.0
+        # what the emulated images use: the simulator's electrons per count
+        return S, float(self.sim.cfg.sensitivity * self._preamp[-1] / self._preamp[pa])
 
     # timings ------------------------------------------------------------------------
     def _settings(self) -> AcquisitionSettings:

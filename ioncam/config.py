@@ -51,8 +51,20 @@ class CameraConfig:
                                "3 = real EM gain (what Solis shows for the iXon Ultra)")
     em_advanced: bool = opt(False, "allow EM gains above 300 (ages the sensor; photon "
                                    "counting only)")
-    shutter: str = opt("open", "'open', 'auto' or 'closed' (external shutter TTL)")
-    shutter_ttl_high: bool = opt(True, "shutter opens on TTL high")
+    shutter: str = opt("open", "shutter: 'open' (permanently), 'closed', 'auto' (opens and "
+                               "closes around every exposure: at most ~2 Hz on an iXon "
+                               "Ultra, not for video) or 'series' (open while acquiring)")
+    external_shutter: str = opt("open", "the external shutter output (Shutter TTL of the "
+                                        "I/O connector), on cameras that control it "
+                                        "separately: same choices")
+    shutter_ttl_high: bool = opt(True, "the shutter output goes high to open")
+    shutter_open_ms: int = opt(0, "shutter opening time [ms] (Andor: 0 when permanently "
+                                  "open, 27 for an iXon Ultra in 'auto')")
+    shutter_close_ms: int = opt(0, "shutter closing time [ms]")
+    sensitivity: float = opt(0.0, "electrons per count of your camera at the readout speed "
+                                  "and pre-amp gain in use (its System Performance Sheet), "
+                                  "for the brightness in photoelectrons/s; 0 = ask the camera "
+                                  "(GetSensitivity)")
     temperature_poll_s: float = opt(2.0, "how often to read the temperature [s]")
 
 

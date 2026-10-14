@@ -32,6 +32,12 @@ import numpy as np
 
 TRIGGER_MODES = ("internal", "external", "external_start", "external_exposure",
                  "software")
+#: shutter modes (SDK SetShutter / SetShutterEx): permanently open, permanently
+#: closed, fully automatic (opens and closes around every exposure - for the
+#: iXon Ultra's shutter at most ~2 Hz, so not for video), open while acquiring
+SHUTTER_MODES = {"open": 1, "closed": 2, "auto": 0, "series": 5}
+#: fan modes (SDK SetFanMode)
+FAN_MODES = {"full": 0, "low": 1, "off": 2}
 ACQUISITION_MODES = ("single", "run_till_abort", "accumulate")
 AMPLIFIERS = ("em", "conventional")
 
@@ -206,6 +212,10 @@ class AppliedSettings:
     em_gain_range: Tuple[int, int] = (0, 0)
     tag: str = ""                     # operating mode this configuration belongs to
     warnings: List[str] = field(default_factory=list)
+    sensitivity: float = 0.0          # electrons per count at this readout speed and pre-amp
+                                      # gain (0: unknown)
+    sensitivity_source: str = ""      # "camera" (GetSensitivity), "configuration", "simulator"
+    em_gain_real: bool = True         # em_gain is the real multiplication (RealGain mode)
 
     @property
     def x0(self) -> int:
@@ -225,9 +235,24 @@ class AppliedSettings:
 
     @property
     def gain_factor(self) -> float:
-        """Rough signal scale (exposure x EM gain) used to normalise brightness."""
+        """Counts of a frame per unit of brightness, used to normalise it:
+        exposure x EM gain / electrons per count - normalised brightness is
+        then photoelectrons per second, the same at any exposure, EM gain,
+        readout speed or pre-amp gain.  Without a known sensitivity: exposure
+        x EM gain (arbitrary units)."""
         g = max(1, self.em_gain) if self.settings.amplifier == "em" else 1
-        return max(self.exposure, 1e-6) * g
+        f = max(self.exposure, 1e-6) * g
+        return f / self.sensitivity if self.sensitivity > 0 else f
+
+    @property
+    def pe_factor(self) -> float:
+        """Photoelectrons per second per count of signal in one frame (0 if
+        unknown): Andor's (counts - offset) x sensitivity / EM gain gives the
+        photoelectrons of an exposure, divided by the exposure time."""
+        if self.sensitivity <= 0 or not self.em_gain_real:
+            return 0.0
+        g = max(1, self.em_gain) if self.settings.amplifier == "em" else 1
+        return self.sensitivity / (max(self.exposure, 1e-6) * g)
 
     @property
     def min_trigger_period(self) -> float:
@@ -254,6 +279,10 @@ class AppliedSettings:
             "em_gain_range": list(self.em_gain_range),
             "tag": self.tag,
             "warnings": list(self.warnings),
+            "sensitivity": self.sensitivity,
+            "sensitivity_source": self.sensitivity_source,
+            "em_gain_real": self.em_gain_real,
+            "pe_factor": self.pe_factor,
         }
 
 
@@ -367,6 +396,18 @@ class CameraBase(abc.ABC):
 
     def send_software_trigger(self) -> None:
         raise CameraError("software trigger not supported by this camera")
+
+    def set_shutter(self, mode: str = "open", external: str = "open", ttl_high: bool = True,
+                    open_ms: int = 0, close_ms: int = 0) -> None:
+        """The shutter (camera idle): ``mode`` of the internal one and
+        ``external`` of the external shutter output (when the camera controls
+        them separately), from :data:`SHUTTER_MODES`; ``ttl_high``: the output
+        goes high to open; opening / closing times [ms]."""
+        raise CameraError("this camera has no shutter control")
+
+    def set_fan(self, mode: str) -> None:
+        """The cooling fan (camera idle): "full", "low" or "off"."""
+        raise CameraError("this camera has no fan control")
 
     def capabilities(self) -> dict:
         """Readout speeds, gains etc. (for GUIs and diagnostics)."""

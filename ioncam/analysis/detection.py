@@ -85,7 +85,7 @@ class DetectionResult:
     hbin: int = 1
     vbin: int = 1
     sigma_f: Tuple[float, float] = (1.0, 1.0)   # filter sigma (sy, sx) [frame px]
-    gain_factor: float = 1.0          # exposure x EM gain of the frame
+    gain_factor: float = 1.0          # counts per unit brightness (AppliedSettings.gain_factor)
     saturated: int = 0
     max_value: int = 0
     focus: float = float("nan")       # median ion width [sensor px]
@@ -96,6 +96,7 @@ class DetectionResult:
     diffuse: Optional[tuple] = None   # (map, noise map, sigma, bin): light the ions do
                                       # not explain, filtered at cloud scale (crop px / bin)
     prior_fit: bool = False           # ion positions are joint fits started from the prior
+    pe_factor: float = 0.0            # photoelectrons/s per count of a source (0: unknown)
 
     # -- geometry helpers ------------------------------------------------------
     def to_crop(self, x, y):
@@ -983,7 +984,7 @@ class Detector:
             z = np.zeros((0, 0), np.float32)
             return DetectionResult(frame.index, frame.timestamp, [], [], 0.0, 0.0, 0.0, z, z,
                                    crop, frame.x0, frame.y0, hb, vb, (sy, sx), gain_factor,
-                                   saturated, max_value)
+                                   saturated, max_value, pe_factor=frame.applied.pe_factor)
 
         sub = raw.astype(np.float32)
         sb = self.static_background
@@ -1145,7 +1146,8 @@ class Detector:
             filt, res, crop, frame.x0, frame.y0, hb, vb, (sy, sx), gain_factor,
             saturated, max_value, focus, spikes, noise_f_map,
             time.perf_counter() - t_start, psf_model, diffuse,
-            bool(cfg.deblend and prior_crop is not None and len(prior_crop) >= 1))
+            bool(cfg.deblend and prior_crop is not None and len(prior_crop) >= 1),
+            frame.applied.pe_factor)
 
     # -- static background ----------------------------------------------------------------
 
