@@ -31,7 +31,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from ioncam.camera.base import (FAN_MODES, SHUTTER_MODES, AcquisitionSettings,
-                                AppliedSettings, CameraBase, CameraError,
+                                AppliedSettings, CameraBase, CameraBusy, CameraError,
                                 nearest_index as _nearest, normalize_roi, roi_to_sdk,
                                 vs_speed_index)
 
@@ -47,6 +47,8 @@ DRV_TEMP_OUT_RANGE = 20038
 DRV_TEMP_NOT_SUPPORTED = 20039
 DRV_TEMP_DRIFT = 20040
 DRV_P1INVALID = 20066
+DRV_P3INVALID = 20068
+DRV_P4INVALID = 20069
 DRV_ACQUIRING = 20072
 DRV_IDLE = 20073
 DRV_NOT_INITIALIZED = 20075
@@ -126,6 +128,7 @@ class AndorCamera(CameraBase):
         self._last_temp: Tuple[float, str] = (float("nan"), "unknown")
         self.dropped_frames = 0
         self.info: Dict = {}
+        self.shutter_note = ""
 
     # -- helpers --------------------------------------------------------------
 
@@ -220,11 +223,12 @@ class AndorCamera(CameraBase):
         except CameraError as e:
             logger.info("fan: %s", e)
         try:
-            self.set_shutter(self.cfg.shutter, self.cfg.external_shutter,
-                             self.cfg.shutter_ttl_high, self.cfg.shutter_open_ms,
-                             self.cfg.shutter_close_ms)
+            self.shutter_note = self.set_shutter(
+                self.cfg.shutter, self.cfg.external_shutter, self.cfg.shutter_ttl_high,
+                self.cfg.shutter_open_ms, self.cfg.shutter_close_ms)
         except CameraError as e:
-            logger.info("shutter: %s", e)
+            self.shutter_note = "the shutter could not be set: {}".format(e)
+            logger.warning("%s", self.shutter_note)
 
         serial = self._try("GetCameraSerialNumber", default=0)
         head = _text(self._try("GetHeadModel", default=b"iXon"))
@@ -273,7 +277,8 @@ class AndorCamera(CameraBase):
         mins = self._try("GetShutterMinTimes", default=None)
         caps["shutter"] = {
             "control": not known or bool(feats & (AC_FEATURES_SHUTTER | AC_FEATURES_SHUTTEREX)),
-            "independent": known and bool(feats & AC_FEATURES_SHUTTEREX),
+            # None: not known (the capabilities could not be read): SetShutterEx is tried
+            "independent": bool(feats & AC_FEATURES_SHUTTEREX) if known else None,
             "internal": None if internal is None else bool(internal),
             "min_close_ms": int(mins[0]) if mins else 0,
             "min_open_ms": int(mins[1]) if mins else 0}
@@ -438,30 +443,90 @@ class AndorCamera(CameraBase):
             return 0.0, ""
         return (value, "camera") if 0.01 < value < 1000.0 else (0.0, "")
 
+    def _raw(self, name: str, *args):
+        """An SDK call's return code (None: the function does not exist), logged."""
+        fn = getattr(self._sdk, name, None)
+        if fn is None:
+            return None
+        res = fn(*args)
+        ret = res[0] if isinstance(res, tuple) else res
+        logger.info("%s%s -> %s", name, args, error_name(ret))
+        return ret
+
     def set_shutter(self, mode: str = "open", external: str = "open", ttl_high: bool = True,
-                    open_ms: int = 0, close_ms: int = 0) -> None:
+                    open_ms: int = 0, close_ms: int = 0) -> str:
+        """SetShutterEx (internal + external shutter) where the camera has it,
+        else SetShutter.  Times below the camera's minimum (GetShutterMinTimes)
+        are raised to it in the automatic modes, where the shutter must move in
+        them, and whenever the camera rejects them - an iXon Ultra 888 may
+        refuse 0 ms (Andor otherwise advises 0 ms for a permanently open
+        shutter)."""
         if mode not in SHUTTER_MODES or external not in SHUTTER_MODES:
             raise CameraError("shutter mode must be one of {}".format(", ".join(SHUTTER_MODES)))
         sh = self._caps.get("shutter") or {}
-        if not sh.get("control", True):
+        if sh.get("control") is False:
             raise CameraError("this camera has no shutter control")
-        if sh.get("independent"):
-            # SetShutterEx(typ, mode, closingtime, openingtime, extmode): internal + external
-            self._call("SetShutterEx", int(bool(ttl_high)), SHUTTER_MODES[mode], int(close_ms),
-                       int(open_ms), SHUTTER_MODES[external])
-        else:
-            self._call("SetShutter", int(bool(ttl_high)), SHUTTER_MODES[mode], int(close_ms),
-                       int(open_ms))
+        typ, m, e = int(bool(ttl_high)), SHUTTER_MODES[mode], SHUTTER_MODES[external]
+        lo_c, lo_o = int(sh.get("min_close_ms") or 0), int(sh.get("min_open_ms") or 0)
+        times = [(int(close_ms), int(open_ms))]
+        if mode in ("auto", "series") or external in ("auto", "series"):
+            times = [(max(c, lo_c), max(o, lo_o)) for c, o in times]
+        if times[0] != (max(times[0][0], lo_c), max(times[0][1], lo_o)):
+            times.append((max(times[0][0], lo_c), max(times[0][1], lo_o)))
+        calls = ([] if sh.get("independent") is False else
+                 [("SetShutterEx", lambda c, o: (typ, m, c, o, e))]) + \
+            [("SetShutter", lambda c, o: (typ, m, c, o))]
+        answers = []
+        for name, args in calls:
+            for c, o in times:
+                ret = self._raw(name, *args(c, o))
+                if ret is None:
+                    break
+                answers.append("{} {}".format(name, error_name(ret)))
+                if ret == DRV_SUCCESS:
+                    if name == "SetShutterEx" and sh.get("independent") is None:
+                        sh["independent"] = True
+                    raised = (c, o) != (int(close_ms), int(open_ms))
+                    return "{} accepted{}".format(name, "; times raised to the camera's "
+                                                  "minimum, closing {} / opening {} ms".format(
+                                                      c, o) if raised else "")
+                if ret == DRV_ACQUIRING:
+                    raise CameraBusy("{}: acquisition in progress".format(name))
+                if ret in (DRV_P3INVALID, DRV_P4INVALID):
+                    continue                    # the times: with the minimum next
+                break                           # not this call: the next one
+        raise CameraError("the camera accepted no shutter setting ({})".format(
+            "; ".join(answers) or "no shutter functions"))
 
-    def set_fan(self, mode: str) -> None:
+    def set_fan(self, mode: str) -> str:
         if mode not in FAN_MODES:
             raise CameraError("fan mode must be one of {}".format(", ".join(FAN_MODES)))
         fan = self._caps.get("fan") or {}
-        if not fan.get("control", True):
+        if fan.get("control") is False:
             raise CameraError("this camera has no fan control")
-        if mode == "low" and not fan.get("low", True):
+        if mode == "low" and fan.get("low") is False:
             raise CameraError("this camera's fan has no low setting")
-        self._call("SetFanMode", FAN_MODES[mode])
+        ret = self._raw("SetFanMode", FAN_MODES[mode])
+        if ret == DRV_ACQUIRING:
+            raise CameraBusy("SetFanMode: acquisition in progress")
+        if ret != DRV_SUCCESS:
+            raise CameraError("SetFanMode({}) failed: {} ({})".format(
+                FAN_MODES[mode], error_name(ret), ret))
+        return "SetFanMode accepted"
+
+    def wait_idle(self, timeout: float = 3.0) -> bool:
+        """Poll GetStatus until DRV_IDLE (AbortAcquisition may return before the
+        camera has stopped)."""
+        t_end = time.monotonic() + timeout
+        while True:
+            status = self._try("GetStatus", default=DRV_IDLE)
+            if status == DRV_IDLE:
+                return True
+            if time.monotonic() >= t_end:
+                logger.warning("camera not idle %.1f s after the abort (%s)", timeout,
+                               error_name(status))
+                return False
+            time.sleep(0.02)
 
     def _choose_preamp(self, amp: int, hs_idx: int, requested: int, warnings: List[str]) -> int:
         """The pre-amp gain index: as requested if available at this speed, else

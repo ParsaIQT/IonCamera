@@ -43,7 +43,7 @@ from ioncam.analysis.readout import (PlanError, ReadoutPlan, binning_advice,
                                      shot_histograms, square_aqroi, verify_plan)
 from ioncam.analysis.tracker import BRIGHT, ChainTracker, adopt_learned_psf, align
 from ioncam.camera.base import (FAN_MODES, SHUTTER_MODES, AcquisitionSettings,
-                                AppliedSettings, CameraBase, CameraError, Frame)
+                                AppliedSettings, CameraBase, CameraBusy, CameraError, Frame)
 from ioncam.config import Config
 from ioncam.events import EventLog
 
@@ -335,6 +335,9 @@ class IonCamEngine:
     def _open_camera(self) -> dict:
         info = self.camera.open()
         cc = self.config.camera
+        self._shutter_note = getattr(self.camera, "shutter_note", "") or ""
+        if self._shutter_note.startswith("the shutter could not be set"):
+            self.events.emit("camera_settings", self._shutter_note, "warning")
         try:
             self.camera.set_temperature(cc.target_temperature)
             if cc.cooler_on:
@@ -1602,20 +1605,53 @@ class IonCamEngine:
     def set_cooler(self, on: bool) -> None:
         self._call(self.camera.set_cooler, bool(on))
 
-    def _while_idle(self, fn: Callable) -> None:
-        """Run ``fn`` with the camera idle (the SDK refuses shutter and fan
-        changes while acquiring), then carry on with what was running: live
-        video, or the armed readout (re-armed)."""
-        mode = self._mode
-        if self.camera.is_acquiring():
-            self.camera.stop()
+    def _on_camera(self, what: str, fn: Callable, settle: float) -> str:
+        """``fn()`` (a shutter or fan setting) on the camera as it runs.  If
+        it must be idle for it (DRV_ACQUIRING): stop, wait until the camera
+        says it is idle, ``fn()``, let it settle, then carry on with live video
+        or the armed readout - and if that does not restart, say so and leave
+        the camera stopped instead of seemingly live."""
         try:
-            fn()
+            return fn()
+        except CameraBusy as e:
+            logger.info("%s: %s - stopping the acquisition first", what, e)
+        mode = self._mode
+        self.camera.stop()
+        self.camera.wait_idle()
+        try:
+            note = fn()
+            time.sleep(settle)
         finally:
-            if mode == LIVE:
-                self._start_live_internal()
-            elif mode == READOUT and self._plan is not None:
-                self._arm_internal(self._plan)
+            self._resume(mode, what)
+        return note + " (acquisition stopped for it)"
+
+    def _resume(self, mode: str, what: str) -> None:
+        """Live video or the armed readout again after ``what``; one retry."""
+        if mode not in (LIVE, READOUT) or (mode == READOUT and self._plan is None):
+            if mode in (LIVE, READOUT):
+                self._mode = IDLE
+            return
+        for attempt in (1, 2):
+            try:
+                if mode == LIVE:
+                    self._start_live_internal()
+                else:
+                    self._arm_internal(self._plan)
+                return
+            except CameraError as e:
+                try:
+                    self.camera.stop()
+                    self.camera.wait_idle()
+                except CameraError:
+                    pass
+                if attempt == 2:
+                    self._mode = IDLE
+                    self.events.emit("camera_error", "after the {} change the acquisition did "
+                                     "not restart ({}) - press Live".format(what, e), "alarm")
+                    raise
+                logger.warning("%s: restarting the acquisition failed (%s); again in 1 s",
+                               what, e)
+                time.sleep(1.0)
 
     def set_shutter(self, mode: Optional[str] = None, external: Optional[str] = None,
                     ttl_high: Optional[bool] = None, open_ms: Optional[int] = None,
@@ -1637,20 +1673,23 @@ class IonCamEngine:
             raise ValueError("shutter times must be >= 0 ms")
 
         def run():
-            self._while_idle(lambda: self.camera.set_shutter(
+            settle = 0.1 + 1e-3 * max(new["shutter_open_ms"], new["shutter_close_ms"])
+            self._shutter_note = self._on_camera("shutter", lambda: self.camera.set_shutter(
                 new["shutter"], new["external_shutter"], new["shutter_ttl_high"],
-                new["shutter_open_ms"], new["shutter_close_ms"]))
+                new["shutter_open_ms"], new["shutter_close_ms"]), settle)
             self.config.update("camera", new)
-            self.events.emit("camera_settings", "shutter {}{}".format(
+            self.events.emit("camera_settings", "shutter {}{}: {}".format(
                 new["shutter"], "" if new["external_shutter"] == "open" else
-                ", external {}".format(new["external_shutter"])), "info")
+                ", external {}".format(new["external_shutter"]), self._shutter_note), "info")
             return self.shutter_settings()
         return self._call(run)
 
     def shutter_settings(self) -> dict:
+        """The shutter settings and what the camera answered last."""
         c = self.config.camera
         return {"mode": c.shutter, "external": c.external_shutter, "ttl_high": c.shutter_ttl_high,
-                "open_ms": c.shutter_open_ms, "close_ms": c.shutter_close_ms}
+                "open_ms": c.shutter_open_ms, "close_ms": c.shutter_close_ms,
+                "camera": getattr(self, "_shutter_note", "")}
 
     def set_fan(self, mode: str) -> str:
         """The cooling fan: "full", "low" or "off".  Off only for short periods
@@ -1660,7 +1699,8 @@ class IonCamEngine:
             raise ValueError("fan mode must be one of {}".format(", ".join(FAN_MODES)))
 
         def run():
-            self._while_idle(lambda: self.camera.set_fan(mode))
+            # the fan is set over the camera's internal bus: give it a moment
+            self._on_camera("fan", lambda: self.camera.set_fan(mode), 0.5)
             self.config.camera.fan_mode = FAN_MODES[mode]
             if mode == "off":
                 self.events.emit("camera_settings", "fan off: only for short periods unless "

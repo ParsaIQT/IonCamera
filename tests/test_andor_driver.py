@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from ioncam.camera.andor import AndorCamera
-from ioncam.camera.base import CameraError
+from ioncam.camera.base import CameraBusy, CameraError
 from ioncam.camera.fake_sdk import FakeAtmcd
 from ioncam.config import Config
 
@@ -272,3 +272,45 @@ def test_shutter_fan_and_electrons_per_count(cam):
     c.cfg.em_gain_mode = 0                                        # DAC units: not the gain
     e = c.configure(cfg.readout.replace(**where), "readout")
     assert not e.em_gain_real and e.pe_factor == 0.0
+
+
+def test_shutter_and_fan_as_a_real_camera_answers(cam):
+    """What an iXon Ultra may answer: fan and shutter refused while acquiring
+    (DRV_ACQUIRING: the engine then stops first), still busy a moment after the
+    abort, 0 ms shutter times refused (an 888 in 2016: "Parameter 3 not valid" -
+    then the camera's minimum, GetShutterMinTimes), capabilities not readable
+    (SetShutterEx tried first), no SetShutterEx (SetShutter)."""
+    c, sdk, cfg = cam
+    sdk.busy_while_acquiring = True
+    sdk.abort_lag = 0.2
+    sdk.enforce_min_shutter_times = True
+    c.configure(cfg.live, "live")
+    c.start()
+    with pytest.raises(CameraBusy):
+        c.set_fan("low")
+    with pytest.raises(CameraBusy):
+        c.set_shutter("closed")
+    c.stop()
+    t = time.monotonic()
+    assert c.wait_idle(2.0) and time.monotonic() - t >= 0.15
+    assert c.set_fan("low") == "SetFanMode accepted"
+    note = c.set_shutter("closed")
+    assert "SetShutterEx accepted" in note and "times raised" in note
+    assert [a for n, a in sdk.calls if n == "SetShutterEx"][-2:] == [(1, 2, 0, 0, 1),
+                                                                    (1, 2, 27, 27, 1)]
+    assert sdk.sim.shutter == "closed"
+    # automatic: at least the minimum times from the start
+    start = len(sdk.calls)
+    c.set_shutter("auto", open_ms=10, close_ms=50)
+    assert [a for n, a in sdk.calls[start:] if n == "SetShutterEx"] == [(1, 0, 50, 27, 1)]
+    # capabilities not readable: SetShutterEx first, and remembered when it works
+    c._caps["shutter"]["independent"] = None
+    sdk.enforce_min_shutter_times = False
+    assert c.set_shutter("open") == "SetShutterEx accepted"
+    assert c._caps["shutter"]["independent"] is True
+    # a camera without SetShutterEx: SetShutter
+    c._caps["shutter"]["independent"] = None
+    sdk.SetShutterEx = None
+    assert c.set_shutter("closed") == "SetShutter accepted" and sdk.sim.shutter == "closed"
+    del sdk.SetShutterEx
+

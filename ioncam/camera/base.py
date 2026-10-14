@@ -46,6 +46,10 @@ class CameraError(RuntimeError):
     """Raised for any camera/driver level failure."""
 
 
+class CameraBusy(CameraError):
+    """The camera refuses this while acquiring (DRV_ACQUIRING): stop first."""
+
+
 Roi = Tuple[int, int, int, int]
 
 
@@ -398,16 +402,22 @@ class CameraBase(abc.ABC):
         raise CameraError("software trigger not supported by this camera")
 
     def set_shutter(self, mode: str = "open", external: str = "open", ttl_high: bool = True,
-                    open_ms: int = 0, close_ms: int = 0) -> None:
-        """The shutter (camera idle): ``mode`` of the internal one and
-        ``external`` of the external shutter output (when the camera controls
-        them separately), from :data:`SHUTTER_MODES`; ``ttl_high``: the output
-        goes high to open; opening / closing times [ms]."""
+                    open_ms: int = 0, close_ms: int = 0) -> str:
+        """The shutter: ``mode`` of the internal one and ``external`` of the
+        external shutter output (when the camera controls them separately),
+        from :data:`SHUTTER_MODES`; ``ttl_high``: the output goes high to open;
+        opening / closing times [ms].  Returns what the camera was told (for
+        the user).  Raises :class:`CameraBusy` if it must be idle for this."""
         raise CameraError("this camera has no shutter control")
 
-    def set_fan(self, mode: str) -> None:
-        """The cooling fan (camera idle): "full", "low" or "off"."""
+    def set_fan(self, mode: str) -> str:
+        """The cooling fan: "full", "low" or "off".  Raises
+        :class:`CameraBusy` if the camera must be idle for this."""
         raise CameraError("this camera has no fan control")
+
+    def wait_idle(self, timeout: float = 3.0) -> bool:
+        """After :meth:`stop`: wait until the camera reports it is idle."""
+        return True
 
     def capabilities(self) -> dict:
         """Readout speeds, gains etc. (for GUIs and diagnostics)."""

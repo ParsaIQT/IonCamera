@@ -13,6 +13,7 @@ import pytest
 sipyco = pytest.importorskip("sipyco")
 from sipyco.pc_rpc import Client  # noqa: E402
 
+from ioncam.camera.base import CameraError  # noqa: E402
 from ioncam.config import Config  # noqa: E402
 from ioncam.server import ServerThread, build  # noqa: E402
 
@@ -519,7 +520,8 @@ def test_brightness_in_photoelectrons_shutter_and_fan(tmp_path):
         time.sleep(1.0)
         assert np.mean(ion_signal()) > 150
         assert c.get_shutter() == {"mode": "open", "external": "open", "ttl_high": True,
-                                   "open_ms": 0, "close_ms": 0}
+                                   "open_ms": 0, "close_ms": 0,
+                                   "camera": "simulated shutter open"}
         with pytest.raises(Exception):
             c.set_shutter("ajar")
         # the fan
@@ -531,6 +533,59 @@ def test_brightness_in_photoelectrons_shutter_and_fan(tmp_path):
             c.set_fan("turbo")
     finally:
         c.close_rpc()
+        server.stop()
+        engine.shutdown()
+
+
+def test_shutter_and_fan_while_live_on_an_888(tmp_path):
+    """Fan and shutter changed during live video through the real driver on
+    an emulated iXon Ultra 888 that refuses them while acquiring, is busy a
+    moment after the abort and refuses 0 ms shutter times: stopped, waited
+    for, set, restarted - live video carries on.  A camera that takes them
+    while acquiring is not stopped at all; a restart that fails twice is said
+    and leaves the camera stopped, not seemingly live."""
+    engine, server, port = make_system(tmp_path, backend="fake_sdk", camera_model="888")
+    sdk = engine.camera._sdk
+    sdk.busy_while_acquiring = True
+    sdk.abort_lag = 0.2
+    sdk.enforce_min_shutter_times = True
+
+    def frames_flow():
+        n = engine.status()["frame_index"]
+        time.sleep(1.0)
+        st = engine.status()
+        return st["mode"] == "live" and st["frame_index"] > n
+
+    def calls_since(k):
+        return [n for n, _ in sdk.calls[k:]]
+    try:
+        assert frames_flow()
+        k = len(sdk.calls)
+        assert engine.set_fan("low") == "low" and frames_flow()
+        assert calls_since(k)[:4] == ["SetFanMode", "AbortAcquisition", "GetStatus",
+                                      "GetStatus"] or "AbortAcquisition" in calls_since(k)
+        sh = engine.set_shutter("closed")
+        assert "times raised" in sh["camera"] and "acquisition stopped" in sh["camera"]
+        assert sdk.sim.shutter == "closed" and frames_flow()
+        engine.set_shutter("open")
+        assert sdk.sim.shutter == "open"
+        # a camera that takes them while acquiring (as pylablib finds): never stopped
+        sdk.busy_while_acquiring = False
+        k = len(sdk.calls)
+        assert engine.set_fan("full") == "full" and frames_flow()
+        assert "AbortAcquisition" not in calls_since(k)
+        # a restart that fails twice: said, and the camera left stopped
+        sdk.busy_while_acquiring = True
+        sdk.StartAcquisition = lambda: 20013                 # DRV_ERROR_ACK
+        with pytest.raises(CameraError):
+            engine.set_fan("low")
+        assert engine.status()["mode"] == "idle"
+        assert any(e["kind"] == "camera_error" and "did not restart" in e["message"]
+                   for e in engine.events.since(0))
+        del sdk.StartAcquisition
+        engine.start_live()
+        assert frames_flow()
+    finally:
         server.stop()
         engine.shutdown()
 

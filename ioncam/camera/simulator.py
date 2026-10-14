@@ -682,15 +682,17 @@ class SimulatedCamera(CameraBase):
         return self._applied
 
     def set_shutter(self, mode: str = "open", external: str = "open", ttl_high: bool = True,
-                    open_ms: int = 0, close_ms: int = 0) -> None:
+                    open_ms: int = 0, close_ms: int = 0) -> str:
         if mode not in SHUTTER_MODES or external not in SHUTTER_MODES:
             raise CameraError("shutter mode must be one of {}".format(", ".join(SHUTTER_MODES)))
         self.shutter = mode
+        return "simulated shutter {}".format(mode)
 
-    def set_fan(self, mode: str) -> None:
+    def set_fan(self, mode: str) -> str:
         if mode not in FAN_MODES:
             raise CameraError("fan mode must be one of {}".format(", ".join(FAN_MODES)))
         self.fan = mode
+        return "simulated fan {}".format(mode)
 
     def start(self) -> None:
         if self._applied is None:

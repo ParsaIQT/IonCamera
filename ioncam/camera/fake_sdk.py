@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import ctypes
 import threading
+import time
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -117,6 +118,12 @@ class FakeAtmcd:
         self._acquired = 0
         self._retrieved = 0
         self._initialized = False
+        # real-camera behaviours, for the tests
+        self.busy_while_acquiring = False   # refuse fan / shutter settings while acquiring
+        self.abort_lag = 0.0                # [s] still "acquiring" after AbortAcquisition
+        self._abort_until = 0.0
+        self.enforce_min_shutter_times = False  # refuse shutter times < 27 ms
+        self.shutterex_only = False         # SetShutter accepted but ignored
         self.state = {
             "read_mode": 4, "acq_mode": 1, "trigger": 0, "amp": 0, "hs": 0, "vs": 0,
             "vs_amp": 0, "preamp": 0, "clamp": 0, "em_gain_mode": 0, "em_gain": 0,
@@ -359,25 +366,44 @@ class FakeAtmcd:
         self.state["cooler_mode"] = mode
         return S
 
+    def _busy(self) -> bool:
+        """Acquiring - or just aborted (``abort_lag``): settings are refused."""
+        return self.sim.is_acquiring() or time.monotonic() < self._abort_until
+
     def SetFanMode(self, mode):
+        if self.busy_while_acquiring and self._busy():
+            return ACQUIRING
         if mode not in (0, 1, 2):
             return P1INVALID
         self.state["fan"] = mode
         return S
 
-    def SetShutter(self, typ, mode, closing, opening):
+    def _shutter(self, typ, mode, closing, opening):
+        if self.busy_while_acquiring and self._busy():
+            return ACQUIRING
         if typ not in (0, 1):
             return P1INVALID
         if mode not in _SHUTTER:
             return P2INVALID
-        self.state["shutter"] = (typ, mode)
+        if closing < 0 or (self.enforce_min_shutter_times and closing < 27):
+            return P3INVALID
+        if opening < 0 or (self.enforce_min_shutter_times and opening < 27):
+            return P4INVALID
         self.sim.set_shutter(_SHUTTER[mode])
         return S
+
+    def SetShutter(self, typ, mode, closing, opening):
+        if self.shutterex_only:
+            return S                        # accepted, and ignored: "you MUST use SetShutterEx"
+        ret = self._shutter(typ, mode, closing, opening)
+        if ret == S:
+            self.state["shutter"] = (typ, mode)
+        return ret
 
     def SetShutterEx(self, typ, mode, closing, opening, extmode):
         if extmode not in _SHUTTER:
             return 20076                    # DRV_P5INVALID
-        ret = self.SetShutter(typ, mode, closing, opening)
+        ret = self._shutter(typ, mode, closing, opening)
         if ret == S:
             self.state["shutter"] = (typ, mode, extmode)
         return ret
@@ -455,10 +481,11 @@ class FakeAtmcd:
         if not self.sim.is_acquiring():
             return IDLE
         self.sim.stop()
+        self._abort_until = time.monotonic() + self.abort_lag
         return S
 
     def GetStatus(self):
-        return S, ACQUIRING if self.sim.is_acquiring() else IDLE
+        return S, ACQUIRING if self._busy() else IDLE
 
     def CancelWait(self):
         self.sim.cancel_wait()

@@ -56,7 +56,7 @@ pip install git+https://github.com/m-labs/sipyco      # not on PyPI (ARTIQ envs 
 ioncam_gui --simulate          # GUI + simulated trap; use the "Simulation" tab to play
 ioncam_gui --simulate --sim-camera 888    # ... as an iXon Ultra 888 (1024 x 1024)
 aqctl_ioncam --simulate        # headless RPC server with the simulator
-pytest                         # 133 tests (~3 min), all on the simulator / emulated SDK
+pytest                         # 135 tests (~3 min), all on the simulator / emulated SDK
 ```
 
 ### The GUI
@@ -474,6 +474,19 @@ from light and dust, at most about 2 Hz, so it is not for video. **Close** in th
 gives dark frames while live video carries on, and **Open** brings the light back. "Open while
 acquiring" keeps the sensor dark between acquisitions.
 
+How a change reaches the camera: ioncam first sends it while the camera runs (other Andor
+drivers, such as pylablib, do too). Only if the camera refuses that ("acquisition in
+progress") does ioncam stop the acquisition, wait until the camera reports it is idle, apply
+the setting, give it a moment, and restart live video or re-arm the readout. If the restart
+fails twice, ioncam says so and leaves the camera stopped instead of seemingly live. For the
+shutter, ioncam uses `SetShutterEx` (internal and external shutter) and falls back to
+`SetShutter`. If the camera refuses the opening or closing times (a 2016 report of an iXon
+Ultra 888 refusing 0 ms), it retries with the camera's minimum (`GetShutterMinTimes`), and
+it always uses at least that minimum in the automatic modes. The Camera tab shows what the
+camera reports about its shutter (internal shutter fitted, external output set separately,
+minimum times) and what it answered last. Every shutter and fan call and its answer is in the
+console.
+
 The cooling fan runs full, low or off. Lower it, or switch it off, only against vibration,
 and off only for short periods unless the camera is water-cooled: the body warms up and the
 camera beeps when it is too hot. The sensor may need a warmer set point, and its temperature
@@ -592,6 +605,16 @@ Now:
 - A value the camera does not have (an 897's 0.5 µs or 5 MHz on an 888) is never
   guessed: the tab says which value is used instead, and **Apply** stores it.
 
+**The shutter has no visible effect.** Look at the Shutter group in the Camera tab:
+- **"internal shutter no":** only the external shutter output (a TTL on the I/O connector)
+  switches, which does something only if an external shutter is wired to it.
+- **The "camera:" line:** it says which call the camera accepted (`SetShutterEx` or
+  `SetShutter`), whether the times were raised to its minimum, or which errors it gave.
+
+The console has every call with its answer. A camera that controls its internal and external
+shutters separately needs `SetShutterEx`; ioncam uses it whenever the camera has it or does
+not say.
+
 **Every button fails with "Event loop is closed"** (versions before October 2026). The
 RPC server had failed to start, usually because sipyco was missing, and the GUI ran its
 actions through the server's event loop. The GUI hid the failure: start-up hung for 10 s,
@@ -663,7 +686,7 @@ These are worth knowing, because several would silently corrupt data:
 
 ## Tests
 
-`pytest` runs 133 tests in about 3 minutes, in the realistic regime (13k photons/s
+`pytest` runs 135 tests in about 3 minutes, in the realistic regime (13k photons/s
 per ion, blurred PSF with halo, laser scatter, surface defects):
 - chain physics against James' published values;
 - detector accuracy (photon-limited) and false-alarm rates at EM gain 1, 50 and 300,
@@ -691,6 +714,9 @@ per ion, blurred PSF with halo, laser scatter, surface defects):
   the readout camera settings enforced (set while armed, calibrate's overrides, the
   settings dialog: one `[readout]`); shutter (SetShutterEx's argument order), fan, and the
   electrons per count asked of the camera in the header's argument order (or configured);
+  the shutter and fan as a real camera may answer (refused while acquiring, busy just after
+  the abort, 0 ms refused, capabilities unreadable, no SetShutterEx), also during live video
+  on an emulated 888, including a restart that fails;
 - a full stack over real sipyco RPC with concurrent clients; the brightness in
   photoelectrons/s against the simulated truth at different gain settings, the shutter
   darkening live video and opening again, the fan; stray light taken for ions

@@ -1374,8 +1374,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sh_close = _spin(0, 5000, int(cam.get("shutter_close_ms", 0)), suffix=" ms",
                               width=90, tip="time the shutter takes to close")
         self.sh_state = _muted("", wrap=True)
+
+        def yes_no(v):
+            return "unknown" if v is None else ("yes" if v else "no")
+        facts = _muted("the camera reports: internal shutter {}; external output set separately "
+                       "{}; minimum closing / opening {} / {} ms".format(
+                           yes_no(caps.get("internal")), yes_no(caps.get("independent")),
+                           caps.get("min_close_ms", "?"), caps.get("min_open_ms", "?")),
+                       wrap=True)
         rows = [["shutter", self.sh_mode]]
-        if caps.get("independent"):
+        if caps.get("independent") is not False:
             rows.append(["external output", self.sh_ext])
         rows += [["output", self.sh_ttl],
                  ["opening / closing", _row(self.sh_open, self.sh_close, None)]]
@@ -1388,7 +1396,7 @@ class MainWindow(QtWidgets.QMainWindow):
                  _button("Open", lambda: self._set_shutter("open"), "permanently open"),
                  _button("Close", lambda: self._set_shutter("closed"),
                          "permanently closed - dark frames"), None),
-            self.sh_state,
+            self.sh_state, facts,
             _muted("Andor: in normal use permanently open, with 0 ms opening and closing "
                    "times; for automatic operation {} ms each.  The shutter is for "
                    "background frames and protection from light and dust, at most ~2 Hz - "
@@ -1406,10 +1414,11 @@ class MainWindow(QtWidgets.QMainWindow):
                  "series": "open while acquiring", "auto": "fully auto"}
         if sh and (self._caps.get("shutter") or {}).get("control", True):
             ext = ", external output {}".format(names.get(sh["external"], sh["external"])) \
-                if (self._caps.get("shutter") or {}).get("independent") else ""
-            self.sh_state.setText("now: {}{}; output {} opens; {} / {} ms".format(
+                if (self._caps.get("shutter") or {}).get("independent") is not False else ""
+            self.sh_state.setText("now: {}{}; output {} opens; {} / {} ms{}".format(
                 names.get(sh["mode"], sh["mode"]), ext, "high" if sh["ttl_high"] else "low",
-                sh["open_ms"], sh["close_ms"]))
+                sh["open_ms"], sh["close_ms"],
+                "\ncamera: " + sh["camera"] if sh.get("camera") else ""))
         if fan and (self._caps.get("fan") or {}).get("control", True):
             self.fan_state.setText("now: {}".format(fan))
 
