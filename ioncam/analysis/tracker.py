@@ -118,6 +118,53 @@ class _Pending:
             self.hits = np.concatenate([self.hits, np.ones(len(new))])
 
 
+_PSF_MEMORY = 0.8      # weight the earlier fits keep at every new one (~5 fits)
+
+
+def _smoothed_psf(old: Optional[dict], new: dict) -> dict:
+    """The PSF learned from successive averaged images, averaged: one fit alone
+    jitters by a few per cent (adopting every one changed the detection PSF,
+    the brightness references and the markers every few seconds).  Older fits
+    are forgotten gradually, so a slow drift of focus is followed.  A halo no
+    wider than the core says nothing about the halo: the halo known is kept,
+    and the first one seen is taken at once (the photometry, and so the
+    brightness in photoelectrons/s, reads ~15 % low without it).  A clearly
+    different fit starts afresh only when the next one confirms it (a
+    refocus persists, a stray fit does not).  The weight travels with the
+    estimate (restoring an estimate restores it)."""
+    def core(e):
+        return math.sqrt(e["sigma"][0] * e["sigma"][1])
+
+    def no_halo(e):
+        return e["halo_fraction"] < 0.02 or e["halo_sigma"] < 1.3 * core(e)
+
+    def differ(a, b, ds, dh):
+        return abs(math.log(core(a) / core(b))) > ds or \
+            abs(a["halo_fraction"] - b["halo_fraction"]) > dh
+
+    if old is None:
+        return dict(new, weight=1.0, outlier=None)
+    if no_halo(new):
+        new = dict(new, halo_fraction=old["halo_fraction"], halo_sigma=old["halo_sigma"])
+    elif no_halo(old):
+        old = dict(old, halo_fraction=new["halo_fraction"], halo_sigma=new["halo_sigma"])
+    if differ(new, old, 0.1, 0.12):
+        prev = old.get("outlier")
+        if prev is not None and not differ(new, prev, 0.05, 0.06):
+            # confirmed: a new PSF (the two fits that showed it, averaged)
+            return _smoothed_psf(dict(prev, weight=1.0, outlier=None), new)
+        return dict(old, outlier=new)                          # once: wait and see
+    w = _PSF_MEMORY * float(old.get("weight", 1.0))
+
+    def avg(a, b):
+        return (w * float(a) + float(b)) / (w + 1.0)
+    return {"sigma": (avg(old["sigma"][0], new["sigma"][0]),
+                      avg(old["sigma"][1], new["sigma"][1])),
+            "halo_fraction": avg(old["halo_fraction"], new["halo_fraction"]),
+            "halo_sigma": avg(old["halo_sigma"], new["halo_sigma"]),
+            "n_ions": new["n_ions"], "weight": w + 1.0, "outlier": None}
+
+
 def adopt_learned_psf(tracker: "ChainTracker", detection_cfg) -> Optional[str]:
     """Use the PSF the tracker measured on averaged frames of the live crystal
     for the per-frame detection too (``detection.auto_psf``): the detector then
@@ -282,6 +329,7 @@ class ChainTracker:
         self._state_since = self.clock()
         self._first_config = True
         self._chain = None              # (scale, center(2), axis(2)) of the last good fit
+        self._verified: dict = {}       # site id -> (x, y) re-measured on averaged frames
         self._premelt: Optional[List[Site]] = None
         self._hold: Optional[dict] = None
         self._after_hold: Optional[dict] = None
@@ -1112,6 +1160,26 @@ class ChainTracker:
 
     # -- commits ------------------------------------------------------------------------
 
+    def _settle_dark(self, ks) -> None:
+        """Sites ``ks`` just went dark and keep their place among the bright
+        ions from now on (see _dark_follow): put them where the averaged frames
+        last measured them relative to the bright ions, rather than leave them
+        where single frames happened to put them."""
+        v = self._verified
+        ref = [s for s in self.sites if s.state == BRIGHT and s.id in v]
+        if not ref:
+            return
+        c_now = np.mean([[s.x, s.y] for s in ref], axis=0)
+        c_then = np.mean([v[s.id] for s in ref], axis=0)
+        for k in ks:
+            s = self.sites[k]
+            if s.id not in v:
+                continue
+            x, y = np.asarray(v[s.id]) - c_then + c_now
+            # (unless the crystal changed since: then the measurement is stale)
+            if math.hypot(x - s.x, y - s.y) < 0.5 * self.cfg.match_radius:
+                s.x, s.y = float(x), float(y)
+
     def _commit_sites(self, newly_dark, newly_bright, obs, t, events):
         self._avg_reset()
         for k in newly_dark:
@@ -1120,6 +1188,7 @@ class ChainTracker:
         for k in newly_bright:
             s = self.sites[k]
             s.state, s.since, s.inferred = BRIGHT, t, False
+        self._settle_dark(newly_dark)
         if len(newly_dark) == 1 and len(newly_bright) == 1:
             events.append(self._event(
                 "dark_ion_moved", "warning",
@@ -1228,13 +1297,33 @@ class ChainTracker:
             scale, _, axis = self._chain
             self._chain = (scale, pos[0].copy(), axis)
 
+    def _bright_centroid(self) -> Optional[np.ndarray]:
+        b = [(s.x, s.y) for s in self.sites if s.state == BRIGHT]
+        return np.mean(b, axis=0) if b else None
+
+    def _dark_follow(self, c0: Optional[np.ndarray]) -> None:
+        """Move the dark sites as the centroid of the bright ones moved since
+        ``c0``.  A dark ion's place is known only relative to the crystal, so
+        it keeps its place relative to the bright ions exactly.  Following
+        another estimate of their motion (a median, the change of one re-measured
+        ion) moved it a little at every update, and those steps added up: the
+        dark ion wandered, and the chain's length and angle with it."""
+        c1 = self._bright_centroid()
+        if c0 is None or c1 is None:
+            return
+        dx, dy = float(c1[0] - c0[0]), float(c1[1] - c0[1])
+        for s in self.sites:
+            if s.state == DARK:
+                s.x += dx
+                s.y += dy
+
     def _apply_tracking(self, obs, spots, t, full: bool = False) -> None:
         """Follow slow drifts / confirmed rigid moves and adapt brightness references.
 
-        Single-frame positions of dim ions are noisy, so normally every site only
-        moves part of the way (``position_smoothing``) towards its spot - dark
-        sites by the same fraction of the common shift.  A confirmed rigid move
-        (``full``) is applied at once."""
+        Single-frame positions of dim ions are noisy, so normally every bright
+        site only moves part of the way (``position_smoothing``) towards its
+        spot.  A confirmed rigid move (``full``) is applied at once.  Dark sites
+        move with the bright ones (see _dark_follow)."""
         cfg = self.cfg
         a = cfg.position_smoothing
         shift = np.asarray(obs["shift"], float)
@@ -1243,14 +1332,17 @@ class ChainTracker:
         self.last_shift = shift
         matched = {k: j for k, j in obs["pairs"]}
         fitted = obs.get("fitted")
+        c0 = self._bright_centroid()
         if not full and fitted is not None and np.any(np.isfinite(fitted[:, 0])):
             # the sites fitted to this frame (as many components as bright ions, so
             # two blended ions can never pull a site in between): smooth towards
-            # them; dark sites follow the mean motion of the bright ones
+            # them; a bright site without a fit follows the others
             ok = np.isfinite(fitted[:, 0])
             pos = self.positions()
             drift = np.median(fitted[ok] - pos[ok], axis=0)
             for k, s in enumerate(self.sites):
+                if s.state == DARK:
+                    continue
                 tx, ty = fitted[k] if ok[k] else pos[k] + drift
                 s.x += a * (float(tx) - s.x)
                 s.y += a * (float(ty) - s.y)
@@ -1258,6 +1350,8 @@ class ChainTracker:
             self._moved_accum = self._moved_accum - a * shift + applied
         else:
             for k, s in enumerate(self.sites):
+                if s.state == DARK:
+                    continue
                 if full:
                     s.x += float(shift[0])
                     s.y += float(shift[1])
@@ -1268,6 +1362,7 @@ class ChainTracker:
                 elif not full:
                     s.x += float(applied[0])
                     s.y += float(applied[1])
+        self._dark_follow(c0)
         region = obs.get("region")
         if region is not None and region > 0 and not obs["missing"]:
             if self._region_ref is None:
@@ -1282,7 +1377,11 @@ class ChainTracker:
         if self._chain is not None:
             scale, center, axis = self._chain
             self._chain = (scale, center + applied, axis)
-            if len(self.sites) >= 2 and np.random.random() < 0.05:
+            # the chain's length and angle are fitted to the positions measured
+            # on averaged frames (see _verify): single-frame positions made them
+            # jitter by a few per cent
+            if len(self.sites) >= 2 and cfg.verify_period <= 0 and \
+                    np.random.random() < 0.05:
                 self._update_chain_fit()
 
     # -- re-measuring the crystal on averaged frames --------------------------------
@@ -1432,7 +1531,7 @@ class ChainTracker:
 
     def _learn_psf(self, mean: np.ndarray, guesses: np.ndarray, det: DetectionResult,
                    var_mean: np.ndarray, span: Tuple[float, float] = (0.6, 1.6),
-                   known_count: bool = False) -> PSF:
+                   known_count: bool = False, smooth: bool = True) -> PSF:
         """Fit core + halo to the averaged crystal.  The estimate is kept only if
         the model then explains the image down to the noise (with the wrong
         number of ions it would not, and a PSF bent to hide an ion is worse than
@@ -1474,9 +1573,10 @@ class ChainTracker:
             ok = chi2 < 2.0
         if not ok:
             return cur
-        self.psf_estimate = {"sigma": (float(sx), float(sy)),
-                             "halo_fraction": float(g.halo_fraction),
-                             "halo_sigma": float(g.halo_sigma), "n_ions": len(guesses)}
+        new = {"sigma": (float(sx), float(sy)), "halo_fraction": float(g.halo_fraction),
+               "halo_sigma": float(g.halo_sigma), "n_ions": len(guesses)}
+        self.psf_estimate = _smoothed_psf(self.psf_estimate, new) if smooth else \
+            dict(new, weight=1.0, outlier=None)
         return self._psf_for(det)
 
     def _verify(self, det: DetectionResult, t: float, events) -> None:
@@ -1509,9 +1609,14 @@ class ChainTracker:
         found = np.column_stack([fx, fy])
         shift, pairs, miss, extra = align(bpos, found, self.cfg.match_radius, 2.0)
         if (not miss and not extra) or len(found) == len(bright):
-            # same crystal, measured more precisely: refine the site positions
+            # same crystal, measured more precisely: refine the site positions (the
+            # dark ones move with the bright ones)
+            c0 = self._bright_centroid()
             for i, j in pairs:
                 bright[i].x, bright[i].y = map(float, found[j])
+            self._dark_follow(c0)
+            self._update_chain_fit()
+            self._verified = {s.id: (s.x, s.y) for s in self.sites}
             return
         dark = [s for s in self.sites if s.state == DARK and
                 np.min(np.hypot(found[:, 0] - s.x, found[:, 1] - s.y)) > self.cfg.match_radius]
@@ -1701,7 +1806,8 @@ class ChainTracker:
         g = np.column_stack([old[:, 0] - x0 - crop[0] - ua, old[:, 1] - y0 - crop[1] - va])
         before_e = self.psf_estimate
         before = self._psf_for(det)
-        after = self._learn_psf(mean, g, det, var_mean, span=(1.0, 2.5), known_count=True)
+        after = self._learn_psf(mean, g, det, var_mean, span=(1.0, 2.5), known_count=True,
+                                smooth=False)
         if self.psf_estimate is before_e:
             return None
         w0, w1 = math.sqrt(before.sx * before.sy), math.sqrt(after.sx * after.sy)

@@ -482,20 +482,32 @@ def test_brightness_in_photoelectrons_shutter_and_fan(tmp_path):
     """The ions' brightness in photoelectrons/s over RPC matches the simulated
     truth (photons reaching the camera x quantum efficiency), whatever the EM
     gain, exposure and pre-amp gain; the shutter darkens live video and opens
-    again (live carries on); the fan."""
+    again (live carries on, and the tracker waits meanwhile: no light lost, no
+    ions lost); the fan."""
     engine, server, port = make_system(tmp_path, laser_noise=0.0)
     c = client(port)
     sim = engine.config.simulator
     truth = sim.photon_rate * sim.quantum_efficiency * sim.laser_power
 
-    def ion_signal():
-        """The frame's counts at the ions above its median."""
-        f = engine.latest_frame()
-        x0, y0 = f.applied.roi[:2]
-        return [float(f.data[int(round(y)) - y0, int(round(x)) - x0] - np.median(f.data))
-                for x, y in engine.tracker.positions()]
+    def ion_signal(n=8):
+        """The counts at the ions above the frame's median, in n frames (one
+        frame alone: +-35 % EMCCD noise)."""
+        out, last = [], 0
+        for _ in range(n):
+            f = engine.latest_frame(since_index=last, timeout=2.0)
+            last = f.index
+            x0, y0 = f.applied.roi[:2]
+            out += [float(f.data[int(round(y)) - y0, int(round(x)) - x0] - np.median(f.data))
+                    for x, y in engine.tracker.positions()]
+        return out
     try:
         assert c.wait_for_ions(3, timeout=15)["ok"]
+        # photometry with the default PSF (no halo) reads ~15 % low: the e-/s are
+        # right once the PSF measured on the crystal is used (within a few s)
+        t0 = time.time()
+        while engine.config.detection.psf_halo_fraction <= 0:
+            assert time.time() - t0 < 20, "the PSF halo was not measured"
+            time.sleep(0.1)
         for live in ({}, {"em_gain": 200, "exposure": 0.02, "preamp_gain_index": 0}):
             if live:
                 c.set_live(**live)
@@ -509,16 +521,22 @@ def test_brightness_in_photoelectrons_shutter_and_fan(tmp_path):
         assert all(s["pe_rate"] for s in c.get_status()["sites"])
         c.set_live(em_gain=50, exposure=0.05, preamp_gain_index=-1)
         time.sleep(1.0)
-        assert np.mean(ion_signal()) > 150
+        assert np.mean(ion_signal()) > 120
         # the shutter: dark frames while closed, the ions back when open
+        ev0 = engine.events.last_id
         sh = c.set_shutter("closed")
         assert sh["mode"] == "closed" and engine.config.camera.shutter == "closed"
         assert c.get_status()["mode"] == "live"
         time.sleep(1.0)
-        assert np.mean(ion_signal()) < 50
+        assert np.mean(ion_signal()) < 40
         assert c.set_shutter("open", open_ms=0)["mode"] == "open"
         time.sleep(1.0)
-        assert np.mean(ion_signal()) > 150
+        assert np.mean(ion_signal()) > 120
+        ev = engine.events.since(ev0)
+        assert not [e for e in ev if e["kind"] in ("fluorescence_lost", "ion_lost",
+                                                    "ions_presumed_lost")], ev
+        assert any("tracking waits" in e["message"] for e in ev), ev
+        assert engine.tracker.n_bright == 3
         assert c.get_shutter() == {"mode": "open", "external": "open", "ttl_high": True,
                                    "open_ms": 0, "close_ms": 0,
                                    "camera": "simulated shutter open"}

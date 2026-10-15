@@ -306,6 +306,10 @@ class IonCamEngine:
         self._detection: Optional[DetectionResult] = None
         self._det_summary: dict = {}
         self._last_analysis = 0.0
+        # the shutter keeps the light from the sensor (closed, or still opening
+        # until _blind_until): the tracker waits for frames that show the ions
+        self._blind = False
+        self._blind_until = 0.0
         self._collector: Optional[List[Frame]] = None
 
         self._temperature: Tuple[float, str] = (float("nan"), "unknown")
@@ -335,6 +339,7 @@ class IonCamEngine:
     def _open_camera(self) -> dict:
         info = self.camera.open()
         cc = self.config.camera
+        self._blind = self._shutter_blinds(cc.shutter)
         self._shutter_note = getattr(self.camera, "shutter_note", "") or ""
         if self._shutter_note.startswith("the shutter could not be set"):
             self.events.emit("camera_settings", self._shutter_note, "warning")
@@ -577,13 +582,16 @@ class IonCamEngine:
             return
         self._last_analysis = now
         frame = live[-1]
+        # with the shutter closed the frames show nothing of the ions: the
+        # tracker waits (instead of reporting their light gone, then them lost)
+        blind = self._blind or frame.timestamp < self._blind_until
         with self._tracker_lock:
             prior = self.tracker.prior()
         det = self.detector.analyze(frame, prior=prior)
         with self._tracker_lock:
-            events = self.tracker.update(det, frame.timestamp)
+            events = [] if blind else self.tracker.update(det, frame.timestamp)
             snap = self.tracker.snapshot()
-            psf_msg = adopt_learned_psf(self.tracker, self.config.detection)
+            psf_msg = None if blind else adopt_learned_psf(self.tracker, self.config.detection)
         if psf_msg:
             self.events.emit("psf_updated", psf_msg, "info")
         self._detection = det
@@ -1674,15 +1682,41 @@ class IonCamEngine:
 
         def run():
             settle = 0.1 + 1e-3 * max(new["shutter_open_ms"], new["shutter_close_ms"])
-            self._shutter_note = self._on_camera("shutter", lambda: self.camera.set_shutter(
-                new["shutter"], new["external_shutter"], new["shutter_ttl_high"],
-                new["shutter_open_ms"], new["shutter_close_ms"]), settle)
+            was, blind = self._blind, self._shutter_blinds(new["shutter"])
+            self._blind = was or blind          # (no frame of a closing shutter is tracked)
+            try:
+                self._shutter_note = self._on_camera("shutter", lambda: self.camera.set_shutter(
+                    new["shutter"], new["external_shutter"], new["shutter_ttl_high"],
+                    new["shutter_open_ms"], new["shutter_close_ms"]), settle)
+            except Exception:
+                self._blind = was
+                raise
             self.config.update("camera", new)
+            if was and not blind:
+                self._blind_until = time.time() + settle      # (nor of an opening one)
+            self._blind = blind
+            note = self._shutter_note
+            if blind and not was:
+                note += " - ion tracking waits until it opens"
+            elif was and not blind:
+                note += " - ion tracking carries on"
             self.events.emit("camera_settings", "shutter {}{}: {}".format(
                 new["shutter"], "" if new["external_shutter"] == "open" else
-                ", external {}".format(new["external_shutter"]), self._shutter_note), "info")
+                ", external {}".format(new["external_shutter"]), note), "info")
             return self.shutter_settings()
         return self._call(run)
+
+    def _shutter_blinds(self, mode: str) -> bool:
+        """Does shutter ``mode`` keep the light from the sensor?  "closed" does,
+        unless the camera says it has no internal shutter: then only its shutter
+        output switches, and what that does depends on what is wired to it."""
+        if mode != "closed":
+            return False
+        try:
+            internal = (self.camera.capabilities().get("shutter") or {}).get("internal")
+        except Exception:
+            internal = None
+        return internal is not False
 
     def shutter_settings(self) -> dict:
         """The shutter settings and what the camera answered last."""

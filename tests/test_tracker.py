@@ -52,6 +52,63 @@ def test_dark_ion_is_not_lost(site):
     assert (sc.tracker.n_bright, sc.tracker.n_dark) == (5, 0)
 
 
+@pytest.mark.parametrize("n,site", [(2, 1), (5, 2)])
+def test_dark_ion_stays_put_and_the_chain_with_it(n, site):
+    """One ion dark for long: the bright ones are tracked frame by frame and
+    re-measured on averaged frames again and again, and the dark one must keep
+    its place among them exactly - it used to wander a little at every update,
+    and the chain's length and angle changed on their own.  The chain is fitted
+    to the positions measured on averaged frames (steady), and the PSF measured
+    meanwhile is not handed to the detection anew every few seconds."""
+    sc = settle(n, psf_sigma=1.82)
+    sc.scene.set_dark(site, True)
+    sc.run(1.5)
+    assert kinds(sc.take()) == ["ion_dark"]
+    truth = np.array(sc.scene.state()["positions"])
+    i0 = len(sc.psf_messages)
+    rel, errors, scales, angles = [], [], [], []
+    for _ in range(30):
+        sc.run(1.0)
+        assert [s.state for s in sc.tracker.sites] == \
+            ["dark" if k == site else "bright" for k in range(n)]
+        pos = sc.tracker.positions()
+        rel.append(pos[site] - np.delete(pos, site, axis=0).mean(axis=0))
+        errors.append(np.hypot(*(pos[site] - truth[site])))
+        chain = sc.tracker.snapshot()["chain"]
+        scales.append(chain["scale_px"])
+        angles.append(chain["angle_deg"])
+    assert sc.take() == []
+    assert np.ptp(np.array(rel), axis=0).max() < 0.05, rel
+    assert max(errors) < 0.6, errors       # (the bright ions' own tracking noise)
+    assert np.ptp(scales) < 0.02 * np.mean(scales), scales
+    assert np.ptp(angles) < 1.0, angles
+    assert sum(map(bool, sc.psf_messages[i0:])) <= 3, [m for m in sc.psf_messages if m]
+
+
+def test_learned_psf_is_smoothed():
+    """Successive PSF fits on averaged frames are averaged; a fit that sees no
+    halo keeps the halo known; one stray fit is ignored, a change the next fit
+    confirms (a refocus) is taken at once."""
+    from ioncam.analysis.tracker import _smoothed_psf
+
+    def fit(s, f=0.15, h=4.5):
+        return {"sigma": (s, s), "halo_fraction": f, "halo_sigma": h, "n_ions": 2}
+    e = _smoothed_psf(None, fit(1.80, f=0.0, h=0.0))
+    e = _smoothed_psf(e, fit(1.86))           # the first halo seen is taken at once
+    assert (e["halo_fraction"], e["halo_sigma"]) == pytest.approx((0.15, 4.5))
+    for s in (1.76, 1.84, 1.78):
+        e = _smoothed_psf(e, fit(s))
+    assert e["sigma"][0] == pytest.approx(1.81, abs=0.02)
+    e = _smoothed_psf(e, fit(1.80, f=0.01, h=1.5))
+    assert (e["halo_fraction"], e["halo_sigma"]) == pytest.approx((0.15, 4.5))
+    stray = _smoothed_psf(e, fit(2.4))
+    assert stray["sigma"] == e["sigma"]
+    assert _smoothed_psf(stray, fit(1.81))["sigma"][0] == pytest.approx(1.81, abs=0.02)
+    assert _smoothed_psf(stray, fit(2.42, f=0.35))["sigma"] == e["sigma"]    # no match
+    refocused = _smoothed_psf(stray, fit(2.42))
+    assert refocused["sigma"][0] == pytest.approx(2.41, abs=0.01)
+
+
 @pytest.mark.parametrize("site", [0, 2, 4])
 def test_lost_ion_detected_by_rearrangement(site):
     sc = settle(5)

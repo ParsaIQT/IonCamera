@@ -56,7 +56,7 @@ pip install git+https://github.com/m-labs/sipyco      # not on PyPI (ARTIQ envs 
 ioncam_gui --simulate          # GUI + simulated trap; use the "Simulation" tab to play
 ioncam_gui --simulate --sim-camera 888    # ... as an iXon Ultra 888 (1024 x 1024)
 aqctl_ioncam --simulate        # headless RPC server with the simulator
-pytest                         # 135 tests (~3 min), all on the simulator / emulated SDK
+pytest                         # 138 tests (~4 min), all on the simulator / emulated SDK
 ```
 
 ### The GUI
@@ -208,9 +208,18 @@ gives clean fingerprints:
   average still shows the old crystal (dim chains produce odd single frames all the
   time). The crystal's light budget helps: two ions seen as one keep their light, a lost
   ion takes one ion's worth with it.
+* A dark ion's place is known only relative to the bright ions, so it keeps that place
+  exactly. When it goes dark it is put where the averaged frames last measured it. From
+  then on it moves only as the centroid of the bright ions moves, in every frame and at
+  every re-measurement. The chain's length and angle are fitted to the positions measured
+  on averaged frames (every `tracker.verify_period`, 2 s), so they do not jitter with
+  single frames.
 * The PSF (core + halo) is measured on averaged frames of the live crystal and handed to
   the detector (`detection.auto_psf`), so a wrong `detection.psf_sigma` corrects itself
-  without a calibration. After refocusing, a detector still assuming the sharper image
+  without a calibration. One measurement alone jitters by a few per cent, so successive
+  ones are averaged, and a clearly different one counts only when the next one agrees:
+  the detector, the brightness references and the markers do not change every few
+  seconds. After refocusing, a detector still assuming the sharper image
   would split each ion in two: if the same ions with a re-fitted, wider PSF explain the
   frames, it is reported as `focus_changed`, not as trapped ions.
 * The green circles around the ions hold `tracker.marker_light_fraction` (80 %) of an
@@ -474,6 +483,12 @@ from light and dust, at most about 2 Hz, so it is not for video. **Close** in th
 gives dark frames while live video carries on, and **Open** brings the light back. "Open while
 acquiring" keeps the sensor dark between acquisitions.
 
+While the internal shutter is closed, ion tracking waits. Dark frames say nothing about the
+ions, so there is no "fluorescence lost" and no "ions presumed lost" 30 s later. When the
+shutter opens, tracking carries on with the crystal as it was, dark ions included, and any
+change shows up as usual. A camera without an internal shutter (the Camera tab says
+"internal shutter no") only switches its shutter output, so tracking carries on regardless.
+
 How a change reaches the camera: ioncam first sends it while the camera runs (other Andor
 drivers, such as pylablib, do too). Only if the camera refuses that ("acquisition in
 progress") does ioncam stop the acquisition, wait until the camera reports it is idle, apply
@@ -615,6 +630,27 @@ The console has every call with its answer. A camera that controls its internal 
 shutters separately needs `SetShutterEx`; ioncam uses it whenever the camera has it or does
 not say.
 
+**A dark ion slowly wanders, and the chain's length and angle change on their own**
+(versions before October 2026). A dark ion's position can only be carried along with the
+bright ions, and two things moved it a little relative to them at every update:
+- Every 2 s the tracker re-measures the bright ions on averaged frames. It moved them to
+  the new measurement and left the dark ion where it was, a step of about 0.1 px each
+  time.
+- From frame to frame, the dark ion followed the median motion of the bright ions. With
+  three or more bright ions, that differs slightly from their actual motion.
+
+These steps added up: the dark ion drifted by up to a pixel in a minute. The chain was
+fitted to all the ions, single-frame noise included, so its length and angle drifted
+with the dark ion and jittered by a few per cent even with every ion bright.
+
+Now a dark ion keeps its place among the bright ions exactly, and the chain is fitted
+only to the positions measured on averaged frames. With two ions, one of them dark, the
+length and angle stay constant. With every ion bright they vary about three times less
+than before.
+
+The PSF measured on the same averaged frames also jumped by a few per cent each time
+and was handed to the detector every few seconds. It is now averaged.
+
 **Every button fails with "Event loop is closed"** (versions before October 2026). The
 RPC server had failed to start, usually because sipyco was missing, and the GUI ran its
 actions through the server's event loop. The GUI hid the failure: start-up hung for 10 s,
@@ -686,19 +722,22 @@ These are worth knowing, because several would silently corrupt data:
 
 ## Tests
 
-`pytest` runs 135 tests in about 3 minutes, in the realistic regime (13k photons/s
+`pytest` runs 138 tests in about 4 minutes, in the realistic regime (13k photons/s
 per ion, blurred PSF with halo, laser scatter, surface defects):
 - chain physics against James' published values;
 - detector accuracy (photon-limited) and false-alarm rates at EM gain 1, 50 and 300,
   also with a camera ROI hugging the crystal, clouds vs ions, the learned background on a
   dirty surface with ion-like dust (any ROI and binning, laser power changes);
 - the joint core + halo fit of a dense chain (unbiased, honest errors) and its Jacobian;
-- every tracker scenario (load via cloud, dark vs lost at every chain position, loss with
+- every tracker scenario (load via cloud, dark vs lost at every chain position, a dark
+  ion that keeps its place for long in a chain of 2 and of 5 (with the chain's length
+  and angle), loss with
   a dark ion present, melting, lasers off, rigid moves, shuttling with hold, a quiet
   stable crystal), and a tight trap (PSF 1.2 px, two or three ions ~4 px apart): dark
   then bright then lost at every site, the PSF learned from the live crystal, a
   full-sensor start, refocusing, a trap turned by 45° and 90°, the per-ion brightness
-  trace and the 80 %-light marker size;
+  trace and the 80 %-light marker size, the learned PSF averaged (a stray fit ignored,
+  a refocus taken);
 - planner invariants, its containment / crosstalk against the simulated image (halo
   included), and agreement with the Grabber gateware model, including its `x1` quirk;
   close ions get overlapping ROIs instead of an error, one centred super-pixel per ion
@@ -719,7 +758,8 @@ per ion, blurred PSF with halo, laser scatter, surface defects):
   on an emulated 888, including a restart that fails;
 - a full stack over real sipyco RPC with concurrent clients; the brightness in
   photoelectrons/s against the simulated truth at different gain settings, the shutter
-  darkening live video and opening again, the fan; stray light taken for ions
+  darkening live video and opening again (the tracker waiting meanwhile), the fan; stray
+  light taken for ions
   (the hint, a tight crop, a search region, a typed AQROI, the AQROI by hand and
   Calibrate + arm inside it);
 - a headless GUI test (levels set by hand stay put, the D-pad direction through the
