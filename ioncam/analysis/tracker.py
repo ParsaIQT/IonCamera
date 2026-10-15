@@ -1306,8 +1306,10 @@ class ChainTracker:
         ``c0``.  A dark ion's place is known only relative to the crystal, so
         it keeps its place relative to the bright ions exactly.  Following
         another estimate of their motion (a median, the change of one re-measured
-        ion) moved it a little at every update, and those steps added up: the
-        dark ion wandered, and the chain's length and angle with it."""
+        ion) moved it a little at every update - the same way every time when the
+        re-measurements lean one way (a slowly drifting image: the averages lag
+        behind) - and those steps added up: the dark ion drifted away, and the
+        chain's length and angle with it."""
         c1 = self._bright_centroid()
         if c0 is None or c1 is None:
             return
@@ -1614,6 +1616,13 @@ class ChainTracker:
             c0 = self._bright_centroid()
             for i, j in pairs:
                 bright[i].x, bright[i].y = map(float, found[j])
+            # the crystal's slow drift ("chain_moved") counts this correction too:
+            # single frames may place the ions a little off the averaged
+            # measurement, always the same way, and the per-frame moves alone
+            # then add up to a move that never happened
+            c1 = self._bright_centroid()
+            if c0 is not None and c1 is not None:
+                self._moved_accum = self._moved_accum + (c1 - c0)
             self._dark_follow(c0)
             self._update_chain_fit()
             self._verified = {s.id: (s.x, s.y) for s in self.sites}

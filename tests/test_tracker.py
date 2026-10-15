@@ -85,6 +85,61 @@ def test_dark_ion_stays_put_and_the_chain_with_it(n, site):
     assert sum(map(bool, sc.psf_messages[i0:])) <= 3, [m for m in sc.psf_messages if m]
 
 
+def test_dark_ion_moves_with_a_slowly_drifting_crystal():
+    """The whole crystal drifts slowly (the imaging warming up, the trap
+    charging), so the 2 s averages of the re-measurement lag behind the latest
+    frames, and every re-measurement moved the bright ion back the same way and
+    left the dark one ahead: the dark ion drifted steadily in the direction of
+    the motion, the chain growing and turning.  It must move with the crystal."""
+    sc = settle(2, psf_sigma=1.82)
+    sc.run(4.0)
+    sc.scene.set_dark(1, True)
+    sc.run(1.5)
+    assert kinds(sc.take()) == ["ion_dark"]
+    chain0 = sc.tracker.snapshot()["chain"]
+    gaps = []
+    for _ in range(120):                    # 30 s at 3 px/min along the chain, 1 across
+        sc.scene.shift(3.0 / 240, 1.0 / 240)
+        sc.run(0.25)
+        pos = sc.tracker.positions()
+        gaps.append(pos[1] - pos[0])
+    assert kinds(sc.take()) == []           # (1.6 px is no "chain_moved" yet)
+    assert np.ptp(np.array(gaps), axis=0).max() < 0.05, gaps
+    truth = np.array(sc.scene.state()["positions"])
+    assert np.hypot(*(sc.tracker.positions()[1] - truth[1])) < 0.4
+    chain = sc.tracker.snapshot()["chain"]
+    assert chain["scale_px"] == pytest.approx(chain0["scale_px"], rel=0.005)
+    assert chain["angle_deg"] == pytest.approx(chain0["angle_deg"], abs=0.2)
+
+
+def test_frames_placing_the_ions_off_the_average_are_no_drift():
+    """Single frames may place the ions a little off the averaged measurement,
+    always the same way, so every re-measurement corrects them the same way:
+    that must neither move a dark ion nor add up to a "chain moved" that never
+    happened (which also marks the readout plan outdated)."""
+    sc = settle(2, psf_sigma=1.82)
+    analyze = sc.detector.analyze
+
+    def biased(frame, prior=None):
+        det = analyze(frame, prior=prior)
+        for s in det.spots:
+            s.x += 0.25
+            s.y += 0.10
+        return det
+    sc.detector.analyze = biased
+    sc.run(35.0)
+    assert sc.take() == []
+    sc.scene.set_dark(1, True)
+    sc.run(1.5)
+    assert kinds(sc.take()) == ["ion_dark"]
+    pos = sc.tracker.positions()
+    gap0 = pos[1] - pos[0]
+    sc.run(30.0)
+    assert sc.take() == []
+    pos = sc.tracker.positions()
+    assert np.hypot(*(pos[1] - pos[0] - gap0)) < 0.05
+
+
 def test_learned_psf_is_smoothed():
     """Successive PSF fits on averaged frames are averaged; a fit that sees no
     halo keeps the halo known; one stray fit is ignored, a change the next fit

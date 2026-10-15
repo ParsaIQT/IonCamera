@@ -56,7 +56,7 @@ pip install git+https://github.com/m-labs/sipyco      # not on PyPI (ARTIQ envs 
 ioncam_gui --simulate          # GUI + simulated trap; use the "Simulation" tab to play
 ioncam_gui --simulate --sim-camera 888    # ... as an iXon Ultra 888 (1024 x 1024)
 aqctl_ioncam --simulate        # headless RPC server with the simulator
-pytest                         # 138 tests (~4 min), all on the simulator / emulated SDK
+pytest                         # 140 tests (~5 min), all on the simulator / emulated SDK
 ```
 
 ### The GUI
@@ -630,23 +630,31 @@ The console has every call with its answer. A camera that controls its internal 
 shutters separately needs `SetShutterEx`; ioncam uses it whenever the camera has it or does
 not say.
 
-**A dark ion slowly wanders, and the chain's length and angle change on their own**
+**A dark ion drifts away, and the chain's length and angle change on their own**
 (versions before October 2026). A dark ion's position can only be carried along with the
-bright ions, and two things moved it a little relative to them at every update:
-- Every 2 s the tracker re-measures the bright ions on averaged frames. It moved them to
-  the new measurement and left the dark ion where it was, a step of about 0.1 px each
-  time.
-- From frame to frame, the dark ion followed the median motion of the bright ions. With
-  three or more bright ions, that differs slightly from their actual motion.
+bright ions. Every 2 s the tracker re-measures the bright ions on averaged frames. It
+moved them to the new measurement but left the dark ion where it was.
+- When these corrections lean the same way every time, the dark ion drifts steadily in
+  one direction. That happens when the whole image drifts slowly (the camera or
+  objective warming up, the trap charging), because a 2 s average lags behind the latest
+  frame. It also happens when single frames place the ions a little off the averaged
+  measurement. In the simulator, a drift of 3 px a minute moved the dark ion 1-2 px a
+  minute relative to the bright one.
+- Otherwise the corrections are random and the dark ion wanders back and forth.
 
-These steps added up: the dark ion drifted by up to a pixel in a minute. The chain was
-fitted to all the ions, single-frame noise included, so its length and angle drifted
-with the dark ion and jittered by a few per cent even with every ion bright.
+With three or more bright ions, the dark ion also followed the median motion of the
+bright ions from frame to frame, which adds a little more. The chain is fitted to all
+the ions, so its length and angle followed the dark ion.
 
 Now a dark ion keeps its place among the bright ions exactly, and the chain is fitted
-only to the positions measured on averaged frames. With two ions, one of them dark, the
-length and angle stay constant. With every ion bright they vary about three times less
-than before.
+only to positions measured on averaged frames. With two ions, one of them dark, the
+length and angle stay constant, and with every ion bright they vary about three times
+less than before.
+
+The same corrections also produced a false "chain moved" event, which marks the readout
+plan outdated. The tracker adds up the crystal's moves from frame to frame and reports
+one at 3 px, but the corrections were not counted. Now they are, so "chain moved" means
+the crystal really moved.
 
 The PSF measured on the same averaged frames also jumped by a few per cent each time
 and was handed to the detector every few seconds. It is now averaged.
@@ -722,7 +730,7 @@ These are worth knowing, because several would silently corrupt data:
 
 ## Tests
 
-`pytest` runs 138 tests in about 4 minutes, in the realistic regime (13k photons/s
+`pytest` runs 140 tests in about 5 minutes, in the realistic regime (13k photons/s
 per ion, blurred PSF with halo, laser scatter, surface defects):
 - chain physics against James' published values;
 - detector accuracy (photon-limited) and false-alarm rates at EM gain 1, 50 and 300,
@@ -731,7 +739,8 @@ per ion, blurred PSF with halo, laser scatter, surface defects):
 - the joint core + halo fit of a dense chain (unbiased, honest errors) and its Jacobian;
 - every tracker scenario (load via cloud, dark vs lost at every chain position, a dark
   ion that keeps its place for long in a chain of 2 and of 5 (with the chain's length
-  and angle), loss with
+  and angle), also while the crystal drifts slowly and when single frames place the
+  ions off the averaged measurement (no false "chain moved"), loss with
   a dark ion present, melting, lasers off, rigid moves, shuttling with hold, a quiet
   stable crystal), and a tight trap (PSF 1.2 px, two or three ions ~4 px apart): dark
   then bright then lost at every site, the PSF learned from the live crystal, a
