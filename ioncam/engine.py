@@ -291,6 +291,10 @@ class IonCamEngine:
         self._stray_hint = False                      # the stray-light hint was given
         self._procedure: Optional[dict] = None
         self._abort = threading.Event()
+        # a procedure that holds the camera for long (the characterization): other
+        # callers are told so at once instead of waiting for it
+        self._long_procedure: Optional[str] = None
+        self._char = None                 # the last camera characterization
         self._error: Optional[str] = None
 
         self._frame_cond = threading.Condition()
@@ -385,6 +389,10 @@ class IonCamEngine:
             return fn(*args, **kwargs)
         if not self._running:
             raise CameraError("engine not running")
+        if self._long_procedure:
+            pr = self._procedure or {}
+            raise ProcedureError("{} running ({:.0%} done) - abort it first".format(
+                self._long_procedure, float(pr.get("progress") or 0.0)))
         fut: concurrent.futures.Future = concurrent.futures.Future()
         self._cmd.put((fn, args, kwargs, fut))
         self.camera.cancel_wait()
@@ -1835,6 +1843,108 @@ class IonCamEngine:
                 np.save(stem + ".npy", image.astype(np.float32))
         except OSError as e:  # pragma: no cover
             logger.warning("could not save %s: %s", kind, e)
+
+    # -- camera characterization ---------------------------------------------------------
+
+    def start_characterization(self, **options) -> dict:
+        """Dark frames at many readout settings with the shutter closed (see
+        :mod:`ioncam.characterize`; ``options`` override ``[characterize]``,
+        ``region`` = [x0, y0, x1, y1]).  Starts in the background and returns
+        the plan (settings, estimated duration, directory); follow it with
+        :meth:`characterization_status`, stop it with :meth:`abort`.  Refused
+        while armed for ARTIQ unless ``force``."""
+        from ioncam.characterize import Characterization
+        options = dict(options)
+        if options.pop("dry_run", False):
+            return Characterization(self, options).describe()
+        if self._procedure is not None:
+            raise ProcedureError("'{}' is running".format(self._procedure["name"]))
+        if self._mode == READOUT and not options.get("force"):
+            raise ProcedureError("armed for the Grabber readout: the characterization takes "
+                                 "the camera for a long time - disarm first")
+        char = Characterization(self, options)
+        self._char = char
+        info = char.describe()
+        self.events.emit("characterization", "Camera characterization started: {} settings, "
+                         "about {:.0f} min, shutter closed - results in {}".format(
+                             info["points"], info["estimate_s"] / 60.0, info["directory"]),
+                         "info")
+
+        def run():
+            try:
+                self._procedure_run("characterize_camera", char.proc)
+            except Exception as e:  # reported by the procedure / the status
+                if char.state in ("planned", "running"):    # it never got going
+                    char.state = "failed"
+                    char.error = str(e)
+        threading.Thread(target=run, name="ioncam-characterize", daemon=True).start()
+        return info
+
+    def characterization_status(self) -> dict:
+        """The running (or last) characterization: state, progress, time left,
+        the latest settings measured."""
+        if self._char is None:
+            return {"state": "idle"}
+        return self._char.status()
+
+    def characterization_results(self, directory: Optional[str] = None, **spam) -> dict:
+        """A characterization's results (the last one, or the one in
+        ``directory``) with the SPAM ranking for ``spam`` (the
+        ``[characterize]`` SPAM options: ion_rate, roi_fraction, roi_pixels,
+        background_rate, detection_ms, target_error, bright_lifetime_ms,
+        dark_lifetime_ms; binning [h, v])."""
+        from ioncam import characterize as ch
+        if not directory:
+            if self._char is not None:
+                directory = self._char.directory
+            else:
+                found = ch.list_results(self.config.storage.data_dir)
+                if not found:
+                    raise ProcedureError("no camera characterization yet")
+                directory = found[0]["directory"]
+        char = self._char
+        if char is not None and os.path.abspath(directory) == os.path.abspath(char.directory) \
+                and char.summary is not None:
+            summary = char.summary
+        else:
+            summary = ch.load_results(directory)
+        # the ranking takes seconds for hundreds of settings: kept for the same
+        # results and parameters
+        key = (os.path.abspath(directory), len(summary.get("points") or []),
+               summary.get("state"), json.dumps(spam, sort_keys=True, default=str))
+        cache = getattr(self, "_rank_cache", None)
+        if cache is not None and cache[0] == key:
+            ranking, params = cache[1]
+        else:
+            ranking, params = ch.rank(summary, self, **spam)
+            self._rank_cache = (key, (ranking, params))
+        return {"camera": summary.get("camera"), "state": summary.get("state"),
+                "started": summary.get("started"), "finished": summary.get("finished"),
+                "region": summary.get("region"), "notes": summary.get("notes"),
+                "light_check": summary.get("light_check"),
+                "global": summary.get("global"), "spam": params, "ranking": ranking,
+                "points": [ch._brief(r) for r in summary.get("points") or []],
+                "directory": os.path.abspath(directory)}
+
+    def list_characterizations(self) -> list:
+        """The characterizations saved in the data directory, newest first."""
+        from ioncam import characterize as ch
+        return ch.list_results(self.config.storage.data_dir)
+
+    def characterization_point(self, index: int, directory: Optional[str] = None) -> dict:
+        """One measured setting of a characterization (the last one, or the
+        one in ``directory``): all its numbers, its histogram of counts above
+        bias and the fitted model's expectation for it."""
+        from ioncam import characterize as ch
+        if not directory:
+            if self._char is None:
+                found = ch.list_results(self.config.storage.data_dir)
+                if not found:
+                    raise ProcedureError("no camera characterization yet")
+                directory = found[0]["directory"]
+            else:
+                directory = self._char.directory
+        return ch.point_detail(directory, int(index))
 
     # -- simulation ----------------------------------------------------------------------------
 

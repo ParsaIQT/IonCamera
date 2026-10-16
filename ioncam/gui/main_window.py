@@ -1341,9 +1341,30 @@ class MainWindow(QtWidgets.QMainWindow):
                    "(start with -c <file>).", wrap=True),
             _row(_tool(self.act["settings"]), _tool(self.act["save_config"]), None),
         ])
-        w = _page(cooling, self._shutter_box(), self._fan_box(), control, configuration,
-                  _group("Camera", [self.info_text]))
+        self.char_btn = _button("Characterize camera...", self._characterize,
+                                "dark frames at many readout settings: noise, EM gain, "
+                                "clock-induced charge, dark current - and the settings with "
+                                "the lowest SPAM error", "verify")
+        characterization = _group("Characterization (SPAM)", [
+            _muted("With the shutter closed, measures the camera's dark counts at many "
+                   "readout settings (mostly exposures below 10 ms): bias, read noise, the "
+                   "real EM gain, clock-induced charge, dark current, hot pixels. Saves the "
+                   "distributions and a model for simulations, and ranks the settings by the "
+                   "state-detection (SPAM) error they give. Takes up to an hour.", wrap=True),
+            _row(self.char_btn, None),
+        ])
+        self._char_dialog = None
+        w = _page(cooling, self._shutter_box(), self._fan_box(), characterization, control,
+                  configuration, _group("Camera", [self.info_text]))
         return _scroll(w)
+
+    def _characterize(self):
+        from ioncam.gui.characterize import CharacterizeDialog
+        if self._char_dialog is None:
+            self._char_dialog = CharacterizeDialog(self)
+        self._char_dialog.show()
+        self._char_dialog.raise_()
+        self._char_dialog.activateWindow()
 
     def _shutter_box(self):
         """The camera's shutter: the internal one and the external shutter
@@ -1588,6 +1609,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.image.apply_theme()
         self.trace.apply_theme()
         self.hist.apply_theme()
+        if getattr(self, "_char_dialog", None) is not None:
+            self._char_dialog.apply_theme()
         self.events.refill()
         self.act["theme"].blockSignals(True)
         self.act["theme"].setChecked(name == "light")

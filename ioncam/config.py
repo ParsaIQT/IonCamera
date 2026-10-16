@@ -220,6 +220,62 @@ class TrackerConfig:
 
 
 @dataclass
+class CharacterizeConfig:
+    stages: List[str] = opt(["baseline", "sensor", "electronics", "vertical", "gain",
+                             "exposure", "binning", "triggered", "conventional", "grid"],
+                            "what the camera characterization measures (with the shutter "
+                            "closed): baseline, sensor, electronics, vertical, gain, "
+                            "exposure, binning, triggered, conventional, grid, temperature")
+    region_size: int = opt(144, "side of the square sensor region measured [px]; centred on "
+                                "the readout AQROI, else the ions, else the sensor (144 suits "
+                                "every binning up to 8 and 9)")
+    samples_per_point: int = opt(3000000, "pixel samples aimed for at every setting (frames "
+                                          "x super-pixels): the rare events of the dark "
+                                          "distribution's tail need millions")
+    min_frames: int = opt(60, "fewest frames per setting")
+    max_frames: int = opt(5000, "most frames per setting")
+    max_point_s: float = opt(20.0, "longest acquisition per setting [s]")
+    discard_frames: int = opt(2, "frames after every start that are analysed separately (the "
+                                 "first frames of an acquisition can differ)")
+    em_gains: List[int] = opt([1, 2, 5, 10, 20, 50, 100, 150, 200, 300, 500, 700, 1000],
+                              "EM gains of the gain sweep (those the camera allows)")
+    exposures_ms: List[float] = opt([0.1, 0.2, 0.5, 1.0, 1.5, 2.0, 3.0, 5.0, 7.0, 10.0, 30.0,
+                                     100.0, 300.0, 1000.0],
+                                    "exposures of the exposure sweep [ms]; the long ones "
+                                    "measure dark current and light leaks")
+    binnings: List[int] = opt([1, 2, 3, 4, 6, 8], "square on-chip binnings measured (the "
+                                                 "readout's is added)")
+    trigger_spacings_ms: List[float] = opt([0.0, 2.0, 10.0, 100.0, 1000.0],
+                                           "software-triggered single shots with this idle "
+                                           "time between them [ms], like Grabber readout "
+                                           "shots (0 = as fast as possible)")
+    grid_gains: List[int] = opt([0, 9999], "EM gains of the full grid (HS speed x pre-amp x "
+                                           "VS speed x clock voltage); 0 = the readout's, "
+                                           "above the camera's maximum = its maximum")
+    vs_amplitudes: List[int] = opt([], "vertical clock voltages measured (0 = normal, 1..4 = "
+                                       "+1..+4); empty = all the camera has")
+    temperatures: List[float] = opt([], "sensor set points of the temperature stage [C], "
+                                        "e.g. [-60, -70, -80]")
+    temperature_timeout_s: float = opt(900.0, "longest wait for the temperature to settle [s]")
+    stability_every_s: float = opt(600.0, "repeat the baseline setting this often [s] (bias, "
+                                          "CIC and temperature drift)")
+    ion_rate: float = opt(0.0, "for the SPAM ranking: photo-electrons/s from one bright ion "
+                               "(all its light); 0 = the brightness measured live")
+    roi_fraction: float = opt(0.0, "fraction of an ion's light in its readout ROI; 0 = from "
+                                   "the readout plan, else 0.6")
+    roi_pixels: int = opt(1, "super-pixels summed per ion")
+    background_rate: float = opt(0.0, "stray light in an ion's ROI [photo-electrons/s]")
+    detection_ms: List[float] = opt([0.5, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0],
+                                    "detection times shown in the ranking [ms]")
+    target_error: float = opt(1e-3, "the ranking compares settings by the shortest detection "
+                                    "time reaching this SPAM error")
+    bright_lifetime_ms: float = opt(0.0, "bright state lifetime under the detection light "
+                                         "(depumping) [ms]; 0 = ignore")
+    dark_lifetime_ms: float = opt(0.0, "dark state lifetime under the detection light "
+                                       "(off-resonant pumping) [ms]; 0 = ignore")
+
+
+@dataclass
 class GrabberConfig:
     flip_x: bool = opt(False, "Grabber x runs opposite to the SDK image x (set from "
                               "check_grabber_mapping if needed)")
@@ -337,7 +393,26 @@ class SimulatorConfig:
     bias: float = opt(100.0, "baseline counts per (binned) pixel")
     read_noise_e: float = opt(30.0, "read noise [e-] rms")
     sensitivity: float = opt(4.0, "electrons per count at the output")
-    cic: float = opt(0.003, "clock-induced charge [e-/px/frame]")
+    cic: float = opt(0.003, "clock-induced charge [e-/px/frame] before the EM register (at "
+                            "the fastest recommended vertical shift speed, normal clock "
+                            "voltage)")
+    cic_vs_exponent: float = opt(0.5, "parallel CIC grows as (vertical shift time / the "
+                                      "fastest recommended one) to this power")
+    cic_amplitude_factor: float = opt(1.6, "parallel CIC x this for every step of vertical "
+                                           "clock voltage (+1..+4)")
+    cic_serial: float = opt(0.0, "serial CIC: electrons per pixel per frame born in the EM "
+                                 "register (at EM gain 300, in proportion to the gain); they "
+                                 "get only part of the gain")
+    em_gain_scale: float = opt(1.0, "the EM gain the camera really has / the one set (an aged "
+                                    "EM register has less)")
+    dark_current: float = opt(0.0, "dark current at -80 C [e-/px/s], doubling every 6.3 C "
+                                   "warmer (hot pixels come on top)")
+    bias_spread: float = opt(0.0, "how much the bias differs between readout channels (HS "
+                                  "speed, pre-amp gain) [counts rms]")
+    camera_profile: str = opt("", "camera_profile.json of a camera characterization: the "
+                                  "simulated camera then has the measured bias, read noise, "
+                                  "electrons per count, EM gain, CIC and dark current of the "
+                                  "nearest measured setting")
     # -- what happens on its own -------------------------------------------------------
     load_rate: float = opt(0.0, "ions loaded per second while the oven is on")
     loss_rate: float = opt(0.0, "loss probability per ion per second")
@@ -356,6 +431,7 @@ SECTIONS: Dict[str, type] = {
     "locate": AcquisitionSettings,
     "readout": AcquisitionSettings,
     "calibration": CalibrationConfig,
+    "characterize": CharacterizeConfig,
     "detection": DetectionConfig,
     "tracker": TrackerConfig,
     "grabber": GrabberConfig,
@@ -373,6 +449,9 @@ SECTION_HELP = {
     "readout": "Grabber readout (external trigger + Camera Link).  AQROI is computed "
                "automatically; the roi field here is ignored",
     "calibration": "How the readout calibration (locate -> plan -> verify -> arm) works",
+    "characterize": "Camera characterization: dark frames at many readout settings with the "
+                    "shutter closed (CIC, read noise, EM gain, dark current) and the SPAM "
+                    "error each setting gives",
     "detection": "Ion spot detection",
     "tracker": "Chain tracking and event classification (trapped / lost / dark)",
     "grabber": "ARTIQ Grabber geometry",
@@ -391,6 +470,7 @@ class Config:
     locate: AcquisitionSettings = field(default_factory=_locate_defaults)
     readout: AcquisitionSettings = field(default_factory=_readout_defaults)
     calibration: CalibrationConfig = field(default_factory=CalibrationConfig)
+    characterize: CharacterizeConfig = field(default_factory=CharacterizeConfig)
     detection: DetectionConfig = field(default_factory=DetectionConfig)
     tracker: TrackerConfig = field(default_factory=TrackerConfig)
     grabber: GrabberConfig = field(default_factory=GrabberConfig)

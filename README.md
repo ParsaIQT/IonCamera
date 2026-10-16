@@ -56,7 +56,7 @@ pip install git+https://github.com/m-labs/sipyco      # not on PyPI (ARTIQ envs 
 ioncam_gui --simulate          # GUI + simulated trap; use the "Simulation" tab to play
 ioncam_gui --simulate --sim-camera 888    # ... as an iXon Ultra 888 (1024 x 1024)
 aqctl_ioncam --simulate        # headless RPC server with the simulator
-pytest                         # 140 tests (~5 min), all on the simulator / emulated SDK
+pytest                         # 155 tests (~6 min), all on the simulator / emulated SDK
 ```
 
 ### The GUI
@@ -171,6 +171,7 @@ with their docstrings):
 | `take_control(owner, reason, timeout)` / `release_control(owner)` | advisory lease shown in all GUIs |
 | `start_live(**settings)` / `set_live(...)` / `set_exposure` / `set_em_gain` / `set_roi` / `stop()` | live video |
 | `get_ion_brightness()` | every ion's brightness in photoelectrons/s, the mean of the bright ones, and the conversion's inputs (see below) |
+| `start_characterization(**options)` / `characterization_status()` / `characterization_results(directory, **spam)` / `list_characterizations()` / `characterization_point(index)` | the camera characterization for SPAM (see below): start it (`dry_run=True`: only the plan), follow it, its results and SPAM ranking, one setting's histogram; `abort()` stops it |
 | `set_shutter(mode, external, ttl_high, open_ms, close_ms)` / `get_shutter()` / `set_fan(mode)` | the shutter (`"open"`, `"closed"`, `"auto"`, `"series"`: open while acquiring) and the cooling fan (`"full"`, `"low"`, `"off"`); live video or the armed readout carries on |
 | `get_frame(since_index, bin, roi, view)` | newest image (raw orientation); `view="corrected"`: background removed, as the detector sees it; `view="background"`: the learned background |
 | `learn_background(n, mask_ions)` / `get_background()` / `clear_background()` | learn / inspect / forget the static surface light (see below) |
@@ -507,6 +508,122 @@ and off only for short periods unless the camera is water-cooled: the body warms
 camera beeps when it is too hot. The sensor may need a warmer set point, and its temperature
 should settle before you measure (transient dark current otherwise).
 
+## Camera characterization for SPAM
+
+**Characterize camera...** (Camera tab, or `start_characterization()` over RPC) measures
+how the camera behaves when no light reaches it, at many readout settings. The results
+serve two purposes: a model of the camera for simulations of state detection (SPAM), and
+the readout settings that reach a target SPAM error in the shortest detection time. It runs
+by itself (about half an hour with the defaults), keeps everything on disk as it goes, and
+an abort keeps what was measured.
+
+What it does:
+
+1. It **closes the shutter**. A camera without an internal shutter only switches its
+   shutter output, so cover it (lens cap, black cloth) first.
+2. It waits for the sensor temperature to settle (`temperature_timeout_s`).
+3. It checks that **the sensor is dark**: 20 ms frames against 1 ms ones, pixel by pixel.
+   Light across the region (a leak), a spot of light (ions or laser scatter: the shutter
+   did not close), or saturated pixels stop the run before anything is measured. A lone
+   hot pixel does not. During the run, frames that saturate at EM gain also stop it, to
+   protect the EM register. `stop_on_light=False` only reports the light.
+4. It **sweeps the readout settings** around the Readout tab's, stage by stage. Most
+   exposures are below 10 ms. Every setting gets about 3 million pixel samples on a
+   144 × 144 px region centred on the readout AQROI (or on the ions):
+
+   | stage | settings | what they show |
+   |---|---|---|
+   | `baseline` | the readout's, at the start, every 10 min and at the end | drift of bias, CIC, temperature |
+   | `sensor` | the whole sensor | hot pixels, CIC against the row, bias structure |
+   | `electronics` | every EM readout speed × pre-amp gain | read noise, bias, serial CIC |
+   | `vertical` | every vertical shift speed × clock voltage | parallel CIC (faster clocks and lower voltage: less) |
+   | `gain` | EM gains 1 … the camera's maximum | the real EM gain against the set one |
+   | `exposure` | 0.1 … 10 ms, and 30 ms … 1 s | dark current (CIC is per frame, dark current grows with time), light leaks |
+   | `binning` | 1 × 1 … 8 × 8 and the readout's | super-pixel noise: CIC adds up, read noise does not |
+   | `triggered` | software-triggered single shots 0 … 1000 ms apart | Grabber-like shots: first-frame effects, bias after idling |
+   | `conventional` | the conventional amplifier's speeds × pre-amp gains | read noise without EM gain |
+   | `grid` | every speed × pre-amp × vertical speed × voltage at the readout's and the maximum EM gain | the full map for the ranking |
+   | `temperature` | other set points (off by default; e.g. −60, −70, −80 °C) | dark current against temperature |
+
+   With the defaults that is 642 settings, about 28 min, on an iXon Ultra 897, and 378
+   settings, about 18 min, on an 888. Each setting is analysed while the next is
+   measured.
+5. It **restores** the shutter and the set point, and live video or the armed readout
+   resumes.
+
+**What every setting gives.** A frame minus a bias map taken from the *other* frames
+(not its own, which would make its noise look smaller) gives:
+
+- the bias, its spatial pattern and frame-to-frame common mode, and its drift;
+- the read noise in counts and electrons;
+- hot pixels (a Poisson test), charge trails, events repeating in the next frame, and
+  the first frames after a start;
+- the whole **histogram of counts above bias**. The dark model of an EMCCD (Lantz et al.
+  2008, appendix A) is fitted to it by maximum likelihood:
+
+  > counts = read noise + EM register output of Poisson(`lam_p`) electrons (parallel CIC
+  > and dark current, each Gamma-distributed with mean `g` counts) + Poisson(`lam_s`)
+  > serial-CIC electrons born inside the register (a log-uniform share of the gain).
+
+  The fit gives `g` (counts per electron, so the **real EM gain** = `g` × electrons per
+  count), `lam_p`, `lam_s` with 1σ errors, and a χ² and tail fractions that check the
+  model where SPAM is decided.
+
+At moderate EM gain (`g` only a few times the read noise), serial CIC and a lower gain
+explain a dark histogram almost equally well. Such settings (gain error > 5 %) are fitted
+again with the gain fixed at the set gain × the real/set ratio that the high-gain settings
+measured. The "fit" column says which settings this applies to ("gain calibrated").
+
+**Together**, the settings give: dark current (from the exposures) and its temperature
+dependence, a light leak if there is one, the real/set EM gain ratio (an aged EM register
+has less gain), how binning adds noise up, stability over the run, first-frame and
+triggered-shot effects, and hot pixels.
+
+**SPAM ranking.** For an ion giving `ion_rate` photoelectrons/s, every setting is ranked.
+By default `ion_rate` is the brightness measured live, with `roi_fraction` of it in its ROI
+of `roi_pixels` super-pixels at the readout binning (from the readout plan). Each setting's
+dark model is moved to that binning and detection time; the ion's counts go through the EM
+register on top. The ranking gives the best threshold, the error at each detection time
+(optionally with stray light and the bright/dark lifetimes under the detection light), and
+the **shortest detection time reaching `target_error`** (default 10⁻³). It agrees with
+Monte Carlo shots to within their statistics. **Use for readout** sets the selected setting
+and that detection time (as exposure) in the Readout tab.
+`characterization_results(ion_rate=..., roi_pixels=..., target_error=...)` ranks again for
+another ion. Differences smaller than the settings' errors (settings with the same
+electronics, for instance) are not significant.
+
+**Files** (`<storage.data_dir>/characterization/<time>_<camera>/`; `README.txt` there
+describes every field):
+
+| file | contents |
+|---|---|
+| `plan.json` | the camera, its capabilities, the options and every setting |
+| `points.jsonl` | one line per setting as it is measured: settings asked and applied, temperatures, all numbers, the fit |
+| `hist/NNNN.npz` | the histogram of counts above bias (and bias / event maps for some) |
+| `summary.json`, `summary.csv` | everything, the global results and the SPAM ranking |
+| `camera_profile.json` | the dark model at every setting, for simulations |
+
+**In simulations.** `simulator.camera_profile = ".../camera_profile.json"` gives the
+simulated camera the measured bias, read noise, electrons per count, real EM gain, parallel
+and serial CIC and dark current (against temperature) of the nearest measured setting, so
+everything in ioncam can be tried with your camera's noise. Your own simulations can read
+the profile directly: per setting it holds `bias`, `read_noise` (counts), `sensitivity`
+(electrons per count), `g`, `lam_p` and `lam_s` (per pixel and frame), and the model above.
+`ioncam.analysis.darkframes` has it as code: `dark_model_pmf` (the distribution of a dark
+pixel), `predict_spam` (the threshold and errors for a signal) and `scaled_model` (another
+binning or exposure).
+
+Options are in `[characterize]` (stages, samples per setting, region, gains, exposures,
+binnings, trigger spacings, grid gains, clock voltages, temperatures, and the SPAM
+parameters). Fewer stages, fewer samples or `grid_gains = [0]` make it quicker.
+
+Background reading: Andor, *Minimizing Clock Induced Charge*, and the iXon Ultra user
+guide (faster vertical shifts and lower clock voltages give less CIC; CIC comes once per
+frame, dark current with the exposure); Lantz et al. 2008
+(arXiv:0803.1420, the EMCCD dark model with serial CIC); Harpsøe et al. 2012
+(arXiv:1111.2066, fitting EMCCD bias, read noise, gain and CIC from dark frames); Burrell
+et al. 2010 (arXiv:0906.3304, EMCCD qubit readout: CIC sets the dark-state background).
+
 ## Learning the background (dirty traps)
 
 Surface traps scatter the cooling laser: a broad, Gaussian-ish glow along the beam
@@ -685,11 +802,14 @@ ioncam/
   camera/andor.py       iXon via pyAndorSDK2 (single SDK thread, uint16 zero-copy hot path)
   camera/simulator.py   ion chain physics + EMCCD model + timing/trigger model
   camera/fake_sdk.py    emulated pyAndorSDK2 (runs the real driver without hardware)
+  camera/profile.py     camera_profile.json: a characterized camera's dark model
   analysis/detection.py matched-filter detection, noise maps, cloud/spike rejection
   analysis/fitting.py   joint pixel-integrated Gaussian fit (analytic Jacobian)
   analysis/chain.py     James equilibrium positions, chain fit with hidden ions
   analysis/tracker.py   crystal tracking and event classification
   analysis/readout.py   AQROI/ROI planner, Grabber gateware model, verification, thresholds
+  analysis/darkframes.py  EMCCD dark model, its fit, SPAM errors and detection times
+  characterize.py       camera characterization: plan, sweep, results, files
   engine.py             camera thread, analysis thread, procedures, safety
   api.py                the RPC target (sipyco "ioncam")
   server.py             aqctl_ioncam
@@ -730,7 +850,7 @@ These are worth knowing, because several would silently corrupt data:
 
 ## Tests
 
-`pytest` runs 140 tests in about 5 minutes, in the realistic regime (13k photons/s
+`pytest` runs 155 tests in about 6 minutes, in the realistic regime (13k photons/s
 per ion, blurred PSF with halo, laser scatter, surface defects):
 - chain physics against James' published values;
 - detector accuracy (photon-limited) and false-alarm rates at EM gain 1, 50 and 300,
@@ -771,6 +891,15 @@ per ion, blurred PSF with halo, laser scatter, surface defects):
   light taken for ions
   (the hint, a tight crop, a search region, a typed AQROI, the AQROI by hand and
   Calibrate + arm inside it);
+- the camera characterization: fits of synthetic EMCCD dark frames with known read
+  noise, gain, CIC and hot pixels (unbiased, honest errors; the gain fixed at moderate
+  gain), SPAM predictions against Monte Carlo shots (ROI sums, depumping), detection
+  times; the sweep on the simulator (the real/set EM gain, CIC against the clock voltage
+  and binning, dark current, the ranking, the files, everything restored, other calls
+  refused meanwhile), an abort keeping what was measured, light on the sensor stopping
+  it (a hot pixel does not), the emulated Andor SDK (shutter, software triggers), the
+  profile driving the simulator, the default plans of both cameras, over RPC and in the
+  GUI dialog (Use for readout);
 - a headless GUI test (levels set by hand stay put, the D-pad direction through the
   display rotation, ROI labels, the shot histograms, the trap-rotation buttons, the
   overlays one kind at a time, the actions that can run, the event filter, saving the

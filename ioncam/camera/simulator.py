@@ -541,8 +541,13 @@ class IonTrapScene:
 
 
 def emccd_counts(electrons: np.ndarray, em_gain: float, use_em: bool, sensitivity: float,
-                 read_noise_e: float, bias: float, cic: float, rng) -> np.ndarray:
-    """Convert mean photo-electrons into a noisy uint16 EMCCD image."""
+                 read_noise_e: float, bias: float, cic: float, rng,
+                 serial_cic: float = 0.0) -> np.ndarray:
+    """Convert mean photo-electrons into a noisy uint16 EMCCD image.
+
+    ``cic``: clock-induced charge before the EM register (full gain);
+    ``serial_cic``: electrons per pixel born in the EM register at a random
+    stage, so multiplied only by the stages after it (gain ** u, u uniform)."""
     n = rng.poisson(np.maximum(electrons, 0.0) + cic)
     if use_em and em_gain > 1.0:
         # (a gamma variate of shape 0 is 0 and draws nothing: only the pixels
@@ -550,6 +555,13 @@ def emccd_counts(electrons: np.ndarray, em_gain: float, use_em: bool, sensitivit
         out = np.zeros(n.shape)
         hit = n > 0
         out[hit] = rng.gamma(n[hit], em_gain)
+        if serial_cic > 0.0:
+            ns = rng.poisson(serial_cic, n.shape)
+            k = int(ns.sum())
+            if k:
+                idx = np.repeat(np.flatnonzero(ns), ns[ns > 0])
+                np.add.at(out.reshape(-1), idx,
+                          rng.exponential(np.power(em_gain, rng.random(k))))
         np.minimum(out, EM_REGISTER_FULL_WELL, out=out)
     else:
         out = n.astype(np.float64)
@@ -599,6 +611,12 @@ class SimulatedCamera(CameraBase):
         self._em_gain = 1
         self._sensitivity = cfg.sensitivity
         self._read_noise = cfg.read_noise_e
+        self._cic = cfg.cic                 # per pixel per frame, before the EM register
+        self._cic_serial = 0.0              # per output pixel per frame, in the register
+        self._bias = cfg.bias
+        self._dark = 0.0                    # dark current at the set point [e-/px/s]
+        self._profile = None
+        self._profile_path = ""
         self.last_frame: Optional[np.ndarray] = None
         self.camera_link_enabled = False
         self.shutter = "open"
@@ -667,10 +685,10 @@ class SimulatedCamera(CameraBase):
         if settings.acquisition == "accumulate":
             cycle *= settings.n_accumulations
         shape = ((roi[3] - roi[1]) // settings.vbin, (roi[2] - roi[0]) // settings.hbin)
-        self._exposure, self._ro, self._cycle, self._em_gain = exposure, ro, cycle, gain
+        self._exposure, self._ro, self._cycle = exposure, ro, cycle
         self._use_em = em
-        self._sensitivity = self.cfg.sensitivity * gains[-1] / gains[pa_index]
-        self._read_noise = self.cfg.read_noise_e * math.sqrt(max(hs, 0.08) / 5.0)
+        self._noise_model(em, speeds.index(hs), hs, pa_index, vs, settings.vs_amplitude, gain)
+        gain = self._em_gain_set
         self.camera_link_enabled = settings.camera_link
         self._applied = AppliedSettings(
             settings=settings, roi=roi, frame_shape=shape, exposure=exposure,
@@ -680,6 +698,60 @@ class SimulatedCamera(CameraBase):
             em_gain=gain, em_gain_range=em_range, tag=tag, warnings=warnings,
             sensitivity=self._sensitivity, sensitivity_source="simulator")
         return self._applied
+
+    def sensitivity_for(self, pa_index: int) -> float:
+        """Electrons per count at a pre-amp gain (index)."""
+        gains = self.model["preamp"]
+        pa = min(max(int(pa_index), 0), len(gains) - 1)
+        return self.cfg.sensitivity * gains[-1] / gains[pa]
+
+    def _load_profile(self):
+        path = self.cfg.camera_profile
+        if path != self._profile_path:
+            self._profile_path = path
+            self._profile = None
+            if path:
+                from ioncam.camera.profile import CameraProfile
+                try:
+                    self._profile = CameraProfile.load(path)
+                except (OSError, ValueError) as e:
+                    raise CameraError("simulator.camera_profile: {}".format(e)) from e
+        return self._profile
+
+    def _noise_model(self, em: bool, hs_idx: int, hs: float, pa_index: int, vs: float,
+                     vs_amplitude: int, gain: int) -> None:
+        """Bias, read noise, electrons per count, EM gain, CIC and dark current
+        of this readout: from a measured camera profile, else the model -
+        parallel CIC grows with the vertical shift time and clock voltage,
+        serial CIC with the EM gain, the bias differs between channels."""
+        cfg, m = self.cfg, self.model
+        self._em_gain_set = gain
+        prof = self._load_profile()
+        p = prof.nearest("em" if em else "conventional", hs, pa_index, vs, vs_amplitude,
+                         gain) if prof is not None else None
+        if p is not None:
+            s = float(p.get("sensitivity") or 0.0) or self.sensitivity_for(pa_index)
+            self._sensitivity = s
+            self._read_noise = float(p.get("read_noise") or 0.0) * s
+            self._bias = float(p.get("bias") or cfg.bias)
+            self._cic = float(p.get("lam_p") or 0.0)
+            self._cic_serial = float(p.get("lam_s") or 0.0) if em else 0.0
+            self._em_gain = float(p["g"]) * s if em and p.get("g") else float(gain)
+            self._dark = prof.dark_current
+            return
+        self._sensitivity = self.sensitivity_for(pa_index)
+        self._read_noise = cfg.read_noise_e * math.sqrt(max(hs, 0.08) / 5.0)
+        vs_ref = m["vs"][m["vs_fastest"]]
+        self._cic = cfg.cic * (vs / vs_ref) ** cfg.cic_vs_exponent * \
+            cfg.cic_amplitude_factor ** max(int(vs_amplitude), 0)
+        self._cic_serial = cfg.cic_serial * gain / 300.0 if em else 0.0
+        self._em_gain = gain * cfg.em_gain_scale if em else gain
+        bias = cfg.bias
+        if cfg.bias_spread > 0:
+            rng = np.random.default_rng((7, int(em), hs_idx, int(pa_index)))
+            bias += cfg.bias_spread * float(rng.standard_normal())
+        self._bias = bias
+        self._dark = cfg.dark_current
 
     def set_shutter(self, mode: str = "open", external: str = "open", ttl_high: bool = True,
                     open_ms: int = 0, close_ms: int = 0) -> str:
@@ -824,9 +896,16 @@ class SimulatedCamera(CameraBase):
         # a closed shutter: dark frames (auto and series are open while acquiring)
         el = self.scene.expected_electrons(applied.roi, s.hbin, s.vbin, applied.exposure, now=t,
                                            light=self.shutter != "closed")
-        cic = self.cfg.cic * s.hbin * s.vbin
+        cic = self._cic * s.hbin * s.vbin
+        if self._dark > 0:
+            # dark current at the sensor temperature (a profile's as measured,
+            # else doubling every 6.3 C from -80 C)
+            self._update_temp()
+            d = self._profile.dark_current_at(self._temp) if self._profile is not None else \
+                self._dark * 2.0 ** ((self._temp + 80.0) / 6.3)
+            cic += d * applied.exposure * s.hbin * s.vbin
         img = emccd_counts(el, self._em_gain, self._use_em, self._sensitivity, self._read_noise,
-                           self.cfg.bias, cic, self.rng)
+                           self._bias, cic, self.rng, serial_cic=self._cic_serial)
         self.last_frame = img
         return img
 

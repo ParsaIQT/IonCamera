@@ -164,7 +164,8 @@ class IonCamAPI:
         await self._run(self._engine.stop)
 
     def abort(self):
-        """Abort a running procedure (locate / calibrate / snap).  True if one was running."""
+        """Abort a running procedure (locate / calibrate / snap / camera
+        characterization).  True if one was running."""
         return self._engine.abort()
 
     async def snap(self, n_frames=1, **settings):
@@ -490,6 +491,49 @@ class IonCamAPI:
     def clear_background(self):
         """Forget the learned static background."""
         self._engine.clear_background()
+
+    # -------------------------------------------------------- characterization
+
+    async def start_characterization(self, **options):
+        """Camera characterization for SPAM: with the shutter closed, dark frames
+        at a sweep of readout settings (HS speed x pre-amp gain, VS speed x
+        clock voltage, EM gain, exposures mostly < 10 ms, binning, triggered
+        shots, optionally the full grid and other temperatures).  Measures
+        bias, read noise, real EM gain, parallel and serial clock-induced
+        charge, dark current, hot pixels; ranks the settings by the SPAM error
+        they give.  ``options`` override ``[characterize]`` (stages,
+        samples_per_point, em_gains, exposures_ms, ...; region [x0, y0, x1,
+        y1]; force=True while armed).  Runs in the background (up to ~1 h):
+        returns the plan (points, estimate_s, directory); follow it with
+        ``characterization_status()``, stop it with ``abort()``."""
+        return _plain(await self._run(self._engine.start_characterization, **options))
+
+    def characterization_status(self):
+        """The running (or last) characterization: state (running / finishing /
+        done / aborted / failed / idle), progress, eta_s, the current setting,
+        the latest results."""
+        return _plain(self._engine.characterization_status())
+
+    async def characterization_results(self, directory=None, **spam):
+        """Results of the last characterization (or the one in ``directory``):
+        global results (dark current, real/set EM gain, binning, stability,
+        hot pixels), every setting's numbers, and the SPAM ranking for
+        ``spam`` (ion_rate [photo-electrons/s], roi_fraction, roi_pixels,
+        background_rate, detection_ms, target_error, bright_lifetime_ms,
+        dark_lifetime_ms, binning [h, v]) - best first."""
+        return _plain(await self._run(self._engine.characterization_results, directory,
+                                      **spam))
+
+    def list_characterizations(self):
+        """Characterizations saved in the data directory, newest first."""
+        return _plain(self._engine.list_characterizations())
+
+    async def characterization_point(self, index, directory=None):
+        """One measured setting of a characterization: its numbers, the
+        histogram of counts above bias (``lo``, ``counts``) and the fitted dark
+        model's expected counts (``model``)."""
+        return _plain(await self._run(self._engine.characterization_point, int(index),
+                                      directory))
 
     # ------------------------------------------------------------------ control
 

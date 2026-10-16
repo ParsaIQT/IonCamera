@@ -429,7 +429,7 @@ class FakeAtmcd:
         if not 0 <= pa < len(self._preamp):
             return P4INVALID, 0.0
         # what the emulated images use: the simulator's electrons per count
-        return S, float(self.sim.cfg.sensitivity * self._preamp[-1] / self._preamp[pa])
+        return S, float(self.sim.sensitivity_for(pa))
 
     # timings ------------------------------------------------------------------------
     def _settings(self) -> AcquisitionSettings:
