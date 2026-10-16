@@ -18,8 +18,8 @@ from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
 from ioncam.camera.base import nearest_index, vs_speed_index
 from ioncam.gui import style
-from ioncam.gui.widgets import (EventList, ImagePanel, ShotHistogramPlot, SiteTable,
-                                StatTile, StatusBanner, TracePlot)
+from ioncam.gui.widgets import (CRYSTAL_TONES, EventList, ImagePanel, ShotHistogramPlot,
+                                SiteTable, StatTile, StatusBanner, TracePlot)
 
 
 def _button(text, slot, tip=None, icon=None, kind=None):
@@ -893,7 +893,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _readout_tab(self):
         ro = self.config.get("readout", {})
         self.ro_chips = {k: style.chip(QtWidgets.QLabel(""))
-                         for k in ("plan", "armed", "shots", "verified")}
+                         for k in ("plan", "armed", "shots", "verified", "crystal")}
         chips = _row(*self.ro_chips.values(), None)
         self.n_ions = _spin(0, 64, 0, special="any", width=70,
                             tip="how many ions to calibrate for (any: those found)")
@@ -2189,6 +2189,16 @@ class MainWindow(QtWidgets.QMainWindow):
             ch["verified"].setText("verified {}".format(time.strftime(
                 "%H:%M:%S", time.localtime(ver))) if ver else "not verified")
             style.chip(ch["verified"], "good" if ver else "")
+            c = ro.get("crystal") or {}
+            v = c.get("verdict")
+            ch["crystal"].setVisible(armed)
+            ch["crystal"].setText({"ok": "crystal ok", "dark": "ion {} dark".format(
+                ", ".join(str(j) for j in c.get("dark") or [])), "lost": "ion lost",
+                "no_light": "no ion light", "unclear": "crystal unclear",
+                "uncertain": "crystal: can't tell yet"}.get(v, "crystal: waiting for shots"))
+            ch["crystal"].setToolTip(c.get("message") or "the crystal from the averaged "
+                                     "readout frames ([readout_check])")
+            style.chip(ch["crystal"], CRYSTAL_TONES.get(v, ""))
 
     def _show_brightness(self, b):
         """The brightness in photoelectrons/s and how it was converted."""

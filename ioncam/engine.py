@@ -41,10 +41,11 @@ from ioncam.analysis.readout import (PlanError, ReadoutPlan, binning_advice,
                                      compare_grabber_frame, dark_pixel_mask, fit_threshold,
                                      plan_readout, reposition_plan, resize_aqroi,
                                      shot_histograms, square_aqroi, verify_plan)
+from ioncam.analysis.readout_check import check_crystal, combine
 from ioncam.analysis.tracker import BRIGHT, ChainTracker, adopt_learned_psf, align
 from ioncam.camera.base import (FAN_MODES, SHUTTER_MODES, AcquisitionSettings,
                                 AppliedSettings, CameraBase, CameraBusy, CameraError, Frame)
-from ioncam.config import Config
+from ioncam.config import Config, ReadoutCheckConfig
 from ioncam.events import EventLog
 
 logger = logging.getLogger(__name__)
@@ -142,14 +143,19 @@ def _pad_roi(roi, min_size: int, sensor_shape) -> tuple:
 
 class ReadoutMonitor:
     """Per-ROI sums of every readout frame (and the frame's background pixels,
-    the dark reference of the shot histograms) + health checks."""
+    the dark reference of the shot histograms) + health checks: the share of
+    the light outside the ion ROIs, and the crystal from the averaged frames
+    (:mod:`ioncam.analysis.readout_check`: an ion dark, lost, no ion light)."""
 
-    def __init__(self, maxlen: int = 50000):
+    def __init__(self, maxlen: int = 50000, check: Optional[ReadoutCheckConfig] = None):
         self._lock = threading.Lock()
         self._maxlen = maxlen
+        self.check_cfg = check if check is not None else ReadoutCheckConfig()
         self.reset(None)
 
-    def reset(self, plan: Optional[ReadoutPlan]) -> None:
+    def reset(self, plan: Optional[ReadoutPlan], crystal=None, g: float = 0.0) -> None:
+        """A new plan (armed): ``crystal`` every ion of the crystal (sensor px;
+        default the plan's), ``g`` the counts per photo-electron."""
         with self._lock:
             self.plan = plan
             self.sums: Deque[np.ndarray] = deque(maxlen=self._maxlen)
@@ -162,9 +168,24 @@ class ReadoutMonitor:
             self.first_shot = 0
             self.outside_baseline: Optional[float] = None
             self.geometry_warning = False
+            # the crystal check: the last frames, its latest result, the
+            # crystal right after arming, the verdicts awaiting confirmation
+            w, h = plan.frame_size if plan is not None else (1, 1)
+            keep = max(int(self.check_cfg.window), 50)
+            self.window: Deque[np.ndarray] = deque(maxlen=min(keep, max(200, 20_000_000 //
+                                                                      max(w * h, 1))))
+            self.crystal_positions = None if crystal is None else \
+                np.asarray(crystal, float).reshape(-1, 2)
+            self.g = float(g)
+            self.check_result: Optional[dict] = None
+            self.reference: Optional[dict] = None
+            self.reported: Optional[tuple] = None
+            self._pending: List[tuple] = []
+            self._since_check = 0
 
     def add(self, frames: Sequence[Frame]) -> List[dict]:
         events = []
+        run = None
         with self._lock:
             plan = self.plan
             if plan is None or not frames:
@@ -180,18 +201,22 @@ class ReadoutMonitor:
             total = data.reshape(len(data), -1).sum(axis=1).astype(float)
             if plan.background_roi is not None:
                 bias = sums[:, n] / area[n]
+            elif self.dark_mask is not None and self.dark_mask.any():
+                bias = np.median(dark, axis=1)
             else:
-                bias = np.median(np.concatenate([data[:, 0, :], data[:, -1, :]], axis=1), axis=1)
-            sig_total = total - bias * (w * h)
-            sig_ions = sums[:, :n].sum(axis=1) - bias * area[:n].sum()
+                bias = None      # every pixel holds ion light: the crystal check judges it
+            if bias is not None:
+                sig_total = total - bias * (w * h)
+                sig_ions = sums[:, :n].sum(axis=1) - bias * area[:n].sum()
             for k, f in enumerate(frames[:len(data)]):
                 self.frames.append(data[k])
+                self.window.append(data[k])
                 self.sums.append(sums[k])
                 self.dark.append(dark[k])
                 self.times.append(f.timestamp)
                 self.shots += 1
                 # fraction of the light outside the ion ROIs (only when ions shine)
-                if sig_total[k] > 50.0 * math.sqrt(max(w * h, 1)):
+                if bias is not None and sig_total[k] > 50.0 * math.sqrt(max(w * h, 1)):
                     self.outside.append(float(1.0 - sig_ions[k] / sig_total[k]))
             if len(self.outside) >= 50:
                 recent = float(np.median(list(self.outside)[-50:]))
@@ -205,7 +230,84 @@ class ReadoutMonitor:
                                               "Recalibrate.".format(recent, self.outside_baseline),
                                    "details": {"outside": recent,
                                                "baseline": self.outside_baseline}})
+            cfg = self.check_cfg
+            self._since_check += len(data)
+            if cfg.enabled and self._since_check >= max(int(cfg.every), 1) and \
+                    len(self.window) >= 50:
+                self._since_check = 0
+                run = (plan, np.array(self.window), self.crystal_positions, self.reference,
+                       self.g)
+        if run is not None:
+            events += self._check(*run)
         return events
+
+    def _check(self, plan, frames, crystal, reference, g) -> List[dict]:
+        """The crystal from the last shots (outside the lock: a few ms)."""
+        cfg = self.check_cfg
+        n_recent = int(cfg.recent) or max(int(cfg.window) // 4, 50)
+        kw = dict(crystal=crystal, reference=reference, dark_level=float(cfg.dark_level),
+                  systematic=float(cfg.systematic), g=g, margin=float(cfg.margin))
+        try:
+            full = check_crystal(plan, frames[-int(cfg.window):], **kw)
+            recent = check_crystal(plan, frames[-n_recent:], **kw) \
+                if len(frames) >= 2 * n_recent else None
+        except Exception:  # pragma: no cover - a check must not stop the monitoring
+            logger.exception("readout crystal check")
+            return []
+        res = combine(full, recent)
+        res["t"] = time.time()
+        with self._lock:
+            if self.plan is not plan:
+                return []                    # re-armed meanwhile
+            res["shot"] = self.shots
+            if self.reference is None and full.get("reference") and \
+                    full["n_shots"] >= min(int(cfg.window), 250):
+                # the crystal as planned, right after arming: each ion's light,
+                # the background, how well the PSF model describes the frames
+                self.reference = dict(full["reference"], shot=self.shots)
+            res["has_reference"] = self.reference is not None
+            self.check_result = res
+            return self._crystal_events(res)
+
+    def _crystal_events(self, res: dict) -> List[dict]:
+        """An event when the crystal is seen to change (``confirm`` checks in
+        a row agreeing), and when it is back as planned."""
+        cfg = self.check_cfg
+        verdict = res.get("verdict")
+        if verdict is None or verdict == "uncertain" or not res.get("decided"):
+            self._pending = []
+            return []
+        key = (verdict, res.get("n_ions"), tuple(res.get("dark") or ()))
+        self._pending = (self._pending + [key])[-max(int(cfg.confirm), 1):]
+        if len(self._pending) < max(int(cfg.confirm), 1) or \
+                any(k != key for k in self._pending) or key == self.reported:
+            return []
+        before, self.reported = self.reported, key
+        details = {"verdict": verdict, "n_ions": res.get("n_ions"),
+                   "expected": res.get("expected"), "dark": res.get("dark"),
+                   "shots": res.get("n_shots"), "shot": res.get("shot"),
+                   "light": [round(i["light"], 1) for i in res.get("ions") or []],
+                   "background": round(float(res.get("background") or 0.0), 1)}
+        if verdict == "ok":
+            if before is None:
+                return []                    # as planned from the start: nothing to say
+            return [{"kind": "readout_crystal_ok", "severity": "info",
+                     "message": "Readout: the crystal is back as planned - " + res["message"],
+                     "details": details}]
+        kind = {"dark": "readout_ion_dark", "lost": "readout_ion_lost",
+                "no_light": "readout_no_light", "unclear": "readout_pattern_unclear"}[verdict]
+        return [{"kind": kind, "severity": "alarm" if verdict == "lost" else "warning",
+                 "message": "Readout: " + res["message"], "details": details}]
+
+    def crystal_status(self) -> Optional[dict]:
+        """The latest crystal check, in brief (status)."""
+        with self._lock:
+            r = self.check_result
+            if r is None:
+                return None
+            return {k: r.get(k) for k in ("verdict", "message", "decided", "n_ions", "expected",
+                                          "dark", "n_shots", "shot", "t", "window",
+                                          "has_reference")}
 
     def recent_frames(self) -> Optional[np.ndarray]:
         with self._lock:
@@ -271,7 +373,7 @@ class IonCamEngine:
         if config.storage.event_log and config.storage.data_dir:
             log_path = os.path.join(config.storage.data_dir, "events.jsonl")
         self.events = EventLog(path=log_path)
-        self.monitor = ReadoutMonitor()
+        self.monitor = ReadoutMonitor(check=config.readout_check)
         self.info: Dict[str, Any] = {}
 
         self._cmd: "queue.Queue[tuple]" = queue.Queue()
@@ -577,6 +679,12 @@ class IonCamEngine:
                 self.events.add(ev)
                 if ev["kind"] == "readout_geometry_changed":
                     self._plan_valid = False
+                elif ev["kind"] in ("readout_ion_lost", "readout_pattern_unclear") and \
+                        self._plan is not None and self._plan_valid:
+                    self._plan_valid = False
+                    self.events.emit("readout_plan_outdated", "The crystal changed under the "
+                                     "armed readout - recalibrate before the next experiment",
+                                     "warning")
         live = [f for f in batch if f.tag == "live"]
         if not live:
             return
@@ -687,6 +795,7 @@ class IonCamEngine:
                         "n_ions": plan.n_ions if plan else 0,
                         "frame_size": list(plan.frame_size) if plan else None,
                         "shots": self.monitor.shots,
+                        "crystal": self.monitor.crystal_status(),
                         "aqroi_by_hand": bool(plan is not None and plan.aqroi_by_hand),
                         "verified": vs["t"] if vs and plan and vs["plan"] == plan.created
                         else None},
@@ -1367,13 +1476,61 @@ class IonCamEngine:
             raise ProcedureError("camera frame {} differs from the plan {}x{}".format(
                 applied.frame_shape, w, h))
         plan.applied = applied.to_dict()
-        self.monitor.reset(plan)
+        g = 0.0           # counts per photo-electron (for the zero-light level)
+        if applied.settings.amplifier == "em" and applied.sensitivity > 0 and \
+                applied.em_gain_real:
+            g = max(float(applied.em_gain), 1.0) / float(applied.sensitivity)
+        self.monitor.reset(plan, crystal=self._crystal_for(plan), g=g)
         self.camera.start()
         self._mode = READOUT
         self.events.emit("readout_armed", "Armed: {} trigger, exposure {:.4g} s, frame {}x{}, "
                          "min trigger period {:.4g} s".format(
                              rs.trigger, applied.exposure, w, h, applied.min_trigger_period),
                          "info", min_trigger_period=applied.min_trigger_period)
+
+    def _crystal_for(self, plan: ReadoutPlan) -> np.ndarray:
+        """Every ion of the crystal read out by ``plan``: those of the last
+        locate if it found the plan's ions (ions outside the AQROI tell where
+        the others go when one is lost), else the plan's."""
+        pos = np.asarray(plan.positions, float).reshape(-1, 2)
+        loc = self._last_locate
+        if loc is None or not len(pos):
+            return pos
+        found = np.asarray(loc.get("positions") or [], float).reshape(-1, 2)
+        if len(found) < len(pos):
+            return pos
+        d = np.hypot(pos[:, None, 0] - found[None, :, 0], pos[:, None, 1] - found[None, :, 1])
+        return found if bool(np.all(d.min(axis=1) <= 0.75)) else pos
+
+    def readout_check(self, last: int = 0) -> dict:
+        """Is the crystal still there?  The latest check of the averaged
+        readout frames (``[readout_check]``): ``verdict`` ok / dark (an ion's
+        light gone, the others in place) / lost (fewer ions, re-arranged) /
+        no_light / uncertain / unclear, ``message``, every ion's light and
+        state, the mean frame against the best crystal's.  ``last`` > 0:
+        check the last ``last`` shots now instead (events unaffected)."""
+        mon = self.monitor
+        with mon._lock:
+            plan, res = mon.plan, mon.check_result
+            frames = np.array(mon.window) if last > 0 and mon.window else None
+            crystal, reference, g = mon.crystal_positions, mon.reference, mon.g
+        if plan is None:
+            return {"verdict": None, "message": "no readout armed"}
+        if last > 0:
+            if frames is None:
+                return {"verdict": None, "message": "no readout shots yet"}
+            cfg = self.config.readout_check
+            res = check_crystal(plan, frames[-int(last):], crystal=crystal, reference=reference,
+                                dark_level=cfg.dark_level, systematic=cfg.systematic, g=g,
+                                margin=cfg.margin)
+            res["shot"] = mon.shots
+        if res is None:
+            return {"verdict": None, "message": "waiting for readout shots ({} so far)".format(
+                mon.shots), "shots": mon.shots}
+        out = dict(res)
+        out["reference"] = reference
+        out["config"] = dataclasses.asdict(self.config.readout_check)
+        return out
 
     def disarm_readout(self, resume_live: bool = True) -> None:
         def run():

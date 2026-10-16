@@ -320,7 +320,8 @@ def test_tight_trap_readout_by_hand(tmp_path):
         assert moved["applied"]["roi"] == moved["aqroi"]          # re-armed with it
         assert c.get_status()["mode"] == "readout"
         fine = c.replan_readout(2, 2, None, [2, 2])      # 2x2 super-pixels per ion
-        assert fine["binning"] == [2, 2] and min(fine["containment"]) > 0.6
+        # ~0.60-0.70 of an ion's light, depending on the halo the locate fits
+        assert fine["binning"] == [2, 2] and min(fine["containment"]) > 0.55
         aq = fine["aqroi"]
         fixed = c.replan_readout(2, 2, [aq[0] - 4, aq[1] - 2, aq[2] + 4, aq[3] + 2])
         assert fixed["aqroi"] == [aq[0] - 4, aq[1] - 2, aq[2] + 4, aq[3] + 2]

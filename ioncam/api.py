@@ -312,7 +312,8 @@ class IonCamAPI:
         ion_lost, ion_dark, ion_bright, dark_ion_moved, crystal_melted,
         crystal_recovered, fluorescence_lost, fluorescence_restored,
         ions_presumed_lost, cloud_detected, chain_moved, readout_armed,
-        readout_plan_outdated, readout_geometry_changed, overexposure, ..."""
+        readout_plan_outdated, readout_geometry_changed, readout_ion_dark,
+        readout_ion_lost, readout_no_light, readout_crystal_ok, overexposure, ..."""
         return _plain(self._engine.events.since(int(since_id), kinds, int(limit)))
 
     async def wait_for_event(self, kinds=None, since_id=None, timeout=60.0):
@@ -447,6 +448,23 @@ class IonCamAPI:
         """Per-ROI mean/std, fitted bright/dark threshold and bright fraction over
         the last shots, plus the fraction of light outside the ion ROIs."""
         return _plain(self._engine.monitor.stats(int(last)))
+
+    async def get_readout_check(self, last=0):
+        """Is the crystal still there?  While armed, ioncam averages the last
+        readout frames (``[readout_check]`` window, default 1000 shots) and
+        fits the light with the crystal as calibrated and with one, two, ...
+        ions fewer (the rest re-arranged around the trap centre).  Returns
+        ``verdict``: "ok" (every ion in place, shining), "dark" (``dark``: the
+        ions whose light is gone while the others stay in place), "lost" (the
+        light fits fewer ions at their new places), "no_light", "uncertain"
+        (too little light to tell), "unclear" (fits no expected crystal) or
+        None (no shots yet); ``message``; ``ions`` (each ion's mean light per
+        shot [counts], ``relative`` to the others, ``state``); ``signal`` /
+        ``model``: the mean frame above bias and the best crystal's.  The
+        check runs every ``every`` shots and changes are events
+        (readout_ion_dark, readout_ion_lost, readout_no_light,
+        readout_crystal_ok).  ``last`` > 0: check the last ``last`` shots now."""
+        return _plain(await self._run(self._engine.readout_check, int(last)))
 
     async def get_readout_histograms(self, source="auto", last=20000):
         """Histograms of the readout shots - every ion ROI and the background

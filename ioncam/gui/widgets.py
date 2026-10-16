@@ -482,6 +482,35 @@ class ImagePanel(QtWidgets.QWidget):
         self.hovered.emit("sensor x {:.1f}  y {:.1f}{}".format(x, y, val))
 
 
+CRYSTAL_TONES = {"ok": "good", "uncertain": "", "dark": "warn", "no_light": "warn",
+                 "unclear": "warn", "lost": "bad"}
+
+
+def readout_crystal_view(c, text: str = "- ions", color: str = "#4a515e"):
+    """(count, description, colour) of the readout crystal check ``c``
+    (``status()["readout"]["crystal"]``) for the banner."""
+    if not c or not c.get("verdict"):
+        return text, "readout armed - the crystal check waits for shots", "#2f62b0"
+    v, n, exp = c["verdict"], c.get("n_ions") or 0, c.get("expected") or 0
+    dark = c.get("dark") or []
+    shots = "last {} shots".format(c.get("n_shots"))
+    if v == "ok":
+        return "{} ion{}".format(exp, "s" * (exp != 1)), "readout: in place, shining · " + shots, \
+            STATE_COLORS["stable"]
+    if v == "dark":
+        return "{} ion{} + {} dark".format(exp - len(dark), "s" * (exp - len(dark) != 1),
+                                           len(dark)), \
+            "readout: ion {} dark · {}".format(", ".join(str(j) for j in dark), shots), "#c27a0e"
+    if v == "lost":
+        return "{} ion{}".format(n, "s" * (n != 1)), \
+            "readout: ION LOST - {} left, re-arranged · {}".format(n, shots), "#bf3a30"
+    if v == "no_light":
+        return "- ions", "readout: NO ION LIGHT · " + shots, STATE_COLORS["no_fluorescence"]
+    if v == "unclear":
+        return text, "readout: light pattern unclear - recalibrate · " + shots, "#c27a0e"
+    return "{} ions?".format(exp), "readout: too little light to tell yet · " + shots, "#4a515e"
+
+
 class StatusBanner(QtWidgets.QFrame):
     """Big, colour-coded crystal status for across-the-lab readability, with
     chips for the camera mode (and the procedure step), the sensor
@@ -541,7 +570,6 @@ class StatusBanner(QtWidgets.QFrame):
         text = "{} ion{}".format(nb, "s" * (nb != 1))
         if nd:
             text += " + {} dark".format(nd)
-        self.count.setText(text)
         desc = {"stable": "stable crystal", "empty": "no ions", "changing": "changing...",
                 "melted": "MELTED", "no_fluorescence": "NO FLUORESCENCE",
                 "hold": "tracking on hold"}.get(state, state)
@@ -552,8 +580,13 @@ class StatusBanner(QtWidgets.QFrame):
         lvl = ions.get("fluorescence_level")
         if lvl is not None and state == "stable":
             desc += "  ·  fluorescence {:.0%}".format(lvl)
-        self.state.setText(desc)
         color = STATE_COLORS.get(state, "#4a515e")
+        ro = st.get("readout") or {}
+        if st.get("mode") == "readout":
+            # armed: the live tracking waits; the averaged readout frames tell
+            text, desc, color = readout_crystal_view(ro.get("crystal"), text, color)
+        self.count.setText(text)
+        self.state.setText(desc)
         if time.time() < self._flash_until:
             color = "#d0211a"
         self._paint(color)

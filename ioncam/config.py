@@ -154,6 +154,22 @@ class CalibrationConfig:
 
 
 @dataclass
+class ReadoutCheckConfig:
+    enabled: bool = opt(True, "while armed, check the crystal from the averaged readout "
+                              "frames: an ion dark, lost, no ion light (events)")
+    window: int = opt(1000, "readout shots averaged")
+    recent: int = opt(0, "the most recent shots checked on their own as well, to see a change "
+                         "within the window sooner; 0 = a quarter of the window")
+    every: int = opt(100, "check every this many shots")
+    confirm: int = opt(2, "checks in a row that must agree before an event")
+    dark_level: float = opt(0.15, "an ion with less than this fraction of the other ions' "
+                                  "light (each against its own after arming) is dark")
+    systematic: float = opt(0.05, "relative accuracy of the PSF model per super-pixel")
+    margin: float = opt(16.0, "how much better (chi-square) a crystal of fewer ions must "
+                              "fit the light before an ion is called lost")
+
+
+@dataclass
 class DetectionConfig:
     psf_sigma: float = opt(1.8, "PSF Gaussian sigma [sensor px]; refined by calibration "
                                 "if auto_psf")
@@ -418,6 +434,9 @@ class SimulatorConfig:
     loss_rate: float = opt(0.0, "loss probability per ion per second")
     dark_rate: float = opt(0.0, "go-dark probability per bright ion per second")
     bright_rate: float = opt(0.0, "return-to-bright probability per dark ion per second")
+    qubit_dark_probability: float = opt(0.0, "an experiment's qubit states: the chance that a "
+                                             "bright ion is in its dark state in an exposure "
+                                             "(drawn afresh for every frame and ion)")
     melt_rate: float = opt(0.0, "crystal melting events per second")
     drift_px_per_s: float = opt(0.0, "random-walk drift of the trap centre [px/sqrt(s)]")
     auto_trigger_hz: float = opt(0.0, "external-trigger rate when nobody triggers "
@@ -431,6 +450,7 @@ SECTIONS: Dict[str, type] = {
     "locate": AcquisitionSettings,
     "readout": AcquisitionSettings,
     "calibration": CalibrationConfig,
+    "readout_check": ReadoutCheckConfig,
     "characterize": CharacterizeConfig,
     "detection": DetectionConfig,
     "tracker": TrackerConfig,
@@ -449,6 +469,8 @@ SECTION_HELP = {
     "readout": "Grabber readout (external trigger + Camera Link).  AQROI is computed "
                "automatically; the roi field here is ignored",
     "calibration": "How the readout calibration (locate -> plan -> verify -> arm) works",
+    "readout_check": "While armed: is the crystal still there?  The averaged readout frames "
+                     "tell an ion dark, an ion lost (the others re-arranged) or no ion light",
     "characterize": "Camera characterization: dark frames at many readout settings with the "
                     "shutter closed (CIC, read noise, EM gain, dark current) and the SPAM "
                     "error each setting gives",
@@ -470,6 +492,7 @@ class Config:
     locate: AcquisitionSettings = field(default_factory=_locate_defaults)
     readout: AcquisitionSettings = field(default_factory=_readout_defaults)
     calibration: CalibrationConfig = field(default_factory=CalibrationConfig)
+    readout_check: ReadoutCheckConfig = field(default_factory=ReadoutCheckConfig)
     characterize: CharacterizeConfig = field(default_factory=CharacterizeConfig)
     detection: DetectionConfig = field(default_factory=DetectionConfig)
     tracker: TrackerConfig = field(default_factory=TrackerConfig)

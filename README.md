@@ -56,7 +56,7 @@ pip install git+https://github.com/m-labs/sipyco      # not on PyPI (ARTIQ envs 
 ioncam_gui --simulate          # GUI + simulated trap; use the "Simulation" tab to play
 ioncam_gui --simulate --sim-camera 888    # ... as an iXon Ultra 888 (1024 x 1024)
 aqctl_ioncam --simulate        # headless RPC server with the simulator
-pytest                         # 155 tests (~6 min), all on the simulator / emulated SDK
+pytest                         # 164 tests (~6 min), all on the simulator / emulated SDK
 ```
 
 ### The GUI
@@ -167,6 +167,7 @@ with their docstrings):
 | `arm_readout()` / `disarm_readout(resume_live)` | external trigger + Camera Link on/off |
 | `get_readout_counts(since_shot)` / `get_readout_stats()` | per-ROI sums of every shot (USB copy), threshold fits |
 | `get_readout_histograms(source)` | histograms of every ROI (verification or triggered shots) and, with every shot prepared bright, a threshold and quick fidelity estimate per ion |
+| `get_readout_check(last)` | while armed: is the crystal still there? `verdict` ok / dark / lost / no_light from the averaged readout frames, every ion's light (see below) |
 | `hold_tracking(reason, timeout)` / `resume_tracking()` | "ions will move on purpose" (shuttling, camera) |
 | `take_control(owner, reason, timeout)` / `release_control(owner)` | advisory lease shown in all GUIs |
 | `start_live(**settings)` / `set_live(...)` / `set_exposure` / `set_em_gain` / `set_roi` / `stop()` | live video |
@@ -438,8 +439,92 @@ Some points that matter when using the Grabber:
   (exposure + readout + margin), as in the example experiment.
 * **During experiments.** USB copies of every frame feed `get_readout_counts()`,
   `get_readout_stats()` and `get_readout_histograms()`. If more light than at arming
-  falls outside the ROIs, you get `readout_geometry_changed`; any crystal change in live
-  mode marks the plan **outdated** (`is_readout_valid()` returns False).
+  falls outside the ROIs, you get `readout_geometry_changed` (in frames with pixels away
+  from the ions to measure it against); any crystal change in live mode marks the plan
+  **outdated** (`is_readout_valid()` returns False). The crystal check below watches the
+  ions themselves.
+
+### Is the crystal still there? (while armed)
+
+While the readout is armed, the live tracking waits, but the averaged readout frames still
+show where the light comes from. One shot holds a few photo-electrons per ion. Over many
+shots, whatever states the experiment prepares, each super-pixel's mean signal is
+
+> mean signal = Σ<sub>ions</sub> (fraction of the ion's light in this super-pixel) × (its
+> mean light per shot) + a uniform background (laser scatter).
+
+The fractions come from the located positions and the fitted PSF, core and halo, as in
+the plan. Every 100 shots, ioncam fits the last 1000 shots this way. It tries the crystal
+as calibrated, and also crystals of one, two or more ions fewer: an ion that is lost
+leaves the others to re-arrange around the trap centre, so two ions become one in the
+middle. The best description gives the verdict:
+
+| verdict | what the light says | event |
+|---|---|---|
+| `ok` | every ion at its place, shining | `readout_crystal_ok` (when back after a problem) |
+| `dark` | an ion's light is gone, the others are in place: a dark state that does not end (a molecular ion, a long-lived level), or the experiment keeps that ion dark in every shot | `readout_ion_dark` (warning) |
+| `lost` | the light fits fewer ions at their new places: an ion was lost and the crystal re-arranged (the plan is marked outdated) | `readout_ion_lost` (alarm) |
+| `no_light` | no ion light. It also says whether the laser scatter is still there (ions dark or lost) or gone (lasers off?) | `readout_no_light` (warning) |
+| `uncertain` | another crystal fits about as well, so there is too little light to tell yet | none |
+| `unclear` | the light fits no crystal expected here (ions moved, wrong calibration): recalibrate | `readout_pattern_unclear` (warning) |
+
+For your crystal of two ions at 45°, each in a diagonal super-pixel of a 2 × 2 AQROI, the
+patterns are:
+- **both ions:** the diagonal super-pixels lit, with the leakage into the other two
+  (on the simulated trap 310 counts per shot in each diagonal super-pixel, 50-170 in the
+  other two);
+- **one dark:** one diagonal super-pixel lit, its neighbours with its leakage only;
+- **one lost:** the other ion moves to the middle, so all four super-pixels are lit about
+  the same.
+
+**Where to see it.** While armed, the banner on top shows it, for example "2 ions ·
+readout: in place, shining", "1 ion + 1 dark", or a red "ION LOST", and the Readout tab
+has a crystal chip whose tooltip gives the full message. From ARTIQ:
+
+```python
+r = self.ioncam.get_readout_check()        # the latest check
+if r["verdict"] in ("dark", "lost", "no_light"):
+    print(r["message"])                    # e.g. "ion 1 dark: no light at its place ..."
+r = self.ioncam.get_readout_check(300)     # or check the last 300 shots now
+```
+
+The result also holds each ion's mean light per shot (`ions`: `light` in counts,
+`relative` to the others, `state`) and the mean frame above bias against the best
+crystal's model (`signal`, `model`). Events need two checks in a row that agree.
+
+**How it decides.**
+- **Bias.** A 2 × 2 frame has no dark pixels, so the bias comes from the read-noise peak
+  of the counts: shots in which a super-pixel caught no photo-electron are common in the
+  darkest super-pixels, even with the ions bright in every shot.
+- **Reference.** The first 1000 shots after arming are the reference. They record each
+  ion's light, so every ion is compared with its own brightness and the others, and the
+  background, so the background cannot pass for a centred ion.
+- **Recent shots.** The last quarter of the window (250 shots) is checked on its own as
+  well. When it decides something different, the crystal changed within the window, and
+  the recent part is reported.
+- **Giving up the planned crystal.** It takes a clearly better fit (χ² lower by 16) before
+  an ion is called lost.
+
+On frames made like the simulated lab trap's (PSF 1.2 px, ions 4.3 px apart, 3 × 3
+binning, 2 × 2 AQROI, about 12 photo-electrons per ion per bright shot), over 40 random
+runs per case:
+- **1000 shots:** no wrong verdict for ok, either ion dark, lost, lasers off or ions gone,
+  with the ions bright in every shot, in half of them or in 20 % of them. The same holds
+  with the PSF model 15 % too narrow or the halo under-estimated.
+- **250 shots:** also right, except that a lost ion among ions bright in only 20 % of the
+  shots is mostly `uncertain`, and the full window then decides.
+- **Larger crystals:** a three-ion chain is handled the same way, with any one ion dark
+  or one lost.
+
+**Limits.**
+- An ion the experiment keeps dark in every shot looks dark.
+- A single ion that is dark looks like one that is lost: there is no light either way.
+- Two ions lost from three (one left in the middle) look like the outer two dark; the
+  message says so.
+- The bias needs EM gain: without it, give the frame a background row.
+- Arm with the crystal as planned, because the first shots are the reference.
+- Options are in `[readout_check]`: the window, how often to check, the dark level
+  (15 % of the others' light) and the margin.
 
 ## The ions' brightness in photoelectrons per second
 
@@ -809,6 +894,7 @@ ioncam/
   analysis/tracker.py   crystal tracking and event classification
   analysis/readout.py   AQROI/ROI planner, Grabber gateware model, verification, thresholds
   analysis/darkframes.py  EMCCD dark model, its fit, SPAM errors and detection times
+  analysis/readout_check.py  the crystal from averaged readout frames (dark, lost, no light)
   characterize.py       camera characterization: plan, sweep, results, files
   engine.py             camera thread, analysis thread, procedures, safety
   api.py                the RPC target (sipyco "ioncam")
@@ -850,7 +936,7 @@ These are worth knowing, because several would silently corrupt data:
 
 ## Tests
 
-`pytest` runs 155 tests in about 6 minutes, in the realistic regime (13k photons/s
+`pytest` runs 164 tests in about 6 minutes, in the realistic regime (13k photons/s
 per ion, blurred PSF with halo, laser scatter, surface defects):
 - chain physics against James' published values;
 - detector accuracy (photon-limited) and false-alarm rates at EM gain 1, 50 and 300,
@@ -891,6 +977,12 @@ per ion, blurred PSF with halo, laser scatter, surface defects):
   light taken for ions
   (the hint, a tight crop, a search region, a typed AQROI, the AQROI by hand and
   Calibrate + arm inside it);
+- the crystal check while armed: the bias from the read-noise peak, the re-arranged
+  crystals, two ions at 45° in a 2 × 2 AQROI (ok, either ion dark, lost, lasers off, ions
+  gone; in 1000 and 250 shots, ions bright in every shot or half of them), a three-ion chain
+  (any ion dark, one lost, two lost), a PSF 15 % off, a wrong calibration ("unclear"), and
+  on the simulator while armed with random qubit states: the events for dark, back, lost
+  (the plan outdated), over RPC and in the banner;
 - the camera characterization: fits of synthetic EMCCD dark frames with known read
   noise, gain, CIC and hot pixels (unbiased, honest errors; the gain fixed at moderate
   gain), SPAM predictions against Monte Carlo shots (ROI sums, depumping), detection

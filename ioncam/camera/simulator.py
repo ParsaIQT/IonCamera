@@ -513,6 +513,10 @@ class IonTrapScene:
             sigma = np.full(len(chain), self.psf_sigma)
             rate = self.photon_rate * exposure * qe * laser
             flux = np.array([rate if (i.bright and self.repumper_on) else 0.0 for i in chain])
+            p_dark = float(cfg.qubit_dark_probability)
+            if p_dark > 0 and len(flux):
+                # the experiment's qubit states: dark in this exposure
+                flux = flux * (self.rng.random(len(flux)) >= p_dark)
             if melted and len(chain):
                 pos = pos + self.rng.normal(0.0, 1.5, pos.shape)
                 sigma[:] = self.psf_sigma + 3.0
