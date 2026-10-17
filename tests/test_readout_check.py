@@ -177,6 +177,98 @@ def test_combine_recent_and_full_windows():
     assert combine(ok, unsure)["verdict"] == "ok"
 
 
+@pytest.mark.parametrize("which", ["one ion beside a background ROI", "two ions at 45 deg"])
+def test_no_ion_is_never_an_ion(which):
+    """No ion in the frames, only the camera and laser scatter, plus a few
+    counts of static pattern (binned super-pixels have column-to-column bias
+    differences of that size) at the ion's super-pixel or down one column -
+    which the mean light alone took for a dim ion ('1 ion', green). The
+    ROIs have none of the bright shots an ion gives: no ion light, decided,
+    and no reference taken from it - with or without a reference from the
+    crystal as planned. An ion bright in a fifth of the shots is seen."""
+    if which.startswith("one"):
+        pos = np.array([[257.5, 163.5]])
+        plan = plan_readout(pos, PSF, SENSOR, 4, 4, aqroi=(256, 162, 264, 170),
+                            roi_size=(1, 1), halo=HALO)
+        assert plan.background_roi is not None
+    else:
+        pos, plan = two_ions_2x2()
+        assert plan.background_roi is None
+    w, h = plan.frame_size
+    ref = check_crystal(plan, shots(plan, pos, 1000, 90, 0.5, cic=0.05), g=EM_GAIN / SENS)
+    assert ref["verdict"] == "ok" and ref["decided"] and ref.get("reference")
+    patterns = []
+    for at, d in (((0, 0), 6.0), ((0, 0), 5.0), ((0, 0), 4.0), ((slice(None), 1), 3.0),
+                  ((slice(None), 1), -3.0)):
+        p = np.zeros((h, w))
+        p[at] = d
+        patterns.append(p)
+    for k, offs in enumerate(patterns):
+        for seed in range(4):
+            # (seed 500, +5 or +6 counts: the old check said 'ok', decided)
+            frames = shots(plan, [], 1000, 500 + seed, cic=0.05) + offs[None]
+            for r in (None, ref):
+                c = check_crystal(plan, frames, reference=r, g=EM_GAIN / SENS)
+                assert c["verdict"] == "no_light" and c["decided"], (k, seed, c["message"])
+                assert "reference" not in c and all(lt["state"] == "no" for lt in c["light"])
+    c = check_crystal(plan, shots(plan, pos, 1000, 300, 0.2, cic=0.05), g=EM_GAIN / SENS)
+    assert c["verdict"] == "ok" and c["decided"], c["message"]
+    assert all(lt["state"] == "yes" and lt["bright_fraction"] > 0.1 for lt in c["light"])
+
+
+def test_armed_without_an_ion(tmp_path):
+    """The readout armed for one ion in a 2 x 2 AQROI (no pixel free of its
+    light), and the ion gone before the first shot: no ion light (event,
+    banner), never '1 ion'; an ion back in the trap: the crystal as planned."""
+    cfg = Config()
+    cfg.storage.data_dir = str(tmp_path)
+    cfg.simulator.seed = 5
+    cfg.simulator.n_ions = 1
+    cfg.simulator.psf_sigma = 1.2
+    cfg.tracker.confirm_time = 0.3
+    engine, api = build(cfg, simulate=True)
+    engine.start()
+    try:
+        assert engine.wait_for_ions(1, timeout=30)["ok"]
+        engine.calibrate_readout(n_ions=1, hbin=4, vbin=4)
+        plan = engine.manual_aqroi(2, 2)
+        assert plan["frame_size"] == [2, 2] and engine.mode == "readout"
+        sim, scene = engine.sim_camera(), engine.sim_scene()
+        assert scene.lose_ion()
+        last = engine.events.last_id
+
+        def run(n):
+            nonlocal last
+            k0 = engine.monitor.shots
+            sim.trigger(n, 0.002)
+            t0 = time.time()
+            while engine.monitor.shots < k0 + n and time.time() - t0 < 60:
+                time.sleep(0.05)
+            time.sleep(0.3)
+            kinds = [e["kind"] for e in engine.events.since(last)]
+            last = engine.events.last_id
+            return engine.readout_check(), kinds
+
+        c, kinds = run(1200)
+        assert c["verdict"] == "no_light" and c["decided"], c["message"]
+        assert "readout_no_light" in kinds and engine.monitor.reference is None
+        status = engine.status()["readout"]["crystal"]
+        assert status["verdict"] == "no_light"
+        try:
+            from ioncam.gui.widgets import readout_crystal_view
+        except Exception:  # pragma: no cover - no usable Qt
+            readout_crystal_view = None
+        if readout_crystal_view is not None:
+            text, desc, _ = readout_crystal_view(status)
+            assert text == "- ions" and "NO ION LIGHT" in desc
+        scene.load_ion(1, cloud_time=0.0)
+        c, kinds = run(1200)
+        assert c["verdict"] == "ok" and c["decided"], c["message"]
+        assert "readout_crystal_ok" in kinds
+    finally:
+        engine.shutdown()
+
+
 def test_light_outside_the_rois():
     """One ion in the corner super-pixel of a 2 x 2 AQROI, its neighbour the
     background ROI (with some of its light), clock-induced charge as at a slow

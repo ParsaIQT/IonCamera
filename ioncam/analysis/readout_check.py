@@ -28,19 +28,29 @@ The bias (counts of a super-pixel without a photo-electron) is the read-noise
 peak of the counts: shots in which a super-pixel caught no photo-electron are
 common in its darkest super-pixel even with the ions bright in every shot.  A
 small error in it is uniform and taken up by ``b``.
+
+The means alone cannot tell a dim ion from a few counts of static pattern:
+the bias of binned super-pixels differs by a few counts from column to
+column, and over a thousand shots that is significant.  So each ion's ROI
+is also asked whether it has shots with many photo-electrons - the bright
+mode of its histogram, which an ion that shines in even a few per cent of
+the shots gives and nothing else does (``ion_light``).  No ROI with such
+shots: no ion light, whatever the means say.
 """
 
 from __future__ import annotations
 
 import math
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from scipy.optimize import least_squares, lsq_linear
-from scipy.special import ndtr
+from scipy.special import gammaincc, ndtr
+from scipy.stats import chi2 as chi2_dist
+from scipy.stats import poisson
 
 from ioncam.analysis.chain import equilibrium_positions
-from ioncam.analysis.readout import ReadoutPlan, _light_matrix, dark_pixel_mask
+from ioncam.analysis.readout import ReadoutPlan, _dark_sums, _light_matrix, dark_pixel_mask
 
 VERDICTS = ("ok", "dark", "lost", "no_light", "unclear", "uncertain")
 
@@ -226,6 +236,102 @@ def _names(idx) -> str:
     return idx[0] if len(idx) == 1 else ", ".join(idx[:-1]) + " and " + idx[-1]
 
 
+# ---------------------------------------------------------------------------
+# is there ion light at all: shots with many photo-electrons
+# ---------------------------------------------------------------------------
+
+
+def _poisson_upper(k: int, cl: float) -> float:
+    """One-sided upper limit on a Poisson mean with ``k`` counts seen."""
+    return 0.5 * float(chi2_dist.ppf(cl, 2 * k + 2))
+
+
+def _poisson_lower(k: int, cl: float) -> float:
+    return 0.0 if k <= 0 else 0.5 * float(chi2_dist.ppf(1.0 - cl, 2 * k))
+
+
+def _camera_tail(lam: float, y: float) -> float:
+    """P(counts > y photo-electrons' worth) for Poisson(``lam``) events that
+    all get the full EM gain (exponential each: their sum is Gamma) - an
+    upper bound for the camera's own events (serial CIC gets less gain)."""
+    if lam <= 0.0:
+        return 0.0
+    ks = np.arange(1, int(lam + 10.0 * math.sqrt(lam) + 12))
+    return float(np.sum(poisson.pmf(ks, lam) * gammaincc(ks, y)))
+
+
+def ion_light(plan: ReadoutPlan, frames, level: float, sigma: float, g: float = 0.0,
+              dark: Optional[np.ndarray] = None, peak_fraction: Optional[float] = None,
+              min_fraction: float = 0.02, p_value: float = 1e-5) -> List[dict]:
+    """For each ion's ROI: does it have shots with many photo-electrons?
+
+    An ion that shines in some of the shots fills its ROI with tens of
+    photo-electrons in those shots; clock-induced charge and laser scatter
+    give a super-pixel one or two, and a static pattern of a few counts none.
+    A shot counts as bright above ``threshold`` counts (ROI sum above
+    ``level`` per super-pixel): 5 photo-electrons (``g`` counts each).
+    Pixels without ion light (``dark``, a mask of the frame) show how often
+    the camera and the scatter alone get there in the same shots - sums of
+    as many of them as the ROI has super-pixels; without such pixels, the
+    camera alone, an upper bound from the read-noise peak's share of samples
+    (``peak_fraction``: every event in a super-pixel empties it).
+
+    ``state``: "yes" - more bright shots than the camera gives (p below
+    ``p_value``, at least 0.5 % of the shots); "no" - the ion shone in fewer
+    than ``min_fraction`` of the shots (95 % upper limit); else "unsure"."""
+    f = np.asarray(frames, float)
+    n = len(f)
+    w, h = plan.frame_size
+    flat = f.reshape(n, -1)
+    sums = plan.roi_sums(flat.reshape(n, h, w))
+    sig = max(float(sigma or 0.0), 0.5)
+    have_g = g > 2.0 * sig
+    use_dark = dark is not None and bool(np.any(dark))
+    out = []
+    for j, (u0, v0, u1, v1) in enumerate(plan.ion_rois):
+        area = max((u1 - u0) * (v1 - v0), 1)
+        x = sums[:, j] - area * level
+        if use_dark:
+            thr = max(5.0 * g, 10.0 * sig * math.sqrt(area)) if have_g else \
+                12.0 * sig * math.sqrt(area)
+            ref = _dark_sums(np.rint(flat[:, dark]), area).astype(float) - area * level
+            m = max(int(ref.size), 1)
+            k_ref = int(np.sum(ref > thr))
+            r0, r0_hi = k_ref / m, _poisson_upper(k_ref, 0.999) / m
+            r0_lo = _poisson_lower(k_ref, 0.95) / m
+            source = "pixels without ion light"
+        else:
+            # the camera alone: its events per super-pixel from the read-noise
+            # peak while the peak is clean (most samples in it); a darkest
+            # super-pixel with a weak peak holds ion light, not more camera
+            # events - then a generous 1 event per super-pixel.  Its events
+            # only make a "yes" harder: "no" asks the ROI alone for few
+            # bright shots.
+            g_eff = g if have_g else 10.0 * sig
+            thr = max(5.0 * g_eff, 12.0 * sig * math.sqrt(area))
+            f0 = float(peak_fraction or 0.0)
+            lam = -math.log(min(f0, 1.0)) if f0 >= 0.25 else 1.0
+            r0 = r0_hi = _camera_tail(area * max(lam, 0.0), thr / g_eff)
+            r0_lo = 0.0
+            source = "camera alone (upper bound)"
+        k = int(np.sum(x > thr))
+        excess = k / n - r0
+        excess_hi = _poisson_upper(k, 0.95) / n - r0_lo
+        pv = float(poisson.sf(k - 1, n * r0_hi)) if k > 0 else 1.0
+        if pv < p_value and excess >= 0.005:
+            state = "yes"
+        elif excess_hi < min_fraction:
+            state = "no"
+        else:
+            state = "unsure"
+        out.append({"index": j, "state": state, "threshold": float(thr),
+                    "bright_shots": k, "fraction": k / n, "camera_fraction": float(r0),
+                    "bright_fraction": float(max(excess, 0.0)),
+                    "bright_fraction_upper": float(max(excess_hi, 0.0)),
+                    "p_value": pv, "reference": source})
+    return out
+
+
 def check_crystal(plan: ReadoutPlan, frames, crystal: Optional[Sequence] = None,
                   reference: Optional[dict] = None, dark_level: float = 0.15,
                   systematic: float = 0.05, bias: Optional[dict] = None,
@@ -278,6 +384,10 @@ def check_crystal(plan: ReadoutPlan, frames, crystal: Optional[Sequence] = None,
         lvl = dict(bias, source=bias.get("source", "earlier"))
     level = float(lvl["level"])
     out["bias"] = {k: lvl.get(k) for k in ("level", "sigma", "fraction", "ok", "source", "error")}
+    # -- shots with many photo-electrons in each ion's ROI (ion light at all?)
+    light = ion_light(plan, flat, level, float(lvl.get("sigma") or 0.0), g,
+                      dark if dark.any() else None, lvl.get("fraction"))
+    out["light"] = light
 
     signal = flat.mean(axis=0) - level
     stat2 = flat.var(axis=0) / n_shots
@@ -353,6 +463,22 @@ def check_crystal(plan: ReadoutPlan, frames, crystal: Optional[Sequence] = None,
                    for j in range(len(a))]
     planned_bright = list(plan.ion_states) if len(plan.ion_states) == n_cr else \
         ["bright"] * n_cr
+    # the ROIs' bright shots: per ion when the ROIs are the crystal's ions
+    roi_state = [lt["state"] for lt in light]
+    per_ion = len(light) == n_cr
+    any_lit = "yes" in roi_state
+    all_unlit = bool(light) and all(s == "no" for s in roi_state)
+    # an ion without bright shots is dark beside another that clearly has them
+    # (ions all as dim say nothing about one of them)
+    unlit = [j for j, s in enumerate(roi_state) if per_ion and s == "no" and
+             planned_bright[j] == "bright" and
+             any(lt["state"] == "yes" and lt["bright_fraction"] >= max(
+                 0.05, 3.0 * light[j]["bright_fraction_upper"]) for lt in light)]
+    for j, lt in enumerate(light):
+        if j < len(out["ions"]) and per_ion:
+            out["ions"][j]["bright_fraction"] = lt["bright_fraction"]
+            out["ions"][j]["light_seen"] = lt["state"]
+
     # no ion light: the background alone explains the frames about as well as
     # any crystal, and the ions give clearly less than half their light after
     # arming (before there is a reference: no significant light)
@@ -375,7 +501,10 @@ def check_crystal(plan: ReadoutPlan, frames, crystal: Optional[Sequence] = None,
     # light into the background, another into the ion)
     near = [d for d in hyps if d["ions"] and d["cost"] - by_cost[0]["cost"] < margin]
     bg_only = hyps[-1]["cost"] - by_cost[0]["cost"] < margin
-    no_light = n_cr == 0 or (bg_only and all(dim(d) for d in near))
+    no_light_means = n_cr == 0 or (bg_only and all(dim(d) for d in near))
+    # no ROI with bright shots decides it; the means alone only while no ROI
+    # has them (an ROI with bright shots holds an ion that shines)
+    no_light = all_unlit or (no_light_means and not any_lit)
     lasers = ""
     if ref is not None and ref.get("background") is not None:
         b_ref = float(ref["background"])
@@ -387,9 +516,20 @@ def check_crystal(plan: ReadoutPlan, frames, crystal: Optional[Sequence] = None,
     chi2_dof = best["chi2"] / best["dof"]
     n_bright = sum(1 for st in states if st == "bright")
     alike = rival is not None and conf is not None and conf < margin
+    pe = "" if not g > 0 else " (~{:.0f} photo-electrons)"
+
+    def evidence(lt) -> str:
+        return "{:.1%} of the shots above {:.0f} counts{}, {} {:.1%}".format(
+            lt["fraction"], lt["threshold"], pe.format(lt["threshold"] / g) if pe else "",
+            lt["reference"], lt["camera_fraction"])
+
     if no_light:
         out["verdict"] = "no_light"
         out["message"] = "no ion light in the {}{}".format(window, lasers)
+        if all_unlit:
+            top = max(light, key=lambda lt: lt["fraction"])
+            out["message"] = "no ion light in the {}: no ion ROI has the shots with many " \
+                "photo-electrons that an ion gives ({}){}".format(window, evidence(top), lasers)
     elif best["ions"] < n_cr:
         k = n_cr - best["ions"]
         dark_left = [j for j, st in enumerate(states) if st == "dark"]
@@ -402,8 +542,19 @@ def check_crystal(plan: ReadoutPlan, frames, crystal: Optional[Sequence] = None,
                 "s" if best["ions"] != 1 else "", n_cr, window,
                 "; {} of them dark".format(len(dark_left)) if dark_left else "")
     else:
+        # dark by its mean light - unless its ROI has about as many bright shots
+        # as the brightest (a few counts of bias pattern can zero the mean of a
+        # dim ion; a neighbour's spill-over gives far fewer); and dark when its
+        # ROI has no bright shots beside one that has, whatever its mean says
+        top_frac = max([lt["bright_fraction"] for lt in light] or [0.0])
         dark_now = [j for j, st in enumerate(states) if st == "dark" and
-                    planned_bright[j] == "bright"]
+                    planned_bright[j] == "bright" and not
+                    (per_ion and light[j]["state"] == "yes" and
+                     light[j]["bright_fraction"] >= 0.3 * top_frac)]
+        dark_now = sorted(set(dark_now) | set(unlit))
+        # 'ok' needs bright shots in every ion's ROI
+        not_seen = [j for j, s in enumerate(roi_state) if per_ion and s != "yes" and
+                    planned_bright[j] == "bright" and j not in dark_now]
         if dark_now:
             out["verdict"] = "dark"
             out["dark"] = dark_now
@@ -423,19 +574,41 @@ def check_crystal(plan: ReadoutPlan, frames, crystal: Optional[Sequence] = None,
             out["verdict"] = "uncertain"
             out["message"] = "{} ions in place, or {} at new places - they fit the light " \
                 "about as well ({}); more shots will tell".format(n_cr, rival["ions"], window)
+        elif not_seen:
+            out["verdict"] = "uncertain"
+            out["message"] = "too few shots with many photo-electrons in the ROI of ion {} " \
+                "to tell whether {} there ({})".format(
+                    _names(not_seen), "it is" if len(not_seen) == 1 else "they are",
+                    evidence(light[not_seen[0]]))
         else:
             out["verdict"] = "ok"
-            out["message"] = "{} ion{} in place, shining ({})".format(
-                n_cr, "s" if n_cr != 1 else "", window)
+            seen_frac = [lt["bright_fraction"] for lt in light if lt["state"] == "yes"]
+            out["message"] = "{} ion{} in place, shining ({}{})".format(
+                n_cr, "s" if n_cr != 1 else "", window,
+                "; bright in " + ", ".join("{:.0%}".format(x) for x in seen_frac) +
+                " of the shots" if seen_frac else "")
     if chi2_dof > 25.0 and out["verdict"] != "no_light" and (conf is None or conf < 4.0 * margin):
         out["verdict"] = "unclear"
         out["message"] = "the light pattern fits no crystal expected here (chi2/dof {:.0f}; " \
             "best: {} ion{}) - ions moved? recalibrate".format(
                 chi2_dof, best["ions"], "s" if best["ions"] != 1 else "")
-    # backed by the light: another crystal fits clearly worse (or no light at all)
-    out["decided"] = bool(out["verdict"] in ("no_light", "unclear") or
-                          (conf is not None and conf >= 0.5 * margin) or
-                          (out["verdict"] == "dark" and rival is not None))
+    # backed by the light: another crystal fits clearly worse, or (no light,
+    # an ion dark) the ROIs' bright shots say so
+    v = out["verdict"]
+    strong = conf is not None and conf >= 0.5 * margin
+    if v == "no_light":
+        decided = all_unlit or "unsure" not in roi_state
+    elif v == "unclear":
+        decided = True
+    elif v == "uncertain":
+        decided = False
+    elif v == "dark":
+        decided = strong or bool(unlit)
+    elif v == "ok":
+        decided = strong and (per_ion or any_lit)
+    else:
+        decided = strong
+    out["decided"] = bool(decided)
     if out["verdict"] == "ok" and out["decided"]:
         out["reference"] = {"light": a.tolist(), "background": best["background"],
                             "sigma": lvl.get("sigma") if lvl.get("ok") else None,

@@ -56,7 +56,7 @@ pip install git+https://github.com/m-labs/sipyco      # not on PyPI (ARTIQ envs 
 ioncam_gui --simulate          # GUI + simulated trap; use the "Simulation" tab to play
 ioncam_gui --simulate --sim-camera 888    # ... as an iXon Ultra 888 (1024 x 1024)
 aqctl_ioncam --simulate        # headless RPC server with the simulator
-pytest                         # 166 tests (~6 min), all on the simulator / emulated SDK
+pytest                         # 169 tests (~6 min), all on the simulator / emulated SDK
 ```
 
 ### The GUI
@@ -459,15 +459,25 @@ The fractions come from the located positions and the fitted PSF, core and halo,
 the plan. Every 100 shots, ioncam fits the last 1000 shots this way. It tries the crystal
 as calibrated, and also crystals of one, two or more ions fewer: an ion that is lost
 leaves the others to re-arrange around the trap centre, so two ions become one in the
-middle. The best description gives the verdict:
+middle.
+
+Means alone cannot tell a dim ion from a few counts of static pattern: the bias of binned
+super-pixels differs by about 2 counts from column to column (17 Oct characterization),
+and over 1000 shots a few counts at the ion's super-pixel are significant. So each ion's
+ROI is also asked for the shots an ion gives and nothing else does: shots with more than
+5 photo-electrons. Pixels without ion light in the same shots (the background ROI, or
+super-pixels the ions miss) show how often the camera and the laser scatter alone get
+there; a frame without such pixels uses the camera alone, from its read-noise peak, as
+an upper bound. These bright shots are what makes the ROI's histogram differ from the
+background's. The verdict comes from both:
 
 | verdict | what the light says | event |
 |---|---|---|
 | `ok` | every ion at its place, shining | `readout_crystal_ok` (when back after a problem) |
 | `dark` | an ion's light is gone, the others are in place: a dark state that does not end (a molecular ion, a long-lived level), or the experiment keeps that ion dark in every shot | `readout_ion_dark` (warning) |
 | `lost` | the light fits fewer ions at their new places: an ion was lost and the crystal re-arranged (the plan is marked outdated) | `readout_ion_lost` (alarm) |
-| `no_light` | no ion light. It also says whether the laser scatter is still there (ions dark or lost) or gone (lasers off?) | `readout_no_light` (warning) |
-| `uncertain` | another crystal fits about as well, so there is too little light to tell yet | none |
+| `no_light` | no ion light: no ion's ROI has the bright shots a shining ion gives, whatever the means say. It also says whether the laser scatter is still there (ions dark or lost) or gone (lasers off?) | `readout_no_light` (warning) |
+| `uncertain` | another crystal fits about as well, or an ion's ROI has too few bright shots to say it is there: too little light to tell yet | none |
 | `unclear` | the light fits no crystal expected here (ions moved, wrong calibration): recalibrate | `readout_pattern_unclear` (warning) |
 
 For your crystal of two ions at 45°, each in a diagonal super-pixel of a 2 × 2 AQROI, the
@@ -491,16 +501,27 @@ r = self.ioncam.get_readout_check(300)     # or check the last 300 shots now
 ```
 
 The result also holds each ion's mean light per shot (`ions`: `light` in counts,
-`relative` to the others, `state`) and the mean frame above bias against the best
-crystal's model (`signal`, `model`). Events need two checks in a row that agree.
+`relative` to the others, `state`, and `bright_fraction`: the share of shots in which it
+shone), each ROI's bright-shot test (`light`: `state` yes / no / unsure, `bright_shots`,
+`threshold`, `camera_fraction`) and the mean frame above bias against the best crystal's
+model (`signal`, `model`). Events need two checks in a row that agree. The banner shows
+a verdict the light does not decide yet as "2 ions?" in grey, never in a confident colour.
 
 **How it decides.**
+- **Bright shots.** An ROI has ion light ("yes") when it has clearly more shots above 5
+  photo-electrons than the camera and the scatter give (p below 10⁻⁵, and at least 0.5 %
+  of the shots); none ("no") when the ion shone in fewer than 2 % of the shots (95 %
+  upper limit). No ROI with ion light: `no_light`, decided. An ion whose ROI has none,
+  beside an ROI that clearly has (at least 5 % and three times as many): dark, whatever
+  its mean says. An ion whose ROI has about as many bright shots as the brightest is not
+  called dark by its mean. `ok` needs every ion's ROI to say "yes".
 - **Bias.** A 2 × 2 frame has no dark pixels, so the bias comes from the read-noise peak
   of the counts: shots in which a super-pixel caught no photo-electron are common in the
   darkest super-pixels, even with the ions bright in every shot.
-- **Reference.** The first 1000 shots after arming are the reference. They record each
-  ion's light, so every ion is compared with its own brightness and the others, and the
-  background, so the background cannot pass for a centred ion.
+- **Reference.** The first check that sees every ion shine, decided, is the reference
+  (from 250 shots). It records each ion's light, so every ion is compared with its own
+  brightness and the others, and the background, so the background cannot pass for a
+  centred ion. Armed without an ion, no reference is taken.
 - **Recent shots.** The last quarter of the window (250 shots) is checked on its own as
   well. When it decides something different, the crystal changed within the window, and
   the recent part is reported.
@@ -509,22 +530,31 @@ crystal's model (`signal`, `model`). Events need two checks in a row that agree.
 
 On frames made like the simulated lab trap's (PSF 1.2 px, ions 4.3 px apart, 3 × 3
 binning, 2 × 2 AQROI, about 12 photo-electrons per ion per bright shot), over 40 random
-runs per case:
+runs per case, with clock-induced charge and a random 2-count bias pattern per super-pixel:
 - **1000 shots:** no wrong verdict for ok, either ion dark, lost, lasers off or ions gone,
-  with the ions bright in every shot, in half of them or in 20 % of them. The same holds
-  with the PSF model 15 % too narrow or the halo under-estimated.
-- **250 shots:** also right, except that a lost ion among ions bright in only 20 % of the
-  shots is mostly `uncertain`, and the full window then decides.
+  with the ions bright in every shot, in half of them or in 20 % of them (2 of 720 runs
+  undecided). The same holds with the PSF model 15 % too narrow or the halo
+  under-estimated.
+- **250 shots:** no wrong verdict either. A lost ion among ions bright in only 20 % of the
+  shots is mostly undecided, and so is "ions gone" in about a third of the runs (two or
+  three camera shots above 5 photo-electrons cannot prove the ROI empty); the full window
+  then decides.
+- **No ion, a few counts of pattern at the ion's super-pixel** (+5 or +6 counts, on the
+  1 ion + background ROI frame and the two-ion frame): never anything but `no_light`. The
+  means alone said `ok` or `uncertain` in up to 23 of 40 runs (one ion, +6 counts; two
+  ions, +6 counts: 11 of 40).
 - **Larger crystals:** a three-ion chain is handled the same way, with any one ion dark
   or one lost.
 
 **Limits.**
-- An ion the experiment keeps dark in every shot looks dark.
+- An ion the experiment keeps dark in every shot looks dark; one bright in fewer than 2 %
+  of the shots counts as no light.
 - A single ion that is dark looks like one that is lost: there is no light either way.
 - Two ions lost from three (one left in the middle) look like the outer two dark; the
   message says so.
 - The bias needs EM gain: without it, give the frame a background row.
-- Arm with the crystal as planned, because the first shots are the reference.
+- The reference waits until every ion shines. Until then, ions are judged against each
+  other and by their bright shots only.
 - Options are in `[readout_check]`: the window, how often to check, the dark level
   (15 % of the others' light) and the margin.
 
@@ -944,7 +974,7 @@ These are worth knowing, because several would silently corrupt data:
 
 ## Tests
 
-`pytest` runs 166 tests in about 6 minutes, in the realistic regime (13k photons/s
+`pytest` runs 169 tests in about 6 minutes, in the realistic regime (13k photons/s
 per ion, blurred PSF with halo, laser scatter, surface defects):
 - chain physics against James' published values;
 - detector accuracy (photon-limited) and false-alarm rates at EM gain 1, 50 and 300,

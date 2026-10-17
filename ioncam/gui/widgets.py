@@ -494,6 +494,10 @@ def readout_crystal_view(c, text: str = "- ions", color: str = "#4a515e"):
     v, n, exp = c["verdict"], c.get("n_ions") or 0, c.get("expected") or 0
     dark = c.get("dark") or []
     shots = "last {} shots".format(c.get("n_shots"))
+    if c.get("decided") is False and v in ("ok", "dark", "lost"):
+        # the light leans that way but does not decide it: never a confident colour
+        return "{} ions?".format(exp), "readout: too little light to tell yet · " + shots, \
+            "#4a515e"
     if v == "ok":
         return "{} ion{}".format(exp, "s" * (exp != 1)), "readout: in place, shining · " + shots, \
             STATE_COLORS["stable"]
