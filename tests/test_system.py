@@ -808,6 +808,13 @@ def test_gui_smoke(tmp_path):
             time.sleep(0.01)
         assert win.tiles["pe"].value.text() not in ("", "-")
         assert "(simulator)" in win.pe_label.text()
+        # every ion's row in view (a short window scrolls the page instead of
+        # squeezing the list to a row: "3 bright ions", one row seen)
+        assert isinstance(win.ions_page, QtWidgets.QScrollArea)
+        win.sites.set_sites([{"index": k, "x": 100.0 + 4 * k, "y": 100.0, "state": "bright",
+                              "level": 1.0, "snr": 80.0} for k in range(3)])
+        assert win.sites.minimumHeight() >= win.sites.horizontalHeader().sizeHint().height() + \
+            3 * win.sites.verticalHeader().defaultSectionSize()
         # the shutter and the fan (Camera tab)
         assert [win.sh_mode.itemData(k) for k in range(win.sh_mode.count())] == \
             ["open", "closed", "series", "auto"]

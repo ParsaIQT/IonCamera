@@ -748,6 +748,13 @@ class SiteTable(QtWidgets.QTableWidget):
     def set_sites(self, sites):
         t = style.current()
         self.setRowCount(len(sites))
+        # every ion's row in view (up to 8; more scroll): the page around the
+        # table scrolls instead of squeezing it to a row or two
+        rows = min(max(len(sites), 1), 8)
+        h = self.horizontalHeader().sizeHint().height() + 2 * self.frameWidth() + \
+            rows * self.verticalHeader().defaultSectionSize()
+        if self.minimumHeight() != h:
+            self.setMinimumHeight(h)
         for r, s in enumerate(sites):
             pe = s.get("pe_rate")
             vals = [s["index"], "{:.2f}".format(s["x"]), "{:.2f}".format(s["y"]),

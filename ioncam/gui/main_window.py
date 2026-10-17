@@ -888,7 +888,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ])
         w = _page(grid, self.crystal_label, self.sites, tracking, detection, background, loading)
         w.layout().setStretchFactor(self.sites, 1)
-        return w
+        return _scroll(w)        # a short window scrolls the page, never squeezes the table
 
     def _readout_tab(self):
         ro = self.config.get("readout", {})

@@ -37,7 +37,7 @@ from typing import Deque, List, Optional, Tuple
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
-from ioncam.analysis.chain import fit_chain
+from ioncam.analysis.chain import equilibrium_positions, fit_chain
 from ioncam.analysis.detection import DetectionResult, deblend_patch
 from ioncam.analysis.fitting import PSF, fit_fixed_psf, fit_gaussians
 
@@ -350,6 +350,8 @@ class ChainTracker:
         self._pos_noise = 0.2           # rms per-axis position noise of one ion per frame [px]
         self._cl: Optional[dict] = None   # faint-cloud integrator (see _integrated_clouds)
         self._fi: Optional[dict] = None   # faint-ion integrator (see _faint_ions)
+        self._rel: dict = {}              # site id -> recent brightness / the crystal's
+        self._not_ion_at: List[np.ndarray] = []   # spots dropped as no ions (sensor px)
         self._last_resid: List[float] = []
         self.psf_estimate: Optional[dict] = None   # PSF learned from averaged frames
         self._psf_adopted: Optional[dict] = None   # the estimate last given to detection
@@ -506,6 +508,7 @@ class ChainTracker:
         self._region_var = None
         self._cl = None
         self._pending = None
+        self._not_ion_at = []            # (the spots found to be no ions are subtracted now)
         self._avg_reset()
 
     # -- main update -------------------------------------------------------------------
@@ -516,6 +519,7 @@ class ChainTracker:
         events: List[dict] = []
         spots = np.array([[s.x, s.y] for s in det.spots], float).reshape(-1, 2)
         self.n_spots = len(spots)
+        spots = self._drop_faint_spots(det, spots)
         self._update_marker(det, t)
         self._update_clouds(det, t, events)
 
@@ -539,6 +543,101 @@ class ChainTracker:
         return events
 
     # -- states ---------------------------------------------------------------------------
+
+    def _drop_faint_spots(self, det: DetectionResult, spots: np.ndarray) -> np.ndarray:
+        """Spots far fainter than the crystal's ions (``min_ion_fraction`` of
+        the spots at its bright sites) are no candidates for new ions: stray
+        light or a reflection next to the crystal, not an ion - every ion of a
+        crystal shines alike.  Spots at a bright site stay (``_faint_sites``
+        judges those)."""
+        frac = float(self.cfg.min_ion_fraction)
+        bright = np.array([[s.x, s.y] for s in self.sites if s.state == BRIGHT],
+                          float).reshape(-1, 2)
+        if frac <= 0 or len(spots) == 0 or len(bright) == 0 or \
+                self.state not in (STABLE, CHANGING) or self._after_hold is not None:
+            return spots                 # (a melted crystal's light is all faint)
+        flux = np.array([sp.flux for sp in det.spots], float)
+        d = np.hypot(spots[:, None, 0] - bright[None, :, 0],
+                     spots[:, None, 1] - bright[None, :, 1]).min(axis=1)
+        at_site = d <= self.cfg.match_radius
+        if not at_site.any():
+            return spots                 # (the crystal jumped: nothing to compare with)
+        keep = at_site | (flux >= frac * float(np.median(flux[at_site])))
+        return spots if keep.all() else spots[keep]
+
+    def _faint_sites(self, obs, t, events) -> None:
+        """A bright site that shines far less than the crystal's ions is no
+        ion - stray light or a reflection taken for one when the crystal was
+        found: in the frames where it is lit (above ``dark_level`` of its own
+        reference: a blinking ion's dark frames do not count), the median of
+        its brightness over the other lit ions' median stays below
+        ``min_ion_fraction``.  It is dropped (an event says where).  With two
+        lit sites the median of both is the yardstick (either may be the ion):
+        only a spot below ~0.4 of the other is dropped."""
+        frac = float(self.cfg.min_ion_fraction)
+        idx = [k for k, s in enumerate(self.sites) if s.state == BRIGHT and obs["inside"][k]]
+        if frac <= 0 or len(idx) < 2:
+            return
+        norm = np.asarray(obs["norm"], float)
+        lev = np.asarray(obs["levels"], float)
+        lit = [k for k in idx if np.isfinite(norm[k]) and norm[k] > 0 and
+               np.isfinite(lev[k]) and lev[k] > self.cfg.dark_level]
+        if len(lit) < 2:
+            return
+        drop = []
+        for k in lit:
+            others = [norm[j] for j in lit if j != k] if len(lit) >= 3 else [norm[j] for j in lit]
+            q = self._rel.setdefault(self.sites[k].id, deque(maxlen=60))
+            q.append(float(norm[k]) / max(float(np.median(others)), 1e-12))
+            if len(q) >= 30 and float(np.median(q)) < frac:
+                drop.append(k)
+        if not drop or len(drop) >= len(idx):
+            return
+        gone = [self.sites[k] for k in drop]
+        n_before = self.n_bright
+        self._not_ion_at += [np.array([s.x, s.y]) for s in gone]
+        self.sites = [s for k, s in enumerate(self.sites) if k not in drop]
+        for s in gone:
+            self._rel.pop(s.id, None)
+        self._avg_reset()
+        self._update_chain_fit()
+        self._stable_since = t
+        where = ", ".join("({:.1f}, {:.1f})".format(s.x, s.y) for s in gone)
+        events.append(self._event(
+            "crystal_refined", "info",
+            "{} bright ion{} (not {}): the spot{} at {} shine{} far less than the crystal's "
+            "ions - stray light or a reflection next to it, not an ion (learning the "
+            "background removes it)".format(
+                self.n_bright, "s" * (self.n_bright != 1), n_before, "s" * (len(gone) > 1),
+                where, "" if len(gone) > 1 else "s"), t,
+            before=n_before, after=self.n_bright, not_ions=[[s.x, s.y] for s in gone]))
+
+    def _not_ions(self, found: np.ndarray, extra) -> set:
+        """Which of the ``extra`` sources of an averaged-frame fit (``found``,
+        sensor px) cannot be ions: where a spot was found to shine far less
+        than the ions (``_faint_sites``), or closer to another ion than this
+        trap lets ions come - 0.6 x the closest spacing of a chain that many
+        ions long at the length scale of the crystal as tracked.  Ions repel
+        each other: such a source is light the PSF model leaves next to an ion
+        (or stray light), not a neighbour hidden in single frames.  (How bright
+        a new source must be, the averaged fit asks itself: half a typical ion.)"""
+        if not extra:
+            return set()
+        bad = {j for j in extra for q in self._not_ion_at
+               if float(np.hypot(*(found[j] - q))) <= self.cfg.match_radius}
+        dark = np.array([[s.x, s.y] for s in self.sites if s.state == DARK],
+                        float).reshape(-1, 2)
+        n = len(found) + len(dark)
+        if self._chain is None or n < 2:
+            return bad
+        closest = 0.6 * float(np.min(np.diff(equilibrium_positions(n)))) * float(self._chain[0])
+        allp = np.vstack([found, dark])
+        for j in extra:
+            d = np.hypot(*(allp - found[j]).T)
+            d[j] = np.inf
+            if float(d.min()) < closest:
+                bad.add(j)
+        return bad
 
     def _faint_ions(self, det, t) -> np.ndarray:
         """Faint new ions (empty trap, loading): a ~0.5 s average of the
@@ -608,7 +707,14 @@ class ChainTracker:
             self._pending = None
             self._learn_psf_on(p, det)
             found = self._average_fit(p, det, (p.reliable(),))
-            self._adopt(found if found is not None and len(found) else p.reliable(), [], det, t)
+            found = found if found is not None and len(found) else p.reliable()
+            if self._not_ion_at and len(found):
+                # (spots found to be no ions before are not taken for ions again)
+                keep = [k for k in range(len(found)) if all(
+                    float(np.hypot(*(found[k] - q))) > self.cfg.match_radius
+                    for q in self._not_ion_at)]
+                found = found[keep] if keep else found
+            self._adopt(found, [], det, t)
             n = len(self.sites)
             if self._first_config:
                 events.append(self._event("ions_detected", "info",
@@ -916,6 +1022,7 @@ class ChainTracker:
                 self._apply_tracking(obs, spots, t, full=moved)
             if not moved:
                 self._update_refs(obs)
+                self._faint_sites(obs, t, events)
             if moved:
                 self._avg_reset()
             else:
@@ -978,6 +1085,8 @@ class ChainTracker:
         if not committed:
             return
         p = self._pending
+        if p is None:
+            return                         # (a refocus decided in this frame ended it)
         self._pending = None
         if kind == "SITES":
             self._commit_sites(hyp[1], hyp[2], obs, t, events)
@@ -1279,6 +1388,7 @@ class ChainTracker:
                               inferred=states[i] == DARK))
             self._next_id += 1
         self.sites = sites
+        self._rel = {}
         self._region_ref = None
         self._diffuse_ref = None
         self._region_var = None
@@ -1610,6 +1720,10 @@ class ChainTracker:
         fy = (found[:, 1] + det.crop[1]) * vb + det.y0 + 0.5 * (vb - 1)
         found = np.column_stack([fx, fy])
         shift, pairs, miss, extra = align(bpos, found, self.cfg.match_radius, 2.0)
+        bad = self._not_ions(found, extra)
+        if bad:
+            found = found[[j for j in range(len(found)) if j not in bad]]
+            shift, pairs, miss, extra = align(bpos, found, self.cfg.match_radius, 2.0)
         if (not miss and not extra) or len(found) == len(bright):
             # same crystal, measured more precisely: refine the site positions (the
             # dark ones move with the bright ones)
@@ -1877,6 +1991,13 @@ class ChainTracker:
         cfg = self.cfg
         shift, pairs, miss, extra = align(old, found, 1.5 * cfg.match_radius,
                                           cfg.max_global_shift)
+        bad = self._not_ions(found, extra) if len(old) else set()
+        if bad:
+            found = found[[j for j in range(len(found)) if j not in bad]]
+            if not len(found):
+                return "same", old
+            shift, pairs, miss, extra = align(old, found, 1.5 * cfg.match_radius,
+                                              cfg.max_global_shift)
         if not pairs:
             return "changed", found
         spacing = self._local_spacing(old)

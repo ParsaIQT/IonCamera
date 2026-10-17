@@ -807,7 +807,7 @@ class IonCamEngine:
                                  "camera / imaging moved (not the ions), learn the background "
                                  "again - the surface structure moved with it", "info")
             if ev["kind"] in ("ion_lost", "ion_trapped", "chain_reconfigured", "dark_ion_moved",
-                              "chain_moved") and self._plan is not None:
+                              "chain_moved", "crystal_refined") and self._plan is not None:
                 if self._plan_valid:
                     self._plan_valid = False
                     self.events.emit("readout_plan_outdated", "The crystal changed since the "

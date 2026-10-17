@@ -224,6 +224,10 @@ class TrackerConfig:
                                       "dark ions after a reconfiguration")
     max_dark_inferred: int = opt(3, "maximum number of hidden dark ions to infer")
     hold_timeout: float = opt(120.0, "default maximum duration of hold_tracking() [s]")
+    min_ion_fraction: float = opt(0.6, "an ion shines at least this fraction of a typical "
+                                       "ion of the crystal (each when lit): a fainter spot "
+                                       "next to it - stray light, a reflection - is not "
+                                       "counted as an ion; 0 = off")
     verify_period: float = opt(2.0, "while the crystal is stable, re-measure it on the "
                                     "average of the frames since the last check every "
                                     "this many seconds (dim or dense chains that single "

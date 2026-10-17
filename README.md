@@ -56,7 +56,7 @@ pip install git+https://github.com/m-labs/sipyco      # not on PyPI (ARTIQ envs 
 ioncam_gui --simulate          # GUI + simulated trap; use the "Simulation" tab to play
 ioncam_gui --simulate --sim-camera 888    # ... as an iXon Ultra 888 (1024 x 1024)
 aqctl_ioncam --simulate        # headless RPC server with the simulator
-pytest                         # 172 tests (~6 min), all on the simulator / emulated SDK
+pytest                         # 177 tests (~6 min), all on the simulator / emulated SDK
 ```
 
 ### The GUI
@@ -70,7 +70,7 @@ in the order of the work:
 | tab | what is there |
 |---|---|
 | **Live** | start / stop, exposure, EM gain, binning, **Snap** (average N frames and save them), the camera ROI (crop to the view, around the ions with a margin, full sensor), display (colormap, levels, orientation) and the live readout electronics (amplifier, horizontal and vertical speed, pre-amp, frame transfer) |
-| **Ions** | the crystal at a glance (bright, dark, state, chain scale and angle, PSF σ, noise, the brightness in photoelectrons/s), every site (with its photoelectrons/s), tracking (accept as reference, forget, hold, locate), ion detection (where to search, threshold), the learned background, a loading alert |
+| **Ions** | the crystal at a glance (bright, dark, state, chain scale and angle, PSF σ, noise, the brightness in photoelectrons/s), every site (with its photoelectrons/s; every row in view - a short window scrolls the page), tracking (accept as reference, forget, hold, locate), ion detection (where to search, threshold), the learned background, a loading alert |
 | **Readout** | state chips (plan valid or outdated, armed, shots, verified); calibrate and run (Arm, Disarm, inside the AQROI set by hand); the camera settings of the long exposure and of the readout side by side (see below); the AQROI by hand (New AQROI, Place by click, the size pad, the D-pad); the results: shot histograms with the fidelity estimate, the plan (and a typed AQROI), the ARTIQ snippet |
 | **Events** | the event log, filtered by severity or text; save it to a file |
 | **Camera** | cooling, the shutter (internal and external output, polarity, opening and closing times; Open / Close), the cooling fan (full, low, off), the control lease, configuration (**Settings...**: every option with its help, changed at run time; **Save configuration...**), camera information |
@@ -815,6 +815,20 @@ once (`stray_light_hint`). What helps, best first:
 3. **Raise the detection threshold** (Ions tab, `detection.threshold_sigma`, default
    6 σ): a bright ion is far above it (SNR of a few hundred), faint stray light is not.
 
+**Next to the crystal** stray light is told from ions by how it shines: every ion of a
+crystal is lit alike, so a source at less than `tracker.min_ion_fraction` (0.6) of the
+crystal's other ions - judged on the frames where it is lit, so a blinking ion stays an
+ion - is not one. A spot found together with the crystal is dropped within a few seconds
+(`crystal_refined`: "2 bright ions (not 3): the spot at (x, y) shines far less than the
+crystal's ions ..."), and a spot that faint never becomes a new ion. An extra source that
+only the averaged frames show is no hidden ion either when it sits closer to another ion
+than this trap lets ions come (0.6 × the closest spacing of a chain that many ions long,
+at the tracked length scale): that is light the PSF model leaves next to an ion. Neither
+comes back at the same place until the background is learned or cleared. Before, a
+spot of half an ion's light beside two ions made "3 bright ions", or flipped the count
+between 2 and 3 every few seconds. For long chains in a narrow beam, whose end ions are
+dimmer, lower `min_ion_fraction`.
+
 Cropping the camera works too: Locate and Calibrate + arm search for ions only inside the
 live camera ROI. The long exposure still takes at least 64 × 64 px for its background
 statistics, but nothing found in that padding counts. On the 888's 1024 × 1024 sensor a
@@ -996,7 +1010,7 @@ These are worth knowing, because several would silently corrupt data:
 
 ## Tests
 
-`pytest` runs 172 tests in about 6 minutes, in the realistic regime (13k photons/s
+`pytest` runs 177 tests in about 6 minutes, in the realistic regime (13k photons/s
 per ion, blurred PSF with halo, laser scatter, surface defects):
 - chain physics against James' published values;
 - detector accuracy (photon-limited) and false-alarm rates at EM gain 1, 50 and 300,
@@ -1012,7 +1026,9 @@ per ion, blurred PSF with halo, laser scatter, surface defects):
   then bright then lost at every site, the PSF learned from the live crystal, a
   full-sensor start, refocusing, a trap turned by 45° and 90°, the per-ion brightness
   trace and the 80 %-light marker size, the learned PSF averaged (a stray fit ignored,
-  a refocus taken);
+  a refocus taken); the lab's imaging (PSF 0.8 px + 26 % halo, l = 3.4 px, 45°): a spot
+  of stray light beside or between two ions dropped as no ion and never taken for one
+  again, blinking ions kept, no hidden ion closer than the trap allows;
 - planner invariants, its containment / crosstalk against the simulated image (halo
   included), and agreement with the Grabber gateware model, including its `x1` quirk;
   close ions get overlapping ROIs instead of an error, one centred super-pixel per ion

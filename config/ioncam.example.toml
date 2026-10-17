@@ -187,6 +187,76 @@ min_verify_snr = 5.0
 # joint 2D Gaussian fit of all ions (sub-pixel positions, PSF)
 fit_psf = true
 
+# While armed: is the crystal still there?  The averaged readout frames tell an ion dark, an ion lost (the others re-arranged) or no ion light
+[readout_check]
+# while armed, check the crystal from the averaged readout frames: an ion dark, lost, no ion light (events)
+enabled = true
+# readout shots averaged
+window = 1000
+# the most recent shots checked on their own as well, to see a change within the window sooner; 0 = a quarter of the window
+recent = 0
+# check every this many shots
+every = 100
+# checks in a row that must agree before an event
+confirm = 2
+# an ion with less than this fraction of the other ions' light (each against its own after arming) is dark
+dark_level = 0.15
+# relative accuracy of the PSF model per super-pixel
+systematic = 0.05
+# how much better (chi-square) a crystal of fewer ions must fit the light before an ion is called lost
+margin = 16.0
+
+# Camera characterization: dark frames at many readout settings with the shutter closed (CIC, read noise, EM gain, dark current) and the SPAM error each setting gives
+[characterize]
+# what the camera characterization measures (with the shutter closed): baseline, sensor, electronics, vertical, gain, exposure, binning, triggered, conventional, grid, temperature
+stages = ["baseline", "sensor", "electronics", "vertical", "gain", "exposure", "binning", "triggered", "conventional", "grid"]
+# side of the square sensor region measured [px]; centred on the readout AQROI, else the ions, else the sensor (144 suits every binning up to 8 and 9)
+region_size = 144
+# pixel samples aimed for at every setting (frames x super-pixels): the rare events of the dark distribution's tail need millions
+samples_per_point = 3000000
+# fewest frames per setting
+min_frames = 60
+# most frames per setting
+max_frames = 5000
+# longest acquisition per setting [s]
+max_point_s = 20.0
+# frames after every start that are analysed separately (the first frames of an acquisition can differ)
+discard_frames = 2
+# EM gains of the gain sweep (those the camera allows)
+em_gains = [1, 2, 5, 10, 20, 50, 100, 150, 200, 300, 500, 700, 1000]
+# exposures of the exposure sweep [ms]; the long ones measure dark current and light leaks
+exposures_ms = [0.1, 0.2, 0.5, 1.0, 1.5, 2.0, 3.0, 5.0, 7.0, 10.0, 30.0, 100.0, 300.0, 1000.0]
+# square on-chip binnings measured (the readout's is added)
+binnings = [1, 2, 3, 4, 6, 8]
+# software-triggered single shots with this idle time between them [ms], like Grabber readout shots (0 = as fast as possible)
+trigger_spacings_ms = [0.0, 2.0, 10.0, 100.0, 1000.0]
+# EM gains of the full grid (HS speed x pre-amp x VS speed x clock voltage); 0 = the readout's, above the camera's maximum = its maximum
+grid_gains = [0, 9999]
+# vertical clock voltages measured (0 = normal, 1..4 = +1..+4); empty = all the camera has
+vs_amplitudes = []
+# sensor set points of the temperature stage [C], e.g. [-60, -70, -80]
+temperatures = []
+# longest wait for the temperature to settle [s]
+temperature_timeout_s = 900.0
+# repeat the baseline setting this often [s] (bias, CIC and temperature drift)
+stability_every_s = 600.0
+# for the SPAM ranking: photo-electrons/s from one bright ion (all its light); 0 = the brightness measured live
+ion_rate = 0.0
+# fraction of an ion's light in its readout ROI; 0 = from the readout plan, else 0.6
+roi_fraction = 0.0
+# super-pixels summed per ion
+roi_pixels = 1
+# stray light in an ion's ROI [photo-electrons/s]
+background_rate = 0.0
+# detection times shown in the ranking [ms]
+detection_ms = [0.5, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0]
+# the ranking compares settings by the shortest detection time reaching this SPAM error
+target_error = 0.001
+# bright state lifetime under the detection light (depumping) [ms]; 0 = ignore
+bright_lifetime_ms = 0.0
+# dark state lifetime under the detection light (off-resonant pumping) [ms]; 0 = ignore
+dark_lifetime_ms = 0.0
+
 # Ion spot detection
 [detection]
 # PSF Gaussian sigma [sensor px]; refined by calibration if auto_psf
@@ -254,6 +324,8 @@ use_chain_model = true
 max_dark_inferred = 3
 # default maximum duration of hold_tracking() [s]
 hold_timeout = 120.0
+# an ion shines at least this fraction of a typical ion of the crystal (each when lit): a fainter spot next to it - stray light, a reflection - is not counted as an ion; 0 = off
+min_ion_fraction = 0.6
 # while the crystal is stable, re-measure it on the average of the frames since the last check every this many seconds (dim or dense chains that single frames cannot resolve); 0 = off
 verify_period = 2.0
 # ion markers are circles holding this fraction of an ion's light (PSF core + halo as measured in the image)
@@ -398,8 +470,22 @@ bias = 100.0
 read_noise_e = 30.0
 # electrons per count at the output
 sensitivity = 4.0
-# clock-induced charge [e-/px/frame]
+# clock-induced charge [e-/px/frame] before the EM register (at the fastest recommended vertical shift speed, normal clock voltage)
 cic = 0.003
+# parallel CIC grows as (vertical shift time / the fastest recommended one) to this power
+cic_vs_exponent = 0.5
+# parallel CIC x this for every step of vertical clock voltage (+1..+4)
+cic_amplitude_factor = 1.6
+# serial CIC: electrons per pixel per frame born in the EM register (at EM gain 300, in proportion to the gain); they get only part of the gain
+cic_serial = 0.0
+# the EM gain the camera really has / the one set (an aged EM register has less)
+em_gain_scale = 1.0
+# dark current at -80 C [e-/px/s], doubling every 6.3 C warmer (hot pixels come on top)
+dark_current = 0.0
+# how much the bias differs between readout channels (HS speed, pre-amp gain) [counts rms]
+bias_spread = 0.0
+# camera_profile.json of a camera characterization: the simulated camera then has the measured bias, read noise, electrons per count, EM gain, CIC and dark current of the nearest measured setting
+camera_profile = ""
 # ions loaded per second while the oven is on
 load_rate = 0.0
 # loss probability per ion per second
@@ -408,6 +494,8 @@ loss_rate = 0.0
 dark_rate = 0.0
 # return-to-bright probability per dark ion per second
 bright_rate = 0.0
+# an experiment's qubit states: the chance that a bright ion is in its dark state in an exposure (drawn afresh for every frame and ion)
+qubit_dark_probability = 0.0
 # crystal melting events per second
 melt_rate = 0.0
 # random-walk drift of the trap centre [px/sqrt(s)]

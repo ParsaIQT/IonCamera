@@ -397,3 +397,87 @@ def test_rotated_trap(angle):
     sc.scene.lose_ion(0)
     sc.run(3.0)
     assert kinds(sc.take()) == ["ion_lost"] and sc.tracker.n_bright == 2
+
+
+# the lab's trap and imaging: PSF core 0.8 px + 26 % in a halo of 1.8 px (as
+# located), l = 3.4 px, the crystal at 45 deg
+LAB = dict(scale=3.4, psf_sigma=0.8, psf_halo_fraction=0.26, psf_halo_sigma=1.8,
+           exposure=0.1, em_gain=10, trap_angle_deg=45.0)
+
+
+def _lab(n=2, seed=1):
+    sc = Scenario(n_ions=n, seed=seed, **LAB)
+    d = sc.cfg.detection
+    d.psf_sigma, d.psf_halo_fraction, d.psf_halo_sigma = 0.8, 0.26, 1.8
+    return sc
+
+
+def _with_spot(sc, dx, dy, fraction):
+    """A static point of light (stray light, a reflection) at (dx, dy) from
+    ion 0 as it sits now, ``fraction`` of an ion's light, in every frame."""
+    from scipy.special import ndtr
+    scene = sc.scene
+    x0, y0 = scene._chain_positions(len(scene.crystallized(sc.clock.t)))[0] + [dx, dy]
+    render = scene.expected_electrons
+
+    def with_spot(roi, hbin, vbin, exposure, *args, **kw):
+        img = render(roi, hbin, vbin, exposure, *args, **kw)
+        h, w = img.shape
+        xe = roi[0] - 0.5 + hbin * np.arange(w + 1)
+        ye = roi[1] - 0.5 + vbin * np.arange(h + 1)
+        sg = scene.psf_sigma
+        ex = ndtr((xe[1:] - x0) / sg) - ndtr((xe[:-1] - x0) / sg)
+        ey = ndtr((ye[1:] - y0) / sg) - ndtr((ye[:-1] - y0) / sg)
+        rate = scene.photon_rate * exposure * scene.cfg.quantum_efficiency * fraction
+        return img + rate * np.outer(ey, ex)
+    scene.expected_electrons = with_spot
+
+
+@pytest.mark.parametrize("spot", [(2.5, -1.0, 0.45), (1.5, 1.5, 0.4), (6.0, 6.0, 0.3)])
+def test_faint_spot_next_to_the_crystal_is_no_ion(spot):
+    """Two ions and a static spot of stray light beside them (or between
+    them): found with the crystal, it is dropped as no ion within seconds -
+    it shines far less than the ions - and never taken for one again (it
+    was "3 bright ions", flipping to 2 and back)."""
+    sc = _lab()
+    _with_spot(sc, *spot)
+    sc.run(10.0)
+    ev = sc.take()
+    assert sc.tracker.n_bright == 2 and sc.tracker.n_dark == 0, kinds(ev)
+    assert any("not an ion" in e["message"] for e in ev if e["kind"] == "crystal_refined")
+    sc.run(30.0)
+    assert sc.tracker.n_bright == 2 and sc.tracker.n_dark == 0
+    assert not {"crystal_refined", "ion_trapped", "ion_dark"} & set(kinds(sc.take()))
+
+
+def test_blinking_ions_stay_ions():
+    """Ions dark in half the frames at random (qubit states, blinking): each
+    shines like the others whenever lit - none is dropped as stray light."""
+    sc = _lab(seed=2)
+    sc.run(3.0)
+    sc.take()
+    sc.scene.set_params(qubit_dark_probability=0.5)
+    sc.run(40.0)
+    assert not any("not an ion" in e["message"] for e in sc.take())
+    assert len(sc.tracker.sites) == 2
+
+
+def test_no_hidden_ion_closer_than_the_trap_allows():
+    """An extra source the averaged frames show next to an ion is no hidden
+    ion when ions in this trap cannot come that close (two ions 4.3 px
+    apart: l = 3.4 px, three would be >= 3.7 px apart), nor where a spot was
+    found to be no ion; a third ion where a chain of three would put it is."""
+    from ioncam.analysis.chain import equilibrium_positions
+    from ioncam.analysis.tracker import ChainTracker, Site
+    from ioncam.config import Config
+    tr = ChainTracker(Config().tracker)
+    two = 100.0 + 3.4 * equilibrium_positions(2)
+    tr.sites = [Site(id=1, x=float(two[0]), y=100.0), Site(id=2, x=float(two[1]), y=100.0)]
+    tr._update_chain_fit()
+    close = np.array([[two[0], 100.0], [two[1], 100.0], [two[0] + 1.6, 100.0]])
+    assert tr._not_ions(close, [2]) == {2}
+    three = 100.0 + 3.4 * equilibrium_positions(3)
+    chain3 = np.column_stack([three, np.full(3, 100.0)])
+    assert tr._not_ions(chain3, [1]) == set()
+    tr._not_ion_at = [np.array([100.3, 100.0])]
+    assert tr._not_ions(chain3, [1]) == {1}
