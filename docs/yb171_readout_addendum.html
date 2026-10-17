@@ -1,0 +1,1002 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Yb171 EMCCD Readout Addendum</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=STIX+Two+Text:wght@500;600&family=Source+Sans+3:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column (46rem) on a cool lab-paper ground; tables and the chart may run to 64rem. */
+:root {
+  --bg: #f5f6f8;
+  --surface: #ffffff;
+  --ink: #15171c;
+  --ink-2: #454c5c;
+  --muted: #687082;
+  --rule: #dde1e8;
+  --accent: #4b3cc4;        /* 369.5 nm, the detection light, drawn as violet */
+  --accent-wash: #efedfc;
+  --code-bg: #eff1f5;
+  --ok: #1b6e35; --ok-wash: #e4f3e8;
+  --chg: #8f4500; --chg-wash: #fcefdf;
+  --open: #4b3cc4; --open-wash: #efedfc;
+  --series-1: #2a78d6;
+  --series-2: #eb6834;
+  --grid: #e7e9ee;
+  --axis: #c3c8d1;
+  --font-display: "STIX Two Text", "Times New Roman", Times, serif;
+  --font-body: "Source Sans 3", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0f1115; --surface: #161a20; --ink: #e8eaf0; --ink-2: #bcc2cd; --muted: #8f97a7;
+    --rule: #2a303a; --accent: #a99cff; --accent-wash: #221e3e; --code-bg: #1c2029;
+    --ok: #6fcf8a; --ok-wash: #15261b; --chg: #f2a65e; --chg-wash: #2c2013;
+    --open: #a99cff; --open-wash: #221e3e; --series-1: #3987e5; --series-2: #d95926;
+    --grid: #242a33; --axis: #3b424d; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0f1115; --surface: #161a20; --ink: #e8eaf0; --ink-2: #bcc2cd; --muted: #8f97a7;
+  --rule: #2a303a; --accent: #a99cff; --accent-wash: #221e3e; --code-bg: #1c2029;
+  --ok: #6fcf8a; --ok-wash: #15261b; --chg: #f2a65e; --chg-wash: #2c2013;
+  --open: #a99cff; --open-wash: #221e3e; --series-1: #3987e5; --series-2: #d95926;
+  --grid: #242a33; --axis: #3b424d; color-scheme: dark;
+}
+html { -webkit-text-size-adjust: 100%; }
+body {
+  background: var(--bg); color: var(--ink);
+  font-family: var(--font-body); font-size: 16px; line-height: 1.6;
+}
+.page {
+  max-width: 64rem; margin: 0 auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 2.75rem 5rem;
+  display: grid; gap: 0;
+}
+.page > * { min-width: 0; }
+.col { max-width: 46rem; }
+header.top { display: grid; gap: 0.9rem; padding-bottom: 1.5rem; }
+.eyebrow { font-size: 0.78rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); font-weight: 600; }
+h1 {
+  font-family: var(--font-display); font-weight: 600; font-size: clamp(2rem, 1.4rem + 2.6vw, 2.75rem);
+  line-height: 1.12; margin: 0; text-wrap: balance; letter-spacing: -0.01em;
+}
+.lede { font-size: 1.14rem; color: var(--ink-2); margin: 0; }
+.meta { font-size: 0.875rem; color: var(--muted); margin: 0; }
+.meta b { color: var(--ink-2); font-weight: 600; }
+h2 {
+  font-family: var(--font-display); font-weight: 600; font-size: 1.62rem; line-height: 1.2;
+  margin: 3.2rem 0 0.9rem; padding-top: 1.3rem; border-top: 1px solid var(--rule); text-wrap: balance;
+}
+h2 .num { font-family: var(--font-body); font-size: 0.95rem; font-weight: 600; color: var(--muted); margin-right: 0.55rem; vertical-align: 0.2em; }
+h3 { font-size: 1.08rem; font-weight: 700; margin: 2rem 0 0.5rem; text-wrap: balance; }
+p { margin: 0 0 0.9rem; }
+ul, ol { margin: 0 0 1rem; padding-left: 1.3rem; }
+li { margin: 0.3rem 0; }
+li::marker { color: var(--muted); }
+a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 0.18em; }
+a:focus-visible, button:focus-visible, [tabindex]:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }
+strong { font-weight: 700; }
+code { font-family: var(--font-mono); font-size: 0.86em; background: var(--code-bg); padding: 0.05rem 0.3rem; border-radius: 4px; }
+pre { font-family: var(--font-mono); font-size: 0.82rem; line-height: 1.55; background: var(--code-bg); padding: 1rem 1.1rem; border-radius: 6px; overflow-x: auto; margin: 0 0 1rem; }
+pre code { background: none; padding: 0; font-size: inherit; }
+sub, sup { line-height: 0; }
+.small { font-size: 0.875rem; color: var(--ink-2); }
+.toc { margin: 0.4rem 0 0; }
+.toc ol { columns: 2 17rem; column-gap: 2rem; margin: 0; padding-left: 1.4rem; font-size: 0.95rem; }
+.toc li { margin: 0.15rem 0; break-inside: avoid; }
+.summary li { margin: 0.55rem 0; }
+.table-wrap { overflow-x: auto; background: var(--surface); border: 1px solid var(--rule); border-radius: 6px; margin: 0.4rem 0 1.2rem; }
+table { border-collapse: collapse; width: 100%; font-size: 0.89rem; font-variant-numeric: tabular-nums; }
+th, td { padding: 0.45rem 0.7rem; text-align: left; vertical-align: top; border-bottom: 1px solid var(--rule); }
+th { font-weight: 600; color: var(--ink-2); background: var(--surface); vertical-align: bottom; }
+tbody tr:last-child td { border-bottom: none; }
+td.n, th.n { text-align: right; white-space: nowrap; }
+td.w { min-width: 14rem; }
+tr.hl td { background: var(--accent-wash); }
+.tcap { font-size: 0.875rem; color: var(--ink-2); margin: 1.2rem 0 0.2rem; }
+.tcap b { color: var(--ink); }
+.chip { display: inline-block; font-size: 0.74rem; font-weight: 700; line-height: 1.4; padding: 0.08rem 0.5rem; border-radius: 999px; white-space: nowrap; }
+.chip.ok { color: var(--ok); background: var(--ok-wash); }
+.chip.chg { color: var(--chg); background: var(--chg-wash); }
+.chip.open { color: var(--open); background: var(--open-wash); }
+.callout { background: var(--accent-wash); border-radius: 6px; padding: 0.95rem 1.15rem; margin: 0.4rem 0 1.2rem; }
+.callout .label { display: block; font-size: 0.74rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--accent); margin-bottom: 0.3rem; }
+.callout p:last-child, .callout ul:last-child, .callout ol:last-child { margin-bottom: 0; }
+figure { margin: 0.6rem 0 0.4rem; }
+.chart { background: var(--surface); border: 1px solid var(--rule); border-radius: 6px; padding: 1rem 1rem 0.6rem; position: relative; }
+.chart .ttl { font-weight: 700; font-size: 1rem; margin: 0; }
+.chart .sub { font-size: 0.85rem; color: var(--ink-2); margin: 0.15rem 0 0.6rem; }
+.legend { display: flex; flex-wrap: wrap; gap: 0.4rem 1.4rem; font-size: 0.85rem; color: var(--ink-2); margin-bottom: 0.3rem; }
+.legend .item { display: inline-flex; align-items: center; gap: 0.45rem; }
+.legend i { display: inline-block; width: 18px; height: 2px; border-radius: 1px; }
+.legend i.s1 { background: var(--series-1); }
+.legend i.s2 { background: var(--series-2); }
+.legend i.ref { background: var(--ink-2); height: 1px; }
+.plot { width: 100%; }
+.plot svg { display: block; font-family: var(--font-body); }
+.plot .grid { stroke: var(--grid); stroke-width: 1; }
+.plot .axis { stroke: var(--axis); stroke-width: 1; }
+.plot .tick { fill: var(--muted); font-size: 12px; }
+.plot .atitle { fill: var(--ink-2); font-size: 12px; }
+.plot .ref { stroke: var(--ink-2); stroke-width: 1; }
+.plot .reflabel { fill: var(--ink-2); font-size: 12px; }
+.plot .line { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.plot .line.s1, .plot .err.s1 { stroke: var(--series-1); }
+.plot .line.s2, .plot .err.s2 { stroke: var(--series-2); }
+.plot .err { stroke-width: 1; opacity: 0.6; }
+.plot .dot { stroke: var(--surface); stroke-width: 2; }
+.plot .dot.s1 { fill: var(--series-1); }
+.plot .dot.s2 { fill: var(--series-2); }
+.plot .dot.hollow { fill: var(--surface); stroke-width: 2; }
+.plot .dot.hollow.s1 { stroke: var(--series-1); }
+.plot .dot.hollow.s2 { stroke: var(--series-2); }
+.plot .lab { fill: var(--ink); font-size: 12px; font-weight: 600; }
+.plot .hit { fill: transparent; cursor: default; }
+.plot .hit:focus { outline: none; }
+.plot .hit:focus-visible { stroke: var(--accent); stroke-width: 2; }
+.tip {
+  position: absolute; pointer-events: none; background: var(--surface); color: var(--ink);
+  border: 1px solid var(--rule); border-radius: 6px; padding: 0.45rem 0.65rem; font-size: 0.8rem; line-height: 1.35;
+  box-shadow: 0 4px 16px rgba(10, 12, 20, 0.12); max-width: 15rem; z-index: 2;
+}
+.tip .v { font-weight: 700; font-size: 0.92rem; font-variant-numeric: tabular-nums; }
+.tip .k { display: flex; align-items: center; gap: 0.4rem; color: var(--ink-2); }
+.tip .k i { width: 12px; height: 2px; display: inline-block; }
+figcaption { font-size: 0.84rem; color: var(--ink-2); margin-top: 0.55rem; }
+.codehead { display: flex; justify-content: space-between; align-items: center; gap: 1rem; margin: 1.2rem 0 0.35rem; flex-wrap: wrap; }
+.codehead p { margin: 0; font-size: 0.875rem; color: var(--ink-2); }
+button.copy {
+  font: 600 0.82rem/1 var(--font-body); color: var(--accent); background: var(--surface);
+  border: 1px solid var(--rule); border-radius: 6px; padding: 0.5rem 0.8rem; cursor: pointer;
+}
+button.copy:hover { background: var(--accent-wash); }
+.twocol { display: grid; grid-template-columns: repeat(auto-fit, minmax(17rem, 1fr)); gap: 0.5rem 1.6rem; }
+.twocol > * { min-width: 0; }
+footer.end { margin-top: 3.5rem; padding-top: 1.2rem; border-top: 1px solid var(--rule); font-size: 0.85rem; color: var(--muted); }
+@media (max-width: 34rem) {
+  h2 { font-size: 1.4rem; }
+  th, td { padding: 0.4rem 0.55rem; }
+}
+</style>
+</head>
+<body>
+<main class="page">
+<header class="top col">
+  <div class="eyebrow">Addendum to the 29 Sep 2026 report · Hyperfine-qubit readout of ¹⁷¹Yb⁺ with an EMCCD</div>
+  <h1>Yb171 EMCCD Readout Addendum</h1>
+  <p class="lede">On 17 Oct the camera half of the readout model was measured directly, from dark frames. It confirms the camera parameters fitted to run 106415, traces that run's 0.33 e⁻ background to clock-induced charge at a 3.3 µs vertical shift, and supplies fixed hyper-parameters so the SPAM pmfs only have to fit the ion.</p>
+  <p class="meta"><b>Data:</b> ioncam characterization <code>20261017-113225_DU897-BB</code> (iXon Ultra 897, s/n 12729; 677 settings, 3 million samples each, shutter closed, −70 °C), readout plan <code>20261013-141940</code>, ioncam event log 13–17 Oct. <b>Audience:</b> the lab and the analysis code in <code>RandomIQTApplets/yb171_emccd_readout</code> (ybreadout). Prepared 17 Oct 2026 with Claude Code.</p>
+  <nav class="toc" aria-label="Contents">
+    <ol>
+      <li><a href="#short">In short</a></li>
+      <li><a href="#review">The report against the new data</a></li>
+      <li><a href="#cic">The background is clock-induced charge</a></li>
+      <li><a href="#handover">Parameter hand-over</a></li>
+      <li><a href="#hyper">Hyper-parameters for the readout</a></li>
+      <li><a href="#dof">What fewer free parameters buy</a></li>
+      <li><a href="#ybreadout">Changes for ybreadout</a></li>
+      <li><a href="#validate">Validation plan</a></li>
+      <li><a href="#reference">Camera reference tables</a></li>
+      <li><a href="#caveats">Open questions and caveats</a></li>
+      <li><a href="#settings">Settings and follow-up runs</a></li>
+      <li><a href="#files">Data files</a></li>
+      <li><a href="#ioncam">ioncam notes</a></li>
+    </ol>
+  </nav>
+</header>
+
+<section id="short">
+  <h2><span class="num">1</span>In short</h2>
+  <ul class="summary col">
+    <li><strong>The camera parameters are now measured, not only fitted.</strong> Dark frames reproduce the camera fitted to run 106415: read noise σ 8.665 against 8.653 ADU, g 38.6 against 38.3 ADU/e⁻, real EM gain 164.5 against ≈ 164 at a set 200, zero level 499.7 against 498.7–499.2 ADU.</li>
+    <li><strong>Run 106415's background is clock-induced charge (CIC).</strong> Its λ<sub>bg</sub> = 0.3311 ± 0.007 e⁻/shot (0.338 in the empty ROI) equals the full-gain CIC of one 4×4 super-pixel at a 3.3 µs vertical shift, 0.331 ± 0.003. At 0.9 µs, the speed the report names, it would be 0.044. The fitted serial CIC, 0.357 ± 0.032, also matches 3.3 µs (0.43) and not 0.9 µs (0.18).</li>
+    <li><strong>The "0.9 µs" most likely comes from <code>beta5.py</code>.</strong> It calls <code>SetFKVShiftSpeed(2)</code>, and index 2 is 0.9 µs on this camera, but that call sets the fast-kinetics speed and has no effect in image mode. The speed this camera recommends at normal clock voltage is 3.3 µs, its slowest.</li>
+    <li><strong>CIC costs about two points of SPAM error.</strong> At the report's threshold (117 ADU above B) the camera alone reads an empty ROI as bright 2.4% of the time, most of P(B|D) = 3.28%. At 0.5 µs that falls to 0.08–0.16%, and the predicted mean error at the same Λ = 55 falls from 5.1% to 2.8–3.0%. The report's own "no background" row gives 3.03%.</li>
+    <li><strong>ioncam has armed the readout at 0.5 µs since 13 Oct.</strong> The r106415 calibration (serial CIC 0.357, background prior 0.33) does not describe data taken that way. Recalibrate before analysing them.</li>
+    <li><strong>For the SPAM pmfs:</strong> fix σ, the serial CIC and the CIC per vertical-shift speed; fit B per ROI; give g a prior from the same session; use the real gain (≈ 168) in the cascade. The calibration fit drops from 13 to 8 free parameters, its worst-determined combination goes from ×8.5 to ×2.6 error inflation, and a pmf costs 0.33 ms instead of 6.6 ms with the camera factor cached.</li>
+  </ul>
+</section>
+
+<section id="review">
+  <h2><span class="num">2</span>The report against the new data</h2>
+  <p class="col">Report sections in brackets. "Confirmed" means the dark frames agree within the stated errors; "Changed" means the new data change the reading or the advice; "Open" needs a check that the data here cannot make.</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Item</th><th>Report (29 Sep)</th><th>17 Oct measurement</th><th>Status</th></tr></thead>
+      <tbody>
+        <tr><td>Read noise σ, 4×4 (§4)</td><td>8.653 ± 0.03 ADU</td><td>8.665 ± 0.01 ADU; 8.44 at 1×1; the same at every vertical-shift speed</td><td><span class="chip ok">Confirmed</span></td></tr>
+        <tr><td>g, ADU per electron (§4)</td><td>38.29 ± 0.24</td><td>38.64 ± 0.13 at 4×4; 38.2 ± 0.6 at 1×1 whenever the camera had been reading at 5 MHz; −14% to +6% right after other pixel rates (§9.1)</td><td><span class="chip ok">Confirmed</span></td></tr>
+        <tr><td>Real EM gain at a set 200 (§4)</td><td>≈ 164, if the read noise is Andor's typical 37 e⁻</td><td>164.5 from g × the camera's own 4.39 e⁻/ADU (170 at 4×4); read noise 37.1 e⁻. From EM 50 to 300, G<sub>real</sub> ≈ G<sub>set</sub><sup>0.964</sup></td><td><span class="chip ok">Confirmed</span> EMCAL still advisable</td></tr>
+        <tr><td>Bias / baseline (§2, §4)</td><td>498.73 ± 0.08 (ROI 1), 499.15 ± 0.08 (ROI 2); "about 499"</td><td>Zero level 499.67 ± 0.03 (4×4 region mean), 501.67 at 1×1; stable to 0.03 ADU over 80 min; a fixed column pattern of 2.0 ADU rms at 4×4</td><td><span class="chip ok">Confirmed</span></td></tr>
+        <tr><td>Serial (partial-gain) CIC (§4)</td><td>0.357 ± 0.032 per super-pixel per frame</td><td>0.429 ± 0.014 at 3.3 µs; 0.25, 0.18, 0.04–0.11, 0.03–0.05 at 1.7, 0.9, 0.5, 0.3 µs</td><td><span class="chip ok">Fits 3.3 µs</span></td></tr>
+        <tr><td>Background λ<sub>bg</sub> (§4)</td><td>0.3311 ± 0.007 e⁻/shot; "room light, 369 nm scatter or parallel CIC"</td><td>Full-gain CIC alone is 0.331 ± 0.003 at 3.3 µs, 0.044 at 0.9 µs, 0.011–0.030 at 0.5 µs</td><td><span class="chip chg">Changed: CIC</span></td></tr>
+        <tr><td>Vertical shift speed (Summary, Rec 5)</td><td>0.9 µs</td><td>0.9 µs is index 2 of <code>SetFKVShiftSpeed</code> in beta5.py, which has no effect in image mode. The evidence points to 3.3 µs (§3)</td><td><span class="chip chg">Changed</span></td></tr>
+        <tr><td>Read noise against readout rate (§2)</td><td>89 / 65 / 37 / 15 e⁻ at 17 / 10 / 5 / 1 MHz (spec)</td><td>84 / 56 / 37 / 15 e⁻ at pre-amp 3</td><td><span class="chip ok">Confirmed</span></td></tr>
+        <tr><td>CIC specification (§2)</td><td>0.0018 events/px above 5σ</td><td>0.0077 at 3.3 µs, 0.0032 at 1.7, 0.0016 at 0.9, 0.0007 at 0.5, 0.0005 at 0.3 µs (1×1, normal voltage)</td><td><span class="chip ok">Spec ≈ 0.9 µs</span></td></tr>
+        <tr><td>Dark current</td><td>Not given</td><td>0.002–0.004 e⁻/px/s at −70 °C, 0.012 at −60 °C: under 10⁻⁴ e⁻ per 4×4 super-pixel per 1.5 ms shot</td><td><span class="chip ok">Negligible</span></td></tr>
+        <tr><td>Rec 2: filter, iris, enclosure</td><td>Halving the background gives 4.3%</td><td>No help if the background is CIC; reading at 0.5 µs removes it instead</td><td><span class="chip open">Open: check the run's speed</span></td></tr>
+        <tr><td>Rec 3: pixel-resolved readout at EM ≈ 1000</td><td>3.75% at 1×1</td><td>RealGain allows 2–300 here; 1000 needs advanced EM gain, which ages the register faster. At EM 300 and 5 MHz σ/g = 0.15 e⁻; at 1 MHz 0.066 e⁻ (§9.4)</td><td><span class="chip chg">Changed</span></td></tr>
+        <tr><td>Rec 5: camera settings</td><td>5 MHz, pre-amp 3, EM 200, 4×4, 0.9 µs</td><td>The same with 0.5 µs (or 0.3 µs) at normal clock voltage; never raise the clock voltage (each step multiplies CIC by 2–3)</td><td><span class="chip chg">Changed</span></td></tr>
+        <tr><td>Rec 6: shorten the exposure if room light contributes</td><td>4.98% → about 4.6%</td><td>Dark current is negligible; whether light contributes depends on the run's speed (§3)</td><td><span class="chip open">Open</span></td></tr>
+        <tr><td>Next measurement: laser-off frames</td><td>To split 0.33 e⁻ into CIC, room light and scatter</td><td>Camera part done with the shutter closed (§3); laser-on frames without an ion still to do</td><td><span class="chip ok">Partly done</span></td></tr>
+        <tr><td>Next measurement: EMCAL or photon-transfer check</td><td>To check the true EM gain</td><td>Real gain from dark frames: 82–88% of the set value from EM 50 to 300</td><td><span class="chip ok">Done</span></td></tr>
+        <tr><td>Crosstalk (§4, §6)</td><td>1.03 ± 0.07% from ion 1 into the empty ROI 2</td><td>The 13 Oct readout is one ion in a 2×2 super-pixel AQROI (ion ROI 81% of its light, background ROI 6.3%); the 45° pair needs its own matrix</td><td><span class="chip open">Re-measure</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="cic">
+  <h2><span class="num">3</span>The background is clock-induced charge</h2>
+  <div class="col">
+    <p>Clock-induced charge is made when charge is clocked. Charge made while rows shift through the image and storage areas passes the whole EM register and gets full gain: that is the report's background term. Charge made inside the EM register gets only part of the gain: that is the report's serial CIC. On this camera both grow with the time each row shift takes, and the speed the camera recommends at normal clock voltage, 3.3 µs, is its slowest.</p>
+  </div>
+  <figure class="chart" id="cic-chart">
+    <p class="ttl">Dark events per 4×4 super-pixel per frame</p>
+    <p class="sub">5 MHz, pre-amp 3, EM 200, normal clock voltage, −70 °C, shutter closed. Filled points measured at 4×4 (3.3 µs); hollow points measured at 1×1 and scaled by the 3.3 µs binning ratios (full-gain ×16.3, serial ×10.5). Error bars: 1σ of the fit.</p>
+    <div class="legend" aria-hidden="true">
+      <span class="item"><i class="s1"></i><span>Full-gain CIC λ<sub>CIC</sub></span></span>
+      <span class="item"><i class="s2"></i><span>Serial CIC c<sub>s</sub></span></span>
+      <span class="item"><i class="ref"></i><span>Run 106415 fitted background, 0.331</span></span>
+    </div>
+    <div class="plot" role="img" aria-label="Log-scale chart of full-gain and serial clock-induced charge per 4×4 super-pixel against vertical shift time. Full-gain CIC rises from about 0.011 at 0.5 µs to 0.331 at 3.3 µs, where it meets the run 106415 background line at 0.331. Serial CIC rises from about 0.05 at 0.3 µs to 0.43 at 3.3 µs. The table below lists every value."></div>
+    <div class="tip" hidden></div>
+    <figcaption>The full-gain point at 3.3 µs sits on run 106415's fitted background. Hover or tab to a point for its value; every value is in the table below.</figcaption>
+  </figure>
+  <p class="tcap"><b>Dark counts and predicted SPAM against vertical shift speed.</b> 4×4 binning, one-super-pixel ROI, the ion of run 106415 (λ<sub>B</sub> = 12.83 e⁻ in a 1.1 ms beam, α<sub>bd</sub> = 0.2311, α<sub>db</sub> = 0.01478), no stray light, optimal threshold. Ranges are the two ways of scaling 1×1 to 4×4 (fitted components; total event rate).</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Vertical shift</th><th class="n">λ<sub>CIC</sub> (e⁻/shot)</th><th class="n">c<sub>s</sub></th><th class="n">Threshold above B</th><th class="n">Empty ROI &gt; 117 ADU</th><th class="n">Mean error</th><th class="n">P(D|B)</th><th class="n">P(B|D)</th><th>Basis</th></tr></thead>
+      <tbody>
+        <tr><td>0.3 µs</td><td class="n">0.014–0.020</td><td class="n">0.026–0.052</td><td class="n">30 ADU</td><td class="n">0.08–0.11%</td><td class="n">2.69–2.74%</td><td class="n">3.10%</td><td class="n">2.28%</td><td>1×1, scaled</td></tr>
+        <tr><td>0.5 µs</td><td class="n">0.011–0.030</td><td class="n">0.038–0.106</td><td class="n">33 ADU</td><td class="n">0.08–0.16%</td><td class="n">2.79–2.98%</td><td class="n">3.22%</td><td class="n">2.35%</td><td>1×1, scaled</td></tr>
+        <tr><td>0.9 µs</td><td class="n">0.044–0.068</td><td class="n">0.089–0.181</td><td class="n">55 ADU</td><td class="n">0.28–0.39%</td><td class="n">3.43–3.61%</td><td class="n">4.15%</td><td class="n">2.71%</td><td>1×1, scaled</td></tr>
+        <tr><td>1.7 µs</td><td class="n">0.116–0.138</td><td class="n">0.179–0.247</td><td class="n">81 ADU</td><td class="n">0.74–0.86%</td><td class="n">4.09–4.20%</td><td class="n">5.24%</td><td class="n">2.94%</td><td>1×1, scaled</td></tr>
+        <tr><td>3.3 µs</td><td class="n">0.331</td><td class="n">0.429</td><td class="n">119 ADU</td><td class="n">2.49%</td><td class="n">5.08%</td><td class="n">6.77%</td><td class="n">3.39%</td><td>Measured at 4×4</td></tr>
+        <tr><td>Report's fit (r106415)</td><td class="n">0.331</td><td class="n">0.357</td><td class="n">117 ADU</td><td class="n">2.37%</td><td class="n">5.07% <span class="small">(report 4.98%)</span></td><td class="n">6.74% <span class="small">(6.67%)</span></td><td class="n">3.39% <span class="small">(3.28%)</span></td><td>Report's camera numbers</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="col">
+    <h3>Why 3.3 µs</h3>
+    <ul>
+      <li><strong>The amount.</strong> λ<sub>bg</sub> = 0.3311 ± 0.007 (ROI 2: 0.3381 ± 0.007) against λ<sub>CIC</sub>(3.3 µs) = 0.331 ± 0.003. The AQROI's columns (x 347–355) show 8–12% more dark events than the measured region (§9.8), so 0.36 ± 0.02 there: still within 10%. No other speed comes within a factor of 2.8.</li>
+      <li><strong>The serial CIC.</strong> It also rises with the shift time. The report's 0.357 ± 0.032 is 2σ from the 3.3 µs value (0.43 ± 0.014), 3.4σ from 1.7 µs (0.25) and 5.5σ from 0.9 µs (0.18). Full-gain CIC and light are indistinguishable in SPAM data (both are Poisson electrons at full gain), but the serial CIC is a fingerprint of the shift speed.</li>
+      <li><strong>The source of "0.9 µs".</strong> <code>beta5.py</code> line 80: <code>self.sdk.SetFKVShiftSpeed(2)</code>. On this camera the speeds are 0.3, 0.5, 0.9, 1.7, 3.3 µs, so index 2 reads as 0.9 µs; the call applies only to fast kinetics. beta5 runs live view on an internal trigger, so it may not have configured the SPAM runs at all.</li>
+      <li><strong>The case against.</strong> ioncam's README lists 0.5 µs among the lab's Solis readout settings. If run 106415 was configured in Solis at 0.5 µs, CIC was 0.011–0.030 and the background was mostly light. The equal background in both ROIs does not decide it: CIC is uniform, and so could be scatter over two neighbouring super-pixels.</li>
+    </ul>
+    <div class="callout">
+      <span class="label">Settle it</span>
+      <p>Fit one SPAM run taken through ioncam since 13 Oct (armed at 0.5 µs; §8 step 4) with <code>analyze_artiq_spam.py</code>. λ<sub>bg</sub> ≈ 0.01–0.05 with c<sub>s</sub> ≈ 0.04–0.11 confirms CIC. λ<sub>bg</sub> still near 0.33 means light, and then Rec 2 stands. The run's own camera settings, if recorded, decide it directly.</p>
+    </div>
+  </div>
+</section>
+
+<section id="handover">
+  <h2><span class="num">4</span>Parameter hand-over</h2>
+  <p class="col">ioncam fits the dark model of Lantz et al. (2008) to histograms of dark pixels. It is the report's model with a Gamma (Erlang) register instead of the exact 536-stage cascade. The report found that swap costs at most 5×10⁻⁴ in populations, so the values transfer one to one.</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Report</th><th>ioncam field</th><th>Meaning</th><th class="n">Value (4×4, 3.3 µs)</th><th>Use in the pmfs</th></tr></thead>
+      <tbody>
+        <tr><td>B</td><td><code>stats.bias + stats.fit.mu</code></td><td class="w">Centre of the read-noise Gaussian. Both models integrate over [k − ½, k + ½] (ioncam's binned Gaussian; the report's sin(ω/2)/(ω/2)), so B means the same in both. <code>camera_profile.json</code>'s <code>bias</code> is the median, not B</td><td class="n">499.67 ± 0.03 (region mean)</td><td>Fit per ROI. A fixed 2 ADU rms column pattern and ±1 ADU with the shift speed mean a value from elsewhere does not transfer</td></tr>
+        <tr><td>σ</td><td><code>stats.model.sigma</code> (profile: <code>read_noise</code>)</td><td class="w">Gaussian read noise per read, ADU. The noise of the per-pixel bias estimate is taken out; frame-to-frame common mode is included, as in raw ROI sums with a fixed B</td><td class="n">8.665 ± 0.01</td><td>Fix: 8.66 ± 0.03</td></tr>
+        <tr><td>g</td><td><code>stats.fit.g</code></td><td class="w">ADU per electron entering the EM register (G<sub>real</sub>/S)</td><td class="n">38.64 ± 0.13</td><td>Prior from the same session (§6)</td></tr>
+        <tr><td>G</td><td><code>g × applied.sensitivity</code></td><td class="w">Real EM gain. S = 4.39 e⁻/ADU is the camera's factory value from <code>GetSensitivity</code> (no light was used)</td><td class="n">≈ 170 (164.5 at 1×1)</td><td>Use ≈ 168 in the cascade, not the set 200</td></tr>
+        <tr><td>c<sub>s</sub></td><td><code>stats.fit.lam_s</code> (profile: <code>lam_s</code>)</td><td class="w">Serial CIC events per super-pixel per frame. Output exponential with a log-uniform mean between one output electron (g/200) and g: the report's 1/x law between 1 e⁻ and G e⁻</td><td class="n">0.429 ± 0.014</td><td>Fix per shift speed and binning</td></tr>
+        <tr><td>λ<sub>bg</sub></td><td><code>stats.fit.lam_p</code> (profile: <code>lam_p</code>) + light</td><td class="w">Full-gain Poisson electrons per super-pixel per frame: parallel CIC and dark current from the camera, plus light in the experiment</td><td class="n">0.331 ± 0.003 (camera)</td><td>λ<sub>bg</sub> = λ<sub>CIC</sub> (fixed) + λ<sub>light</sub> ≥ 0 (fit, or 0)</td></tr>
+        <tr><td>N</td><td>–</td><td class="w">EM multiplication stages</td><td class="n">536</td><td>Unchanged</td></tr>
+        <tr><td>n<sub>pix</sub></td><td>–</td><td class="w">Reads per ROI sum (one per super-pixel)</td><td class="n">1</td><td>Unchanged</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="col small">ioncam's lower cutoff for serial CIC uses the set gain (a = g/200 = 0.193 ADU), as the report's code does; one real output electron is 1/S = 0.228 ADU. Either sits deep inside the read noise.</p>
+</section>
+
+<section id="hyper">
+  <h2><span class="num">5</span>Hyper-parameters for the readout</h2>
+  <p class="col">Readout: EM amplifier, 5 MHz, pre-amp 3, EM 200 (RealGain), 4×4 binning, 1.5 ms exposure, normal clock voltage, one super-pixel per ROI. σ and g do not depend on the shift speed (σ 8.44–8.46 ADU at 1×1 for all five); B must be fitted.</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Vertical shift</th><th class="n">λ<sub>CIC</sub></th><th class="n">±1σ</th><th class="n">Alternative scaling</th><th class="n">c<sub>s</sub></th><th class="n">±1σ</th><th class="n">Alternative scaling</th><th class="n">Dark events, total</th><th>Basis</th></tr></thead>
+      <tbody>
+        <tr><td>3.3 µs</td><td class="n">0.3310</td><td class="n">0.0032</td><td class="n">–</td><td class="n">0.4289</td><td class="n">0.0135</td><td class="n">–</td><td class="n">0.760</td><td>Measured at 4×4</td></tr>
+        <tr><td>1.7 µs</td><td class="n">0.1160</td><td class="n">0.0078</td><td class="n">0.1383</td><td class="n">0.2470</td><td class="n">0.0219</td><td class="n">0.1792</td><td class="n">0.363</td><td>1×1 × 16.27 (full-gain), × 10.48 (serial)</td></tr>
+        <tr><td>0.9 µs</td><td class="n">0.0440</td><td class="n">0.0066</td><td class="n">0.0684</td><td class="n">0.1812</td><td class="n">0.0168</td><td class="n">0.0886</td><td class="n">0.225</td><td>1×1 × 16.27 (full-gain), × 10.48 (serial)</td></tr>
+        <tr><td>0.5 µs</td><td class="n">0.0112</td><td class="n">0.0061</td><td class="n">0.0296</td><td class="n">0.1058</td><td class="n">0.0117</td><td class="n">0.0383</td><td class="n">0.117</td><td>1×1 × 16.27 (full-gain), × 10.48 (serial)</td></tr>
+        <tr><td>0.3 µs</td><td class="n">0.0140</td><td class="n">0.0038</td><td class="n">0.0203</td><td class="n">0.0521</td><td class="n">0.0107</td><td class="n">0.0263</td><td class="n">0.066</td><td>1×1 × 16.27 (full-gain), × 10.48 (serial)</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="codehead">
+    <p>Machine-readable copy for ybreadout (all values per 4×4 super-pixel per frame unless stated).</p>
+    <button class="copy" type="button" id="copy-json">Copy JSON</button>
+  </div>
+<pre id="hyper-json"><code>{
+  &quot;schema&quot;: &quot;camera hyper-parameters for SPAM pmfs, from ioncam dark frames, v1 (2026-10-17)&quot;,
+  &quot;camera&quot;: {
+    &quot;model&quot;: &quot;Andor iXon Ultra 897 (DU897_BB)&quot;,
+    &quot;serial&quot;: 12729,
+    &quot;em_stages&quot;: 536,
+    &quot;adc_bits&quot;: 16
+  },
+  &quot;source&quot;: {
+    &quot;run&quot;: &quot;characterization/20261017-113225_DU897-BB&quot;,
+    &quot;frames&quot;: &quot;dark (shutter closed), internal trigger, 3e6 samples per setting&quot;,
+    &quot;region_sensor_px&quot;: [
+      184,
+      184,
+      328,
+      328
+    ],
+    &quot;sensor_temperature_c&quot;: -70.4
+  },
+  &quot;readout&quot;: {
+    &quot;amplifier&quot;: &quot;EM&quot;,
+    &quot;hs_speed_mhz&quot;: 5.0,
+    &quot;preamp_gain&quot;: 3,
+    &quot;em_gain_set&quot;: 200,
+    &quot;em_gain_mode&quot;: &quot;RealGain&quot;,
+    &quot;binning&quot;: [
+      4,
+      4
+    ],
+    &quot;exposure_ms&quot;: 1.5,
+    &quot;vs_amplitude&quot;: &quot;normal&quot;,
+    &quot;roi_super_pixels&quot;: 1
+  },
+  &quot;conventions&quot;: {
+    &quot;x&quot;: &quot;ROI sum in ADU (integer)&quot;,
+    &quot;B&quot;: &quot;centre of the read-noise Gaussian; integer bins [k-1/2, k+1/2]&quot;,
+    &quot;sigma&quot;: &quot;Gaussian read noise per read, ADU, frame-to-frame common mode included&quot;,
+    &quot;g&quot;: &quot;ADU per electron entering the EM register&quot;,
+    &quot;c_s&quot;: &quot;serial (partial-gain) CIC events per super-pixel per frame; output exponential with log-uniform mean between g/200 and g&quot;,
+    &quot;lam_cic&quot;: &quot;full-gain events per super-pixel per frame (parallel CIC + dark current): the camera part of lam_bg&quot;
+  },
+  &quot;fixed&quot;: {
+    &quot;sigma_adu&quot;: 8.66,
+    &quot;sigma_adu_err&quot;: 0.03,
+    &quot;n_pix&quot;: 1,
+    &quot;G_real&quot;: 168,
+    &quot;S_e_per_adu_factory&quot;: 4.39
+  },
+  &quot;g_adu_per_e&quot;: {
+    &quot;value_4x4&quot;: 38.64,
+    &quot;value_4x4_err&quot;: 0.13,
+    &quot;steady_5mhz_1x1&quot;: 38.19,
+    &quot;steady_5mhz_1x1_sd&quot;: 0.57,
+    &quot;prior_suggested&quot;: [
+      38.5,
+      0.8
+    ],
+    &quot;after_10min_other_rate&quot;: {
+      &quot;17MHz&quot;: -0.14,
+      &quot;10MHz&quot;: -0.065,
+      &quot;1MHz&quot;: 0.04
+    },
+    &quot;use&quot;: &quot;per session: fit with the prior, or measure in the same session&quot;
+  },
+  &quot;B_adu&quot;: {
+    &quot;region_mean_4x4&quot;: 499.67,
+    &quot;column_rms_4x4&quot;: 2.0,
+    &quot;row_rms_4x4&quot;: 0.54,
+    &quot;use&quot;: &quot;fit per ROI and data set (column pattern; moves ~1 ADU with the shift speed)&quot;
+  },
+  &quot;per_vs_speed_us&quot;: {
+    &quot;3.3&quot;: {
+      &quot;lam_cic&quot;: 0.331,
+      &quot;lam_cic_err&quot;: 0.0032,
+      &quot;c_s&quot;: 0.4289,
+      &quot;c_s_err&quot;: 0.0135,
+      &quot;basis&quot;: &quot;measured at 4x4&quot;,
+      &quot;predicted_spam_error&quot;: [
+        0.0508,
+        0.0508
+      ],
+      &quot;optimal_threshold_above_B_adu&quot;: 119
+    },
+    &quot;1.7&quot;: {
+      &quot;lam_cic&quot;: 0.116,
+      &quot;lam_cic_err&quot;: 0.0078,
+      &quot;c_s&quot;: 0.247,
+      &quot;c_s_err&quot;: 0.0219,
+      &quot;lam_cic_alt&quot;: 0.1383,
+      &quot;c_s_alt&quot;: 0.1792,
+      &quot;basis&quot;: &quot;1x1 fit scaled by the 3.3 us binning ratios; alt = scaled by the total event rate&quot;,
+      &quot;predicted_spam_error&quot;: [
+        0.0409,
+        0.042
+      ],
+      &quot;optimal_threshold_above_B_adu&quot;: 81
+    },
+    &quot;0.9&quot;: {
+      &quot;lam_cic&quot;: 0.044,
+      &quot;lam_cic_err&quot;: 0.0066,
+      &quot;c_s&quot;: 0.1812,
+      &quot;c_s_err&quot;: 0.0168,
+      &quot;lam_cic_alt&quot;: 0.0684,
+      &quot;c_s_alt&quot;: 0.0886,
+      &quot;basis&quot;: &quot;1x1 fit scaled by the 3.3 us binning ratios; alt = scaled by the total event rate&quot;,
+      &quot;predicted_spam_error&quot;: [
+        0.0343,
+        0.0361
+      ],
+      &quot;optimal_threshold_above_B_adu&quot;: 55
+    },
+    &quot;0.5&quot;: {
+      &quot;lam_cic&quot;: 0.0112,
+      &quot;lam_cic_err&quot;: 0.0061,
+      &quot;c_s&quot;: 0.1058,
+      &quot;c_s_err&quot;: 0.0117,
+      &quot;lam_cic_alt&quot;: 0.0296,
+      &quot;c_s_alt&quot;: 0.0383,
+      &quot;basis&quot;: &quot;1x1 fit scaled by the 3.3 us binning ratios; alt = scaled by the total event rate&quot;,
+      &quot;predicted_spam_error&quot;: [
+        0.0279,
+        0.0298
+      ],
+      &quot;optimal_threshold_above_B_adu&quot;: 33
+    },
+    &quot;0.3&quot;: {
+      &quot;lam_cic&quot;: 0.014,
+      &quot;lam_cic_err&quot;: 0.0038,
+      &quot;c_s&quot;: 0.0521,
+      &quot;c_s_err&quot;: 0.0107,
+      &quot;lam_cic_alt&quot;: 0.0203,
+      &quot;c_s_alt&quot;: 0.0263,
+      &quot;basis&quot;: &quot;1x1 fit scaled by the 3.3 us binning ratios; alt = scaled by the total event rate&quot;,
+      &quot;predicted_spam_error&quot;: [
+        0.0269,
+        0.0274
+      ],
+      &quot;optimal_threshold_above_B_adu&quot;: 30
+    }
+  },
+  &quot;aqroi_column_factor&quot;: {
+    &quot;value&quot;: 1.1,
+    &quot;range&quot;: [
+      1.08,
+      1.12
+    ],
+    &quot;applies_to&quot;: &quot;x 347-355 (13 Oct AQROI) against the measured region; multiply lam_cic and c_s&quot;
+  },
+  &quot;dark_current_e_per_px_s&quot;: {
+    &quot;-70C&quot;: 0.003,
+    &quot;-60C&quot;: 0.012
+  },
+  &quot;cic_temperature&quot;: {
+    &quot;-70C_1x1&quot;: 0.02,
+    &quot;-60C_1x1&quot;: 0.0227
+  },
+  &quot;ion_used_for_predictions&quot;: &quot;run 106415: lam_B 12.83 e-, a_bd 0.2311, a_db 0.01478, 1.1 ms beam, no light&quot;
+}</code></pre>
+</section>
+
+<section id="dof">
+  <h2><span class="num">6</span>What fewer free parameters buy</h2>
+  <h3 class="col">Free parameters</h3>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Parameter</th><th>Report calibration (§4)</th><th>With the dark-frame data</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>σ</td><td>Free, shared</td><td>Fixed, 8.66 ADU</td><td class="w">Measured to ±0.1%, the same at every shift speed, and ±0.3% over 80 min</td></tr>
+        <tr><td>Serial CIC c<sub>s</sub></td><td>Free, shared</td><td>Fixed per shift speed</td><td class="w">Changes 8× between 0.3 and 3.3 µs; degenerate with g and the background in SPAM data</td></tr>
+        <tr><td>λ<sub>bg</sub>, two ROIs</td><td>Free per ROI</td><td>λ<sub>CIC</sub> fixed; λ<sub>light</sub> ≥ 0 only if needed</td><td class="w">CIC and light are the same Poisson term; only the camera settings split them</td></tr>
+        <tr><td>g</td><td>Free, shared</td><td>Free with a prior, 38.5 ± 0.8</td><td class="w">Moves −14% to +6% with the recent pixel rate (§9.1); a same-session dark measurement pins it</td></tr>
+        <tr><td>B, two ROIs</td><td>Free per ROI</td><td>Free per ROI</td><td class="w">Nearly orthogonal to everything else and costs nothing (a phase factor)</td></tr>
+        <tr><td>G in the cascade</td><td>200 (set)</td><td>≈ 168 (real)</td><td class="w">G<sub>real</sub> ≈ G<sub>set</sub><sup>0.964</sup>; changes the excess-noise shape slightly</td></tr>
+        <tr><td>λ<sub>B</sub>, α<sub>bd</sub>, α<sub>db</sub>, ε<sub>b</sub>, ε<sub>d</sub>, crosstalk</td><td>Free</td><td>Free</td><td class="w">The physics</td></tr>
+        <tr class="hl"><td><strong>Count</strong></td><td><strong>13</strong></td><td><strong>8</strong> (9 with g)</td><td class="w">Population inference (§6 of the report): 2 → 1 refitted parameter per ion per data set</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <h3 class="col">Statistical errors of a calibration run</h3>
+  <p class="col">Fisher information of 20 000 bright- and 20 000 dark-prepared shots, one-super-pixel ROI, run 106415's ion, ioncam's dark model with the single-switch leaky ion (ε<sub>b</sub> = 0.62%, ε<sub>d</sub> = 0.1%). "Worst direction" is the least determined combination of parameters and how much it inflates the errors against independent parameters.</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Shift</th><th>Free parameters</th><th class="n">σ(λ<sub>B</sub>) e⁻</th><th class="n">σ(α<sub>bd</sub>)</th><th class="n">σ(α<sub>db</sub>)</th><th class="n">σ(ε<sub>b</sub>)</th><th class="n">σ(ε<sub>d</sub>)</th><th>Worst direction</th></tr></thead>
+      <tbody>
+        <tr><td>3.3 µs</td><td>All 12, with the empty ROI (as the report)</td><td class="n">0.20</td><td class="n">0.0102</td><td class="n">0.00277</td><td class="n">0.00184</td><td class="n">0.00137</td><td>λ<sub>B</sub>, g, c<sub>s</sub>, λ<sub>bg</sub>: ×8.5</td></tr>
+        <tr class="hl"><td>3.3 µs</td><td>Camera fixed, B free (6)</td><td class="n">0.054</td><td class="n">0.0090</td><td class="n">0.00255</td><td class="n">0.00181</td><td class="n">0.00131</td><td>α<sub>db</sub> against ε<sub>d</sub>: ×2.6</td></tr>
+        <tr><td>3.3 µs</td><td>Camera fixed, B and g free (7)</td><td class="n">0.19</td><td class="n">0.0101</td><td class="n">0.00278</td><td class="n">0.00184</td><td class="n">0.00137</td><td>λ<sub>B</sub> against g: ×6.2</td></tr>
+        <tr><td>0.5 µs</td><td>All 12, with the empty ROI</td><td class="n">0.23</td><td class="n">0.0098</td><td class="n">0.00195</td><td class="n">0.00156</td><td class="n">0.00113</td><td>λ<sub>B</sub> against g: ×7.6</td></tr>
+        <tr class="hl"><td>0.5 µs</td><td>Camera fixed, B free (6)</td><td class="n">0.052</td><td class="n">0.0083</td><td class="n">0.00172</td><td class="n">0.00155</td><td class="n">0.00106</td><td>α<sub>db</sub> against ε<sub>d</sub>: ×2.1</td></tr>
+        <tr><td>0.5 µs</td><td>Camera fixed, B and g free (7)</td><td class="n">0.23</td><td class="n">0.0097</td><td class="n">0.00173</td><td class="n">0.00156</td><td class="n">0.00107</td><td>λ<sub>B</sub> against g: ×7.4</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="col">
+    <ul>
+      <li><strong>Conditioning is the main gain.</strong> With everything free, λ<sub>B</sub>, g, the serial CIC and the background share one poorly determined direction (variance inflation 20–23 for each). Fixing the camera leaves only the physical pair α<sub>db</sub>/ε<sub>d</sub>, which both put light into dark-prepared shots. Fits converge faster and small data sets stay stable.</li>
+      <li><strong>λ<sub>B</sub> is pinned only when g is.</strong> The data fix the product g·λ<sub>B</sub>. Populations depend on the count distribution, which the product fixes, so a free g costs them nothing. λ<sub>B</sub> in photo-electrons and Λ = λ<sub>B</sub>/α<sub>bd</sub> need g; use a same-session prior.</li>
+      <li><strong>The leak rates gain 8–17% at fixed shot count.</strong> The preparation errors barely move. Moving to 0.5 µs helps α<sub>db</sub> more (×1.4 at the same shot count), because the dark shots are cleaner.</li>
+    </ul>
+  </div>
+  <h3 class="col">Speed</h3>
+  <p class="col">Benchmark on one core (numpy): an emulation of the report's <code>roi_pmf</code> (M = 4096 points, 536-stage cascade) takes <strong>6.6 ms</strong>, of which 5.6 ms is the cascade and camera factor. With the camera factor cached, the ion part and the inverse FFT take <strong>0.33 ms</strong> (20× faster), with identical output. A kernel matrix K[x, n] = P(x | n full-gain electrons) of 4096 × 80 turns a pmf into one matrix-vector product, <strong>0.09 ms</strong>, given the ion's photon-number distribution. Fewer free parameters also mean fewer evaluations per fit.</p>
+</section>
+
+<section id="ybreadout">
+  <h2><span class="num">7</span>Changes for ybreadout</h2>
+  <ol class="col">
+    <li><strong>Split the background.</strong> λ<sub>bg</sub> = λ<sub>CIC</sub>(shift speed, binning) + λ<sub>light</sub>. λ<sub>CIC</sub> comes from the camera; λ<sub>light</sub> ≥ 0 is fitted, or set to 0 after laser-on frames without an ion.</li>
+    <li><strong>Make the camera a per-ROI object</strong> (B, σ, g, c<sub>s</sub>, λ<sub>CIC</sub>, G, N, n<sub>pix</sub>), loaded from a dark calibration at the exact readout (§8 step 2), with §5 as the fallback and the priors.</li>
+    <li><strong>Cache ψ and ψ<sub>s</sub></strong> per (g, G). With g free, tabulate the cascade once over θ = ω·g/G and interpolate: ψ depends on ω and g only through θ.</li>
+    <li><strong>Cache the camera factor per ROI.</strong> B can stay free at no cost: it is the phase factor exp(iω(B − x<sub>0</sub>)).</li>
+    <li><strong>Use the real gain in the cascade:</strong> G ≈ 168 at a set 200, p = G<sup>1/536</sup> − 1 = 0.0096.</li>
+    <li><strong>Population inference:</strong> with λ<sub>CIC</sub> fixed, refit only each ion's brightness per data set. Drop the 30% log-normal prior on λ<sub>bg</sub>: it is centred on the 3.3 µs value (0.33) and would pull 0.5 µs data up thirtyfold.</li>
+    <li><strong>Thresholds:</strong> anything that still thresholds needs a new one. The optimal threshold is about 33 ADU above B at 0.5 µs, against 117–119 at 3.3 µs.</li>
+    <li><strong>Crosstalk:</strong> the 1.03% belongs to one ion beside an empty ROI. ioncam's readout plan reports <code>crosstalk_matrix</code>, <code>containment</code> and <code>background_contamination</code> for the current geometry.</li>
+    <li><strong>Pixel-resolved readout (Rec 3):</strong> the frame-to-frame common mode is 0.8–1.0 ADU rms and shared by all pixels of a frame. In a 16-pixel sum it adds about 18% to the read-noise variance; model one offset per frame, or take it from dark pixels of the same frame.</li>
+  </ol>
+<pre><code># ybreadout sketch: the camera is fixed, only the ion changes between evaluations
+import numpy as np
+from functools import lru_cache
+from ybreadout.ion import mmpp_pgf
+from ybreadout.emccd import cascade_cf, quantisation_cf
+
+M, N = 4096, 536
+w = 2 * np.pi * np.arange(M // 2 + 1) / M
+
+@lru_cache(maxsize=16)
+def cascade(g, G=168.0):
+    return cascade_cf(w * g / G, G, N, serial=True)          # psi, psi_s: 5.6 ms, once
+
+@lru_cache(maxsize=64)
+def camera(roi, sigma, g, c_s, lam_cic, G=168.0, n_pix=1):
+    psi, psi_s = cascade(g, G)
+    cam = np.exp(-0.5 * (sigma * w) ** 2 + c_s * (psi_s - 1) + lam_cic * (psi - 1))
+    return psi, cam * quantisation_cf(w, n_pix)               # per ROI, once
+
+def roi_pmf(cam_key, B, x0, state, lam, a_bd, a_db, lam_light=0.0):
+    psi, cam = camera(*cam_key)
+    cf = cam * np.exp(1j * w * (B - x0)) * mmpp_pgf(psi, lam, a_bd, a_db, state)
+    if lam_light:
+        cf = cf * np.exp(lam_light * (psi - 1))
+    return np.fft.irfft(np.conj(cf), n=M)                     # 0.33 ms
+
+# 0.5 us readout, ROI 1 (values from section 5; replace with the dark calibration)
+key = ("roi1", 8.66, 38.5, 0.106, 0.011)
+pb = roi_pmf(key, B=499.7, x0=400, state="bright", lam=12.83, a_bd=0.2311, a_db=0.01478)</code></pre>
+</section>
+
+<section id="validate">
+  <h2><span class="num">8</span>Validation plan</h2>
+  <ol class="col">
+    <li><strong>Look up the camera settings of runs 106415 and 95989</strong>, if anything recorded them. That alone settles §3.</li>
+    <li><strong>Dark calibration at the exact readout.</strong> Lasers off or shutter closed, armed as in the experiment (external trigger, the real AQROI), 20 000–50 000 shots through the Grabber at each shift speed of interest (0.5 µs at least). Fit B, σ, g, c<sub>s</sub> and λ<sub>CIC</sub> per ROI. These replace §5, which comes from a 144 px region on an internal trigger.</li>
+    <li><strong>Refit run 106415</strong> with σ = 8.66, c<sub>s</sub> = 0.43 and λ<sub>CIC</sub> = 0.331 fixed, λ<sub>light</sub> ≥ 0, g free with a prior and B per ROI. If it ran at 3.3 µs, expect the same χ²/dof, λ<sub>light</sub> ≈ 0 and unchanged physics.</li>
+    <li><strong>Fit a SPAM run taken through ioncam since 13 Oct</strong> (0.5 µs) with the 0.5 µs camera. Expect λ<sub>light</sub> ≈ 0, λ<sub>bg</sub> ≈ 0.01–0.03 and a mean error near 3% at Λ ≈ 55.</li>
+    <li><strong>Laser-on frames without an ion</strong> at 0.5 µs measure the 369 nm scatter, λ<sub>light</sub>, directly.</li>
+    <li><strong>Re-run the settings study</strong> (Recs 1–6) with the measured camera: CIC per speed in §5, σ/g per readout rate in §9.4, real gain in §9.6.</li>
+  </ol>
+</section>
+
+<section id="reference">
+  <h2><span class="num">9</span>Camera reference tables</h2>
+  <p class="col">All from the 17 Oct run: dark frames, shutter closed, sensor at −70 °C ("stabilized"), region x 184–328, y 184–328 (sensor px), EM amplifier, 1.5 ms exposure unless stated. Statistical errors are 1σ of the histogram fit.</p>
+
+  <h3 class="col" id="ref-repeats">9.1 The readout setting over the run, and g</h3>
+  <p class="tcap"><b>5 MHz, pre-amp 3, EM 200, 1×1, 3.3 µs</b>, repeated every 10 min between other stages.</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th class="n">Time (min)</th><th>Ran just before</th><th class="n">Zero level (ADU)</th><th class="n">σ (ADU)</th><th class="n">g (ADU/e⁻)</th><th class="n">Real gain</th><th class="n">λ<sub>CIC</sub></th><th class="n">c<sub>s</sub></th><th class="n">Sensor (°C)</th></tr></thead>
+      <tbody>
+        <tr><td class="n">0</td><td>Start of the run</td><td class="n">501.67</td><td class="n">8.44</td><td class="n">37.48</td><td class="n">164.5</td><td class="n">0.0203</td><td class="n">0.0409</td><td class="n">-70.1</td></tr>
+        <tr><td class="n">10</td><td>17 MHz, EM 200 (grid)</td><td class="n">501.69</td><td class="n">8.47</td><td class="n">32.81</td><td class="n">144.0</td><td class="n">0.0202</td><td class="n">0.0437</td><td class="n">-66.9</td></tr>
+        <tr><td class="n">20</td><td>10 MHz, EM 200 (grid)</td><td class="n">501.68</td><td class="n">8.46</td><td class="n">35.34</td><td class="n">155.1</td><td class="n">0.0214</td><td class="n">0.0385</td><td class="n">-69.6</td></tr>
+        <tr><td class="n">30</td><td>1 MHz, EM 200 (grid)</td><td class="n">501.67</td><td class="n">8.44</td><td class="n">39.02</td><td class="n">171.3</td><td class="n">0.0199</td><td class="n">0.0434</td><td class="n">-70.7</td></tr>
+        <tr><td class="n">40</td><td>1 MHz, EM 200 (grid)</td><td class="n">501.66</td><td class="n">8.43</td><td class="n">40.55</td><td class="n">178.0</td><td class="n">0.0196</td><td class="n">0.0468</td><td class="n">-70.7</td></tr>
+        <tr><td class="n">51</td><td>10 MHz, EM 300 (grid)</td><td class="n">501.68</td><td class="n">8.48</td><td class="n">35.85</td><td class="n">157.4</td><td class="n">0.0200</td><td class="n">0.0420</td><td class="n">-69.3</td></tr>
+        <tr><td class="n">61</td><td>1 MHz, EM 300 (grid)</td><td class="n">501.67</td><td class="n">8.44</td><td class="n">39.74</td><td class="n">174.4</td><td class="n">0.0208</td><td class="n">0.0397</td><td class="n">-70.8</td></tr>
+        <tr><td class="n">71</td><td>1 MHz, EM 300 (grid)</td><td class="n">501.66</td><td class="n">8.44</td><td class="n">40.38</td><td class="n">177.3</td><td class="n">0.0204</td><td class="n">0.0415</td><td class="n">-70.7</td></tr>
+        <tr><td class="n">81</td><td>5 MHz, EM 200 (temperature)</td><td class="n">501.66</td><td class="n">8.45</td><td class="n">38.81</td><td class="n">170.4</td><td class="n">0.0188</td><td class="n">0.0494</td><td class="n">-70.3</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="col">Whenever the camera had been reading at 5 MHz, g was 38.2 ± 0.6 (37 settings; 37.0–39.4), at −70 °C and at −60 °C alike: RealGain compensates the sensor temperature. After about 10 minutes at another pixel rate it was off: −14% after 17 MHz, −6 to −7% after 10 MHz, +2 to +6% after 1 MHz. That pattern fits self-heating of the EM register, which the sensor thermistor does not see. ioncam's live view runs at 10 MHz by default, so g may sit a few per cent low for the first minutes after arming.</p>
+
+  <h3 class="col" id="ref-binning">9.2 Binning</h3>
+  <p class="tcap"><b>5 MHz, pre-amp 3, EM 200, 3.3 µs.</b> λ<sub>CIC</sub>/area and c<sub>s</sub>/area<sup>0.85</sup> show the scaling laws.</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Binning</th><th class="n">Frames</th><th class="n">Zero level</th><th class="n">σ</th><th class="n">g</th><th class="n">λ<sub>CIC</sub></th><th class="n">λ<sub>CIC</sub>/area</th><th class="n">c<sub>s</sub></th><th class="n">c<sub>s</sub>/area<sup>0.85</sup></th><th class="n">Common mode</th><th class="n">Bias column rms</th><th class="n">χ²/dof</th></tr></thead>
+      <tbody>
+        <tr><td>1×1</td><td class="n">145</td><td class="n">501.67 ± 0.01</td><td class="n">8.441</td><td class="n">37.48</td><td class="n">0.0203 ± 0.0007</td><td class="n">0.02034</td><td class="n">0.0409 ± 0.0031</td><td class="n">0.0409</td><td class="n">0.76</td><td class="n">0.09</td><td class="n">1.07</td></tr>
+        <tr><td>2×2</td><td class="n">579</td><td class="n">500.76 ± 0.01</td><td class="n">8.563</td><td class="n">38.38</td><td class="n">0.0829 ± 0.0012</td><td class="n">0.02073</td><td class="n">0.1284 ± 0.0053</td><td class="n">0.0395</td><td class="n">0.99</td><td class="n">1.83</td><td class="n">0.87</td></tr>
+        <tr><td>3×3</td><td class="n">1303</td><td class="n">500.19 ± 0.02</td><td class="n">8.660</td><td class="n">38.30</td><td class="n">0.1887 ± 0.0019</td><td class="n">0.02097</td><td class="n">0.2438 ± 0.0080</td><td class="n">0.0377</td><td class="n">1.04</td><td class="n">1.62</td><td class="n">1.09</td></tr>
+        <tr><td>4×4</td><td class="n">1589</td><td class="n">499.67 ± 0.03</td><td class="n">8.665</td><td class="n">38.64</td><td class="n">0.3310 ± 0.0032</td><td class="n">0.02069</td><td class="n">0.4289 ± 0.0135</td><td class="n">0.0406</td><td class="n">1.23</td><td class="n">2.00</td><td class="n">1.26</td></tr>
+        <tr><td>6×6</td><td class="n">1769</td><td class="n">499.88 ± 0.07</td><td class="n">8.957</td><td class="n">39.10</td><td class="n">0.7491 ± 0.0085</td><td class="n">0.02081</td><td class="n">0.8251 ± 0.0362</td><td class="n">0.0392</td><td class="n">2.13</td><td class="n">2.02</td><td class="n">1.10</td></tr>
+        <tr><td>8×8</td><td class="n">1871</td><td class="n">498.74 ± 0.17</td><td class="n">9.374</td><td class="n">39.27</td><td class="n">1.3136 ± 0.0202</td><td class="n">0.02053</td><td class="n">1.4374 ± 0.0891</td><td class="n">0.0419</td><td class="n">4.57</td><td class="n">2.32</td><td class="n">1.06</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="col">Full-gain CIC scales with the binned area (0.0207 per physical pixel at every binning); serial CIC as area<sup>0.85</sup>. σ grows from 8.44 ADU (1×1) to 9.37 ADU (8×8). The zero level falls 2 ADU from 1×1 to 4×4, and from 2×2 up the bias map carries a fixed column pattern of 1.8–2.3 ADU rms (0.09 at 1×1). The common mode at 4×4 and above is inflated by CIC events in the per-frame median.</p>
+
+  <h3 class="col" id="ref-vertical">9.3 Vertical shift speed and clock voltage</h3>
+  <p class="tcap"><b>5 MHz, pre-amp 3, EM 200, 1×1.</b> Voltage 0 is normal; +1 to +4 raise the clock amplitude.</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th class="n">Shift (µs)</th><th class="n">Voltage</th><th class="n">λ<sub>CIC</sub></th><th class="n">c<sub>s</sub></th><th class="n">Events above 5σ</th><th class="n">σ</th><th class="n">Zero level</th><th class="n">Trail, next row</th></tr></thead>
+      <tbody>
+        <tr><td class="n">0.3</td><td class="n">normal</td><td class="n">0.00086</td><td class="n">0.0050</td><td class="n">0.00047</td><td class="n">8.44</td><td class="n">503.0</td><td class="n">0.20%</td></tr>
+        <tr><td class="n">0.3</td><td class="n">+1</td><td class="n">0.00000</td><td class="n">0.0078</td><td class="n">0.00050</td><td class="n">8.45</td><td class="n">504.0</td><td class="n">0.24%</td></tr>
+        <tr><td class="n">0.3</td><td class="n">+2</td><td class="n">0.00105</td><td class="n">0.0102</td><td class="n">0.00085</td><td class="n">8.44</td><td class="n">504.0</td><td class="n">0.05%</td></tr>
+        <tr><td class="n">0.3</td><td class="n">+3</td><td class="n">0.00315</td><td class="n">0.0202</td><td class="n">0.00215</td><td class="n">8.44</td><td class="n">502.9</td><td class="n">0.08%</td></tr>
+        <tr><td class="n">0.3</td><td class="n">+4</td><td class="n">0.00818</td><td class="n">0.0694</td><td class="n">0.00703</td><td class="n">8.71</td><td class="n">497.6</td><td class="n">0.30%</td></tr>
+        <tr><td class="n">0.5</td><td class="n">normal</td><td class="n">0.00069</td><td class="n">0.0101</td><td class="n">0.00069</td><td class="n">8.46</td><td class="n">502.0</td><td class="n">0.26%</td></tr>
+        <tr><td class="n">0.5</td><td class="n">+1</td><td class="n">0.00219</td><td class="n">0.0119</td><td class="n">0.00119</td><td class="n">8.45</td><td class="n">501.9</td><td class="n">0.03%</td></tr>
+        <tr><td class="n">0.5</td><td class="n">+2</td><td class="n">0.00582</td><td class="n">0.0230</td><td class="n">0.00275</td><td class="n">8.46</td><td class="n">501.9</td><td class="n">0.01%</td></tr>
+        <tr><td class="n">0.5</td><td class="n">+3</td><td class="n">0.01625</td><td class="n">0.0929</td><td class="n">0.01011</td><td class="n">8.87</td><td class="n">494.5</td><td class="n">0.45%</td></tr>
+        <tr><td class="n">0.5</td><td class="n">+4</td><td class="n">0.04204</td><td class="n">0.2181</td><td class="n">0.02259</td><td class="n">8.94</td><td class="n">487.7</td><td class="n">0.70%</td></tr>
+        <tr><td class="n">0.9</td><td class="n">normal</td><td class="n">0.00270</td><td class="n">0.0173</td><td class="n">0.00159</td><td class="n">8.44</td><td class="n">500.9</td><td class="n">0.04%</td></tr>
+        <tr><td class="n">0.9</td><td class="n">+1</td><td class="n">0.00934</td><td class="n">0.0262</td><td class="n">0.00384</td><td class="n">8.46</td><td class="n">500.8</td><td class="n">0.19%</td></tr>
+        <tr><td class="n">0.9</td><td class="n">+2</td><td class="n">0.02579</td><td class="n">0.0709</td><td class="n">0.01108</td><td class="n">8.49</td><td class="n">499.5</td><td class="n">0.18%</td></tr>
+        <tr><td class="n">0.9</td><td class="n">+3</td><td class="n">0.08183</td><td class="n">0.1537</td><td class="n">0.02731</td><td class="n">9.18</td><td class="n">489.6</td><td class="n">0.91%</td></tr>
+        <tr><td class="n">0.9</td><td class="n">+4</td><td class="n">0.18474</td><td class="n">0.3638</td><td class="n">0.05697</td><td class="n">9.03</td><td class="n">487.6</td><td class="n">1.43%</td></tr>
+        <tr><td class="n">1.7</td><td class="n">normal</td><td class="n">0.00713</td><td class="n">0.0236</td><td class="n">0.00322</td><td class="n">8.44</td><td class="n">500.9</td><td class="n">0.25%</td></tr>
+        <tr><td class="n">1.7</td><td class="n">+1</td><td class="n">0.02253</td><td class="n">0.0461</td><td class="n">0.00858</td><td class="n">8.48</td><td class="n">501.6</td><td class="n">0.15%</td></tr>
+        <tr><td class="n">1.7</td><td class="n">+2</td><td class="n">0.06235</td><td class="n">0.1279</td><td class="n">0.02339</td><td class="n">8.66</td><td class="n">497.9</td><td class="n">0.53%</td></tr>
+        <tr><td class="n">1.7</td><td class="n">+3</td><td class="n">0.16943</td><td class="n">0.2919</td><td class="n">0.05171</td><td class="n">9.21</td><td class="n">489.1</td><td class="n">1.31%</td></tr>
+        <tr><td class="n">1.7</td><td class="n">+4</td><td class="n">0.40356</td><td class="n">0.5863</td><td class="n">0.09019</td><td class="n">9.33</td><td class="n">487.6</td><td class="n">2.66%</td></tr>
+        <tr><td class="n">3.3</td><td class="n">normal</td><td class="n">0.02034</td><td class="n">0.0409</td><td class="n">0.00770</td><td class="n">8.44</td><td class="n">501.7</td><td class="n">0.16%</td></tr>
+        <tr><td class="n">3.3</td><td class="n">+1</td><td class="n">0.05902</td><td class="n">0.0987</td><td class="n">0.02077</td><td class="n">8.46</td><td class="n">501.1</td><td class="n">0.38%</td></tr>
+        <tr><td class="n">3.3</td><td class="n">+2</td><td class="n">0.15854</td><td class="n">0.2509</td><td class="n">0.05056</td><td class="n">8.70</td><td class="n">497.5</td><td class="n">1.05%</td></tr>
+        <tr><td class="n">3.3</td><td class="n">+3</td><td class="n">0.39494</td><td class="n">0.5742</td><td class="n">0.09101</td><td class="n">9.17</td><td class="n">490.8</td><td class="n">2.51%</td></tr>
+        <tr><td class="n">3.3</td><td class="n">+4</td><td class="n">0.97684</td><td class="n">0.7114</td><td class="n">0.06754</td><td class="n">11.50</td><td class="n">490.0</td><td class="n">4.78%</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="col">Each voltage step multiplies CIC by 2–3; at +3 and +4 the zero level drops 7–14 ADU and σ rises. The charge left in the next row (trail) stays at or below 0.3% at normal voltage for every speed, so the faster shifts lose no charge for a readout this small. Keep the voltage normal. At 0.3 and 0.5 µs the few events leave λ<sub>CIC</sub> uncertain (±27%, ±55%); the total event rate is better known.</p>
+
+  <h3 class="col" id="ref-electronics">9.4 Readout rate and pre-amplifier</h3>
+  <p class="tcap"><b>EM amplifier, EM 200, 1×1, 3.3 µs.</b> σ/g is the read noise in photo-electrons at the register input; it does not depend on the camera's sensitivity table.</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th class="n">Rate (MHz)</th><th class="n">Pre-amp</th><th class="n">S (e⁻/ADU)</th><th class="n">σ (ADU)</th><th class="n">σ (e⁻, via S)</th><th class="n">g</th><th class="n">σ/g (e⁻)</th><th class="n">g × S</th><th class="n">Zero level</th></tr></thead>
+      <tbody>
+        <tr><td class="n">17</td><td class="n">1</td><td class="n">16.11</td><td class="n">14.91</td><td class="n">240.2</td><td class="n">16.84</td><td class="n">0.885</td><td class="n">271</td><td class="n">505.6</td></tr>
+        <tr><td class="n">17</td><td class="n">2</td><td class="n">9.53</td><td class="n">17.30</td><td class="n">164.8</td><td class="n">26.95</td><td class="n">0.642</td><td class="n">257</td><td class="n">488.6</td></tr>
+        <tr><td class="n">17</td><td class="n">3</td><td class="n">5.08</td><td class="n">16.50</td><td class="n">83.9</td><td class="n">43.05</td><td class="n">0.383</td><td class="n">219</td><td class="n">471.5</td></tr>
+        <tr><td class="n">10</td><td class="n">1</td><td class="n">15.94</td><td class="n">7.03</td><td class="n">112.0</td><td class="n">12.65</td><td class="n">0.556</td><td class="n">202</td><td class="n">489.8</td></tr>
+        <tr><td class="n">10</td><td class="n">2</td><td class="n">8.01</td><td class="n">8.92</td><td class="n">71.4</td><td class="n">23.69</td><td class="n">0.376</td><td class="n">190</td><td class="n">494.7</td></tr>
+        <tr><td class="n">10</td><td class="n">3</td><td class="n">4.82</td><td class="n">11.70</td><td class="n">56.4</td><td class="n">38.95</td><td class="n">0.300</td><td class="n">188</td><td class="n">500.6</td></tr>
+        <tr><td class="n">5</td><td class="n">1</td><td class="n">17.74</td><td class="n">3.99</td><td class="n">70.7</td><td class="n">9.39</td><td class="n">0.424</td><td class="n">167</td><td class="n">500.9</td></tr>
+        <tr><td class="n">5</td><td class="n">2</td><td class="n">8.38</td><td class="n">5.49</td><td class="n">46.0</td><td class="n">19.10</td><td class="n">0.288</td><td class="n">160</td><td class="n">500.8</td></tr>
+        <tr><td class="n">5</td><td class="n">3</td><td class="n">4.39</td><td class="n">8.44</td><td class="n">37.1</td><td class="n">37.48</td><td class="n">0.225</td><td class="n">165</td><td class="n">501.7</td></tr>
+        <tr><td class="n">1</td><td class="n">1</td><td class="n">17.41</td><td class="n">1.45</td><td class="n">25.3</td><td class="n">8.16</td><td class="n">0.178</td><td class="n">142</td><td class="n">501.0</td></tr>
+        <tr><td class="n">1</td><td class="n">2</td><td class="n">8.40</td><td class="n">2.13</td><td class="n">17.9</td><td class="n">17.99</td><td class="n">0.118</td><td class="n">151</td><td class="n">500.9</td></tr>
+        <tr><td class="n">1</td><td class="n">3</td><td class="n">4.35</td><td class="n">3.53</td><td class="n">15.4</td><td class="n">35.25</td><td class="n">0.100</td><td class="n">153</td><td class="n">501.9</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="col">The gain implied by the camera's sensitivity values runs from about 150 at 1 MHz to 220–270 at 17 MHz, which points at the factory sensitivity table rather than the register: compare readout rates by g and σ/g, not g × S. The zero level moves with the rate (472–506 ADU).</p>
+  <div class="twocol">
+    <div>
+      <p class="tcap"><b>Conventional amplifier</b> (no EM gain), read noise in e⁻ via S.</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th class="n">Rate (MHz)</th><th class="n">Pre-amp</th><th class="n">σ (ADU)</th><th class="n">σ (e⁻)</th></tr></thead>
+          <tbody>
+        <tr><td class="n">3</td><td class="n">1</td><td class="n">3.12</td><td class="n">12.4</td></tr>
+        <tr><td class="n">3</td><td class="n">2</td><td class="n">3.49</td><td class="n">10.7</td></tr>
+        <tr><td class="n">3</td><td class="n">3</td><td class="n">6.10</td><td class="n">8.8</td></tr>
+        <tr><td class="n">1</td><td class="n">1</td><td class="n">1.65</td><td class="n">6.6</td></tr>
+        <tr><td class="n">1</td><td class="n">2</td><td class="n">1.91</td><td class="n">5.9</td></tr>
+        <tr><td class="n">1</td><td class="n">3</td><td class="n">3.48</td><td class="n">4.9</td></tr>
+        <tr><td class="n">0.08</td><td class="n">1</td><td class="n">0.78</td><td class="n">3.1</td></tr>
+        <tr><td class="n">0.08</td><td class="n">2</td><td class="n">0.82</td><td class="n">2.5</td></tr>
+        <tr><td class="n">0.08</td><td class="n">3</td><td class="n">1.64</td><td class="n">2.3</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+    <div>
+      <p class="tcap"><b>9.6 EM gain, set and real</b> (5 MHz, pre-amp 3, 1×1). Below 50 there are too few events to measure g.</p>
+      <div class="table-wrap" id="ref-gain">
+        <table>
+          <thead><tr><th class="n">Set</th><th class="n">g</th><th class="n">Real (g × S)</th><th class="n">Real / set</th><th class="n">λ<sub>CIC</sub></th></tr></thead>
+          <tbody>
+        <tr><td class="n">50</td><td class="n">10.01</td><td class="n">43.9</td><td class="n">0.879</td><td class="n">0.0168</td></tr>
+        <tr><td class="n">100</td><td class="n">19.16</td><td class="n">84.1</td><td class="n">0.841</td><td class="n">0.0191</td></tr>
+        <tr><td class="n">150</td><td class="n">28.31</td><td class="n">124.3</td><td class="n">0.828</td><td class="n">0.0209</td></tr>
+        <tr><td class="n">200</td><td class="n">37.48</td><td class="n">164.5</td><td class="n">0.823</td><td class="n">0.0203</td></tr>
+        <tr><td class="n">300</td><td class="n">55.83</td><td class="n">245.1</td><td class="n">0.817</td><td class="n">0.0198</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="small">G<sub>real</sub> ≈ G<sub>set</sub><sup>0.964</sup> (exponent loss 0.033–0.038), the signature of an aged register in RealGain mode. CIC does not depend on the EM gain.</p>
+    </div>
+  </div>
+
+  <h3 class="col" id="ref-grid">9.5 Readout rate × shift speed at pre-amp 3</h3>
+  <p class="tcap"><b>1×1, normal voltage, EM 200 and 300</b> (the 5 MHz, EM 200 row is §9.3). Where λ<sub>CIC</sub> is near zero, g is poorly determined: use g from the 3.3 µs row of the same rate.</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th class="n">Rate (MHz)</th><th class="n">EM</th><th class="n">Shift (µs)</th><th class="n">σ (ADU)</th><th class="n">g</th><th class="n">σ/g (e⁻)</th><th class="n">λ<sub>CIC</sub></th><th class="n">c<sub>s</sub></th><th class="n">Zero level</th><th class="n">Readout (ms)</th></tr></thead>
+      <tbody>
+        <tr><td class="n">17</td><td class="n">200</td><td class="n">0.3</td><td class="n">16.12</td><td class="n">49.0 *</td><td class="n">0.329</td><td class="n">0.00000</td><td class="n">0.0038</td><td class="n">457.0</td><td class="n">5.3</td></tr>
+        <tr><td class="n">17</td><td class="n">200</td><td class="n">0.5</td><td class="n">16.02</td><td class="n">45.7 *</td><td class="n">0.351</td><td class="n">0.00000</td><td class="n">0.0076</td><td class="n">471.0</td><td class="n">5.5</td></tr>
+        <tr><td class="n">17</td><td class="n">200</td><td class="n">0.9</td><td class="n">16.09</td><td class="n">32.2</td><td class="n">0.500</td><td class="n">0.00412</td><td class="n">0.0013</td><td class="n">488.9</td><td class="n">5.8</td></tr>
+        <tr><td class="n">17</td><td class="n">200</td><td class="n">1.7</td><td class="n">16.12</td><td class="n">36.7</td><td class="n">0.440</td><td class="n">0.00678</td><td class="n">0.0175</td><td class="n">484.3</td><td class="n">6.5</td></tr>
+        <tr><td class="n">10</td><td class="n">200</td><td class="n">0.3</td><td class="n">11.54</td><td class="n">58.0 *</td><td class="n">0.199</td><td class="n">0.00000</td><td class="n">0.0056</td><td class="n">501.0</td><td class="n">8.6</td></tr>
+        <tr><td class="n">10</td><td class="n">200</td><td class="n">0.5</td><td class="n">11.51</td><td class="n">61.3 *</td><td class="n">0.188</td><td class="n">0.00000</td><td class="n">0.0089</td><td class="n">494.9</td><td class="n">8.8</td></tr>
+        <tr><td class="n">10</td><td class="n">200</td><td class="n">0.9</td><td class="n">11.51</td><td class="n">44.0</td><td class="n">0.261</td><td class="n">0.00173</td><td class="n">0.0182</td><td class="n">484.9</td><td class="n">9.1</td></tr>
+        <tr><td class="n">10</td><td class="n">200</td><td class="n">1.7</td><td class="n">11.53</td><td class="n">40.3</td><td class="n">0.286</td><td class="n">0.00587</td><td class="n">0.0278</td><td class="n">488.8</td><td class="n">9.8</td></tr>
+        <tr><td class="n">1</td><td class="n">200</td><td class="n">0.3</td><td class="n">3.52</td><td class="n">35.8</td><td class="n">0.098</td><td class="n">0.00190</td><td class="n">0.0099</td><td class="n">501.0</td><td class="n">82.3</td></tr>
+        <tr><td class="n">1</td><td class="n">200</td><td class="n">0.5</td><td class="n">3.51</td><td class="n">37.2</td><td class="n">0.094</td><td class="n">0.00237</td><td class="n">0.0123</td><td class="n">502.0</td><td class="n">82.4</td></tr>
+        <tr><td class="n">1</td><td class="n">200</td><td class="n">0.9</td><td class="n">3.52</td><td class="n">35.7</td><td class="n">0.098</td><td class="n">0.00523</td><td class="n">0.0131</td><td class="n">502.0</td><td class="n">82.8</td></tr>
+        <tr><td class="n">1</td><td class="n">200</td><td class="n">1.7</td><td class="n">3.53</td><td class="n">34.5</td><td class="n">0.102</td><td class="n">0.00969</td><td class="n">0.0186</td><td class="n">501.9</td><td class="n">83.5</td></tr>
+        <tr><td class="n">17</td><td class="n">300</td><td class="n">0.3</td><td class="n">16.20</td><td class="n">84.0 *</td><td class="n">0.193</td><td class="n">0.00000</td><td class="n">0.0037</td><td class="n">453.0</td><td class="n">5.3</td></tr>
+        <tr><td class="n">17</td><td class="n">300</td><td class="n">0.5</td><td class="n">16.12</td><td class="n">59.9 *</td><td class="n">0.269</td><td class="n">0.00053</td><td class="n">0.0059</td><td class="n">471.5</td><td class="n">5.5</td></tr>
+        <tr><td class="n">17</td><td class="n">300</td><td class="n">0.9</td><td class="n">16.13</td><td class="n">55.6</td><td class="n">0.290</td><td class="n">0.00247</td><td class="n">0.0114</td><td class="n">488.9</td><td class="n">5.8</td></tr>
+        <tr><td class="n">17</td><td class="n">300</td><td class="n">1.7</td><td class="n">16.16</td><td class="n">55.4</td><td class="n">0.292</td><td class="n">0.00668</td><td class="n">0.0197</td><td class="n">483.8</td><td class="n">6.5</td></tr>
+        <tr><td class="n">17</td><td class="n">300</td><td class="n">3.3</td><td class="n">16.21</td><td class="n">58.1</td><td class="n">0.279</td><td class="n">0.01899</td><td class="n">0.0387</td><td class="n">468.5</td><td class="n">7.9</td></tr>
+        <tr><td class="n">10</td><td class="n">300</td><td class="n">0.3</td><td class="n">11.54</td><td class="n">85.2 *</td><td class="n">0.135</td><td class="n">0.00000</td><td class="n">0.0064</td><td class="n">500.0</td><td class="n">8.6</td></tr>
+        <tr><td class="n">10</td><td class="n">300</td><td class="n">0.5</td><td class="n">11.54</td><td class="n">67.1 *</td><td class="n">0.172</td><td class="n">0.00076</td><td class="n">0.0077</td><td class="n">495.0</td><td class="n">8.8</td></tr>
+        <tr><td class="n">10</td><td class="n">300</td><td class="n">0.9</td><td class="n">11.55</td><td class="n">61.0</td><td class="n">0.189</td><td class="n">0.00286</td><td class="n">0.0150</td><td class="n">485.9</td><td class="n">9.1</td></tr>
+        <tr><td class="n">10</td><td class="n">300</td><td class="n">1.7</td><td class="n">11.54</td><td class="n">58.7</td><td class="n">0.197</td><td class="n">0.00706</td><td class="n">0.0242</td><td class="n">488.8</td><td class="n">9.8</td></tr>
+        <tr><td class="n">10</td><td class="n">300</td><td class="n">3.3</td><td class="n">11.58</td><td class="n">58.0</td><td class="n">0.200</td><td class="n">0.01894</td><td class="n">0.0498</td><td class="n">500.5</td><td class="n">11.2</td></tr>
+        <tr><td class="n">5</td><td class="n">300</td><td class="n">0.3</td><td class="n">8.44</td><td class="n">84.7 *</td><td class="n">0.100</td><td class="n">0.00000</td><td class="n">0.0079</td><td class="n">504.0</td><td class="n">16.8</td></tr>
+        <tr><td class="n">5</td><td class="n">300</td><td class="n">0.5</td><td class="n">8.44</td><td class="n">65.3 *</td><td class="n">0.129</td><td class="n">0.00076</td><td class="n">0.0106</td><td class="n">502.0</td><td class="n">17.0</td></tr>
+        <tr><td class="n">5</td><td class="n">300</td><td class="n">0.9</td><td class="n">8.46</td><td class="n">58.2</td><td class="n">0.145</td><td class="n">0.00328</td><td class="n">0.0151</td><td class="n">500.9</td><td class="n">17.3</td></tr>
+        <tr><td class="n">5</td><td class="n">300</td><td class="n">1.7</td><td class="n">8.45</td><td class="n">56.5</td><td class="n">0.149</td><td class="n">0.00760</td><td class="n">0.0246</td><td class="n">500.8</td><td class="n">18.0</td></tr>
+        <tr><td class="n">1</td><td class="n">300</td><td class="n">0.3</td><td class="n">3.52</td><td class="n">55.3</td><td class="n">0.064</td><td class="n">0.00155</td><td class="n">0.0117</td><td class="n">501.0</td><td class="n">82.3</td></tr>
+        <tr><td class="n">1</td><td class="n">300</td><td class="n">0.5</td><td class="n">3.52</td><td class="n">53.7</td><td class="n">0.066</td><td class="n">0.00249</td><td class="n">0.0131</td><td class="n">502.0</td><td class="n">82.4</td></tr>
+        <tr><td class="n">1</td><td class="n">300</td><td class="n">0.9</td><td class="n">3.56</td><td class="n">52.7</td><td class="n">0.067</td><td class="n">0.00513</td><td class="n">0.0154</td><td class="n">502.0</td><td class="n">82.8</td></tr>
+        <tr><td class="n">1</td><td class="n">300</td><td class="n">1.7</td><td class="n">3.53</td><td class="n">54.0</td><td class="n">0.065</td><td class="n">0.00900</td><td class="n">0.0229</td><td class="n">501.9</td><td class="n">83.5</td></tr>
+        <tr><td class="n">1</td><td class="n">300</td><td class="n">3.3</td><td class="n">3.55</td><td class="n">52.6</td><td class="n">0.068</td><td class="n">0.02213</td><td class="n">0.0363</td><td class="n">501.8</td><td class="n">84.9</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="col small">Readout times are for the 144 × 144 px characterization region at 1×1, not for the 8 × 8 px AQROI.</p>
+
+  <h3 class="col" id="ref-dark">9.7 Dark current, temperature and timing</h3>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Sensor</th><th class="n">Dark current (e⁻/px/s)</th><th class="n">λ<sub>CIC</sub> (1×1)</th><th class="n">σ (ADU)</th><th class="n">g</th></tr></thead>
+      <tbody>
+        <tr><td>−70 °C</td><td class="n">0.002–0.004</td><td class="n">0.0200</td><td class="n">8.45</td><td class="n">38.1</td></tr>
+        <tr><td>−60 °C</td><td class="n">0.012</td><td class="n">0.0227</td><td class="n">8.51</td><td class="n">37.8</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <ul class="col">
+    <li>CIC is 14% higher at −60 °C than at −70 °C. Dark current adds under 10⁻⁴ e⁻ per 4×4 super-pixel in a 1.5 ms shot.</li>
+    <li>Software-triggered shots 0, 2, 10, 100 and 1000 ms apart: λ<sub>CIC</sub> 0.0188–0.0199 and the same event rate. Waiting between shots does not build up charge.</li>
+    <li>The first frames after a start show no excess at normal voltage (median event ratio 1.04); only 0.3 µs at raised voltage did.</li>
+    <li>No hot pixels in the region or on the whole sensor.</li>
+  </ul>
+
+  <h3 class="col" id="ref-spatial">9.8 Where on the sensor</h3>
+  <p class="col">From the whole-sensor point (1×1, 3.3 µs, 40 frames): dark events above 5σ per pixel per frame.</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Columns x</th><th class="n">0–63</th><th class="n">64–127</th><th class="n">128–191</th><th class="n">192–255</th><th class="n">256–319</th><th class="n">320–383</th><th class="n">384–447</th><th class="n">448–511</th></tr></thead>
+      <tbody>
+        <tr><td>Events/px/frame</td><td class="n">0.0109</td><td class="n">0.0099</td><td class="n">0.0083</td><td class="n">0.0077</td><td class="n">0.0078</td><td class="n">0.0084</td><td class="n">0.0095</td><td class="n">0.0100</td></tr>
+        <tr><td>Bias, median (ADU)</td><td class="n">502.98</td><td class="n">502.62</td><td class="n">502.56</td><td class="n">502.47</td><td class="n">502.39</td><td class="n">502.34</td><td class="n">502.47</td><td class="n">502.69</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="col">The event rate is U-shaped across columns, about 35% higher at the edges than in the middle, and flat along rows (0.0086–0.0094). The measured region gave 0.0078 ± 0.0001; a 40 × 40 px box around the 13 Oct AQROI gives 0.0087 ± 0.0004. Scale λ<sub>CIC</sub> and c<sub>s</sub> by 1.08–1.12 for that AQROI, or better, measure there (§11).</p>
+</section>
+
+<section id="caveats">
+  <h2><span class="num">10</span>Open questions and caveats</h2>
+  <ul class="col">
+    <li><strong>The shift speed of runs 106415 and 95989.</strong> Run 95989's 2.0 e⁻ background at 3.3 µs would be 0.33 e⁻ of CIC and 1.7 e⁻ of light, consistent with the room light the report saw.</li>
+    <li><strong>Serial CIC at the real readout.</strong> It was measured on a 144 px wide region on an internal trigger; the experiment reads a 2 × 2 super-pixel frame on an external trigger. Serial CIC may depend on how long the register clocks between reads, and the report's 0.357 against 0.429 here may be that. §8 step 2 measures it.</li>
+    <li><strong>4×4 values below 3.3 µs are scaled from 1×1.</strong> The two scalings differ by up to 2.6× for λ<sub>CIC</sub> at 0.5 µs; predicted SPAM moves only 2.8 → 3.0%. One short run per speed removes the doubt (§11).</li>
+    <li><strong>Column dependence.</strong> Dark events vary ±20% across the sensor (§9.8).</li>
+    <li><strong>g.</strong> It follows the recent pixel rate (§9.1), and S is the factory value, so the real gain carries S's error.</li>
+    <li><strong>B.</strong> It has a column pattern, moves about 1 ADU with the shift speed at 5 MHz and up to 30 ADU between readout rates: fit it per ROI and data set.</li>
+    <li><strong>Temperature.</strong> Run 106415's sensor temperature is not known here; CIC is 14% higher at −60 °C.</li>
+  </ul>
+</section>
+
+<section id="settings">
+  <h2><span class="num">11</span>Settings and follow-up runs</h2>
+  <div class="col">
+    <ul>
+      <li><strong>Readout:</strong> 5 MHz, pre-amp 3, EM 200 (RealGain), 4×4, normal clock voltage, <strong>0.5 µs</strong> vertical shift; 0.3 µs is marginally better. In ioncam, put <code>vs_speed_us = 0.5</code> in the <code>[readout]</code> section of the configuration file. The value <code>0</code> means "the camera's recommended speed", which is 3.3 µs on this camera; the 17 Oct session ran with 0. A value set in the GUI or over RPC is not saved.</li>
+      <li><strong>Live view:</strong> if a stable g matters right after arming, run live view at 5 MHz as well (<code>[live] hs_speed_mhz = 5.0</code>), or wait a few minutes after arming.</li>
+      <li><strong>EM gain:</strong> 200 is fine. EM 300 lowers σ/g by a third (0.15 e⁻ at 5 MHz) at the cost of faster register ageing. Above 300 needs advanced EM gain.</li>
+    </ul>
+    <p>A short ioncam run measures 4×4 directly at each speed (about a minute each, shutter closed by the characterization, readout disarmed first):</p>
+  </div>
+<pre><code># ioncam RPC (sipyco client "cam")
+for vs in (0.3, 0.5, 0.9):
+    cam.set_acquisition("readout", vs_speed_us=vs)
+    cam.start_characterization(stages=["baseline", "binning"], binnings=[1, 4])
+    # wait until cam.characterization_status()["state"] == "done"
+cam.set_acquisition("readout", vs_speed_us=0.5)
+
+# The 144 px region centres on the loaded readout plan's AQROI; without a plan add
+#     region=[279, 187, 423, 331]     (contains the 13 Oct AQROI, on its binning grid)</code></pre>
+  <p class="col">The dark calibration that matters most is §8 step 2: the real armed readout with the lasers off, through the Grabber.</p>
+</section>
+
+<section id="files">
+  <h2><span class="num">12</span>Data files</h2>
+  <p class="col">In <code>characterization/20261017-113225_DU897-BB/</code>:</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>File</th><th>Contents</th></tr></thead>
+      <tbody>
+        <tr><td><code>camera_profile.json</code></td><td class="w">Format "ioncam camera profile 1". <code>points</code>: 643 settings with stage, amplifier, hs_speed_mhz, preamp_gain_index, preamp_gain, vs_speed_us, vs_amplitude, em_gain, hbin, vbin, exposure, bias (median), read_noise (σ), sensitivity, g, lam_p (λ<sub>CIC</sub>), lam_s (c<sub>s</sub>), common_mode_rms, temperature. Also dark_current, dark_current_temperature, gain_ratio.</td></tr>
+        <tr><td><code>points.jsonl</code></td><td class="w">One line per setting: settings asked, settings applied (speeds, gain, exposure, readout and keep-clean times, sensitivity), temperatures, and stats: bias median, bias spatial/row/column rms, common mode, drift, read noise, events above 5σ, hot pixels, trail, first frames, <code>fit</code> {mu, sigma, g, lam_p, lam_s, a, errors, chi2_dof, n_samples, n_events} and <code>model</code> {sigma, …}. The zero level is <code>stats.bias + stats.fit.mu</code>.</td></tr>
+        <tr><td><code>hist/NNNN.npz</code></td><td class="w"><code>hist</code>: samples per count above each pixel's bias, starting at <code>hist_lo</code>. The 1×1 baseline, stability, temperature and whole-sensor points also hold <code>bias_map</code>, <code>event_map</code> and <code>frame_offsets</code>.</td></tr>
+        <tr><td><code>summary.json</code>, <code>summary.csv</code></td><td class="w">Global results (dark current, real/set gain, binning, stability, triggered shots, trail, first frames, hot pixels) and the setting ranking.</td></tr>
+        <tr><td><code>plan.json</code>, <code>README.txt</code></td><td class="w">The camera's capabilities (speeds, pre-amps, gain range, recommended shift index 4 = 3.3 µs), the options, and a description of the model.</td></tr>
+      </tbody>
+    </table>
+  </div>
+<pre><code>import json
+prof = json.load(open("camera_profile.json"))
+
+def camera(vs_us, hbin=4, hs=5.0, pa=3.0, em=200, voltage=0):
+    for p in prof["points"]:
+        if (p["vs_speed_us"], p["hbin"], p["hs_speed_mhz"], p["preamp_gain"],
+                p["em_gain"], p["vs_amplitude"], p["amplifier"]) == (vs_us, hbin, hs, pa, em, voltage, "em"):
+            return {"sigma": p["read_noise"], "g": p["g"], "c_s": p["lam_s"], "lam_cic": p["lam_p"]}
+
+camera(3.3)   # the only 4x4 point; other speeds: camera(vs, hbin=1) and the scaling in section 5</code></pre>
+</section>
+
+<section id="ioncam">
+  <h2><span class="num">13</span>ioncam notes</h2>
+  <ul class="col">
+    <li>Fixed on 17 Oct (branch <code>ccr-a499e221-gz5z1p</code>, commit <code>d47d060</code>): the 21 false <code>readout_geometry_changed</code> warnings of 13–14 Oct, which marked the plan outdated (the per-shot "light outside the ROIs" drowned in EM noise and CIC), and a false <code>camera_error</code> logged when the camera failed to open.</li>
+    <li>The 1571 <code>chain_moved</code> events of 13–16 Oct came from one session running code from 13 Oct; that false "chain moved" was fixed on 15 Oct (<code>c70e5ee</code>).</li>
+    <li>Every readout armed on 13–16 Oct ran at 0.5 µs: the 13 Oct plan says so, and every arm has the same minimum trigger period (6.64–6.76 ms).</li>
+  </ul>
+</section>
+
+<footer class="end col">
+  Numbers from <code>points.jsonl</code> with ioncam's dark model (<code>ioncam/analysis/darkframes.py</code>); SPAM predictions, Fisher information and timings from scripts run on the same data. The report's figures are quoted from its 29 Sep text.
+</footer>
+</main>
+
+<script>
+(function () {
+  "use strict";
+  var DATA = {"speeds": [0.3, 0.5, 0.9, 1.7, 3.3], "ref": 0.3311, "full": [{"vs": 0.3, "v": 0.014, "err": 0.00382, "measured": false}, {"vs": 0.5, "v": 0.0112, "err": 0.00611, "measured": false}, {"vs": 0.9, "v": 0.04395, "err": 0.00659, "measured": false}, {"vs": 1.7, "v": 0.11596, "err": 0.00776, "measured": false}, {"vs": 3.3, "v": 0.33098, "err": 0.00322, "measured": true}], "serial": [{"vs": 0.3, "v": 0.05206, "err": 0.01065, "measured": false}, {"vs": 0.5, "v": 0.10578, "err": 0.01171, "measured": false}, {"vs": 0.9, "v": 0.18125, "err": 0.01676, "measured": false}, {"vs": 1.7, "v": 0.24699, "err": 0.02193, "measured": false}, {"vs": 3.3, "v": 0.42886, "err": 0.01348, "measured": true}]};
+  var fig = document.getElementById("cic-chart");
+  var host = fig.querySelector(".plot");
+  var tip = fig.querySelector(".tip");
+  var NS = "http://www.w3.org/2000/svg";
+
+  function el(name, attrs, parent) {
+    var e = document.createElementNS(NS, name);
+    for (var k in attrs) e.setAttribute(k, attrs[k]);
+    if (parent) parent.appendChild(e);
+    return e;
+  }
+  function txt(parent, x, y, s, cls, anchor) {
+    var t = el("text", { x: x, y: y, "class": cls, "text-anchor": anchor || "start" }, parent);
+    t.textContent = s;
+    return t;
+  }
+  function fmt(v) { return v >= 0.1 ? v.toFixed(3) : v.toFixed(4); }
+
+  function showTip(p, s, cx, cy) {
+    tip.textContent = "";
+    var v = document.createElement("div");
+    v.className = "v";
+    v.textContent = fmt(p.v) + (p.err ? " ± " + fmt(p.err) : "") + " e⁻";
+    var k = document.createElement("div");
+    k.className = "k";
+    var i = document.createElement("i");
+    i.style.background = "var(--series-" + s.n + ")";
+    k.appendChild(i);
+    k.appendChild(document.createTextNode(s.name + " · " + p.vs + " µs"));
+    var b = document.createElement("div");
+    b.style.color = "var(--muted)";
+    b.textContent = p.measured ? "measured at 4×4" : "1×1 measurement scaled to 4×4";
+    tip.appendChild(v); tip.appendChild(k); tip.appendChild(b);
+    tip.hidden = false;
+    var fr = fig.getBoundingClientRect(), hr = host.getBoundingClientRect();
+    var x = hr.left - fr.left + cx, y = hr.top - fr.top + cy;
+    var w = tip.offsetWidth, h = tip.offsetHeight;
+    var left = x + 14;
+    if (left + w > fig.clientWidth - 6) left = x - w - 14;
+    tip.style.left = Math.max(6, left) + "px";
+    tip.style.top = Math.max(6, y - h - 10) + "px";
+  }
+  function hideTip() { tip.hidden = true; }
+
+  function render() {
+    host.textContent = "";
+    var W = Math.max(280, Math.floor(host.clientWidth));
+    var narrow = W < 520;
+    var H = narrow ? 300 : 340;
+    var m = { l: narrow ? 46 : 58, r: narrow ? 14 : 128, t: 12, b: 46 };
+    var svg = el("svg", { width: W, height: H, viewBox: "0 0 " + W + " " + H, "aria-hidden": "true" }, host);
+    var lx0 = Math.log10(0.24), lx1 = Math.log10(4.3), ly0 = Math.log10(0.004), ly1 = Math.log10(1.3);
+    function X(v) { return m.l + (Math.log10(v) - lx0) / (lx1 - lx0) * (W - m.l - m.r); }
+    function Y(v) { return H - m.b - (Math.log10(Math.max(v, 0.004)) - ly0) / (ly1 - ly0) * (H - m.t - m.b); }
+    [0.01, 0.03, 0.1, 0.3, 1].forEach(function (t) {
+      el("line", { x1: m.l, x2: W - m.r, y1: Y(t), y2: Y(t), "class": "grid" }, svg);
+      txt(svg, m.l - 8, Y(t) + 4, String(t), "tick", "end");
+    });
+    el("line", { x1: m.l, x2: W - m.r, y1: H - m.b, y2: H - m.b, "class": "axis" }, svg);
+    DATA.speeds.forEach(function (s) {
+      el("line", { x1: X(s), x2: X(s), y1: H - m.b, y2: H - m.b + 5, "class": "axis" }, svg);
+      txt(svg, X(s), H - m.b + 18, String(s), "tick", "middle");
+    });
+    txt(svg, m.l + (W - m.l - m.r) / 2, H - 8, "Vertical shift time per row (µs)", "atitle", "middle");
+    el("line", { x1: m.l, x2: W - m.r, y1: Y(DATA.ref), y2: Y(DATA.ref), "class": "ref" }, svg);
+    txt(svg, m.l + 6, Y(DATA.ref) - 6, narrow ? "r106415 background" : "Run 106415 fitted background, 0.331", "reflabel", "start");
+    var series = [
+      { key: "full", n: 1, name: "Full-gain CIC", short: "full-gain" },
+      { key: "serial", n: 2, name: "Serial CIC", short: "serial" }
+    ];
+    series.forEach(function (s) {
+      var pts = DATA[s.key];
+      el("path", { d: "M" + pts.map(function (p) { return X(p.vs).toFixed(1) + "," + Y(p.v).toFixed(1); }).join("L"),
+                   "class": "line s" + s.n }, svg);
+      pts.forEach(function (p) {
+        if (p.err) {
+          var cx = X(p.vs), lo = Y(Math.max(p.v - p.err, 0.0045)), hi = Y(p.v + p.err);
+          el("line", { x1: cx, x2: cx, y1: lo, y2: hi, "class": "err s" + s.n }, svg);
+          el("line", { x1: cx - 3, x2: cx + 3, y1: hi, y2: hi, "class": "err s" + s.n }, svg);
+          el("line", { x1: cx - 3, x2: cx + 3, y1: lo, y2: lo, "class": "err s" + s.n }, svg);
+        }
+      });
+      pts.forEach(function (p) {
+        var cx = X(p.vs), cy = Y(p.v);
+        el("circle", { cx: cx, cy: cy, r: 4.5, "class": "dot s" + s.n + (p.measured ? "" : " hollow") }, svg);
+        var hit = el("circle", { cx: cx, cy: cy, r: 13, "class": "hit", tabindex: "0",
+                                 role: "img", "aria-label": s.name + " at " + p.vs + " µs: " + fmt(p.v) + " e⁻ per super-pixel per frame" }, svg);
+        hit.addEventListener("pointerenter", function () { showTip(p, s, cx, cy); });
+        hit.addEventListener("pointerleave", hideTip);
+        hit.addEventListener("focus", function () { showTip(p, s, cx, cy); });
+        hit.addEventListener("blur", hideTip);
+      });
+      if (!narrow) {
+        var last = pts[pts.length - 1];
+        var dy = s.n === 2 ? -9 : 15;
+        txt(svg, X(last.vs) + 12, Y(last.v) + dy, s.short + " " + fmt(last.v), "lab", "start");
+      }
+    });
+    var yl = el("text", { x: 14, y: m.t + (H - m.t - m.b) / 2, "class": "atitle", "text-anchor": "middle",
+                          transform: "rotate(-90 14 " + (m.t + (H - m.t - m.b) / 2) + ")" }, svg);
+    yl.textContent = "e⁻ per super-pixel per frame";
+  }
+  var raf = 0;
+  function schedule() { cancelAnimationFrame(raf); raf = requestAnimationFrame(render); }
+  if (window.ResizeObserver) new ResizeObserver(schedule).observe(host);
+  else window.addEventListener("resize", schedule);
+  render();
+
+  var btn = document.getElementById("copy-json");
+  var pre = document.getElementById("hyper-json");
+  btn.addEventListener("click", function () {
+    var text = pre.textContent;
+    function selectIt() {
+      var r = document.createRange();
+      r.selectNodeContents(pre);
+      var sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(r);
+      btn.textContent = "Selected: press Ctrl+C";
+    }
+    try {
+      navigator.clipboard.writeText(text).then(function () {
+        btn.textContent = "Copied";
+        setTimeout(function () { btn.textContent = "Copy JSON"; }, 2000);
+      }, selectIt);
+    } catch (e) { selectIt(); }
+  });
+})();
+</script>
+</body>
+</html>

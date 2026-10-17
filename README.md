@@ -604,6 +604,11 @@ the readout settings that reach a target SPAM error in the shortest detection ti
 by itself (about half an hour with the defaults), keeps everything on disk as it goes, and
 an abort keeps what was measured.
 
+The 17 Oct 2026 run on the lab's iXon Ultra 897, and what it changes in the 29 Sep readout
+report (the background traced to clock-induced charge at a 3.3 µs vertical shift; camera
+hyper-parameters for the SPAM pmfs), is written up in `docs/yb171_readout_addendum.html`,
+with the camera values as JSON in `docs/camera_hyperparameters_20261017.json`.
+
 What it does:
 
 1. It **closes the shutter**. A camera without an internal shutter only switches its
@@ -903,6 +908,7 @@ ioncam/
   server.py             aqctl_ioncam
   gui/                  ioncam_gui (pyqtgraph; PyQt5/PyQt6/PySide6)
 examples/artiq/         device_db entry and experiments
+docs/                   the readout addendum (17 Oct 2026) and its camera values
 tests/                  pytest suite (simulator, emulated SDK, real sipyco RPC, GUI smoke)
 ```
 

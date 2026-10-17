@@ -1,0 +1,158 @@
+{
+  "schema": "camera hyper-parameters for SPAM pmfs, from ioncam dark frames, v1 (2026-10-17)",
+  "camera": {
+    "model": "Andor iXon Ultra 897 (DU897_BB)",
+    "serial": 12729,
+    "em_stages": 536,
+    "adc_bits": 16
+  },
+  "source": {
+    "run": "characterization/20261017-113225_DU897-BB",
+    "frames": "dark (shutter closed), internal trigger, 3e6 samples per setting",
+    "region_sensor_px": [
+      184,
+      184,
+      328,
+      328
+    ],
+    "sensor_temperature_c": -70.4
+  },
+  "readout": {
+    "amplifier": "EM",
+    "hs_speed_mhz": 5.0,
+    "preamp_gain": 3,
+    "em_gain_set": 200,
+    "em_gain_mode": "RealGain",
+    "binning": [
+      4,
+      4
+    ],
+    "exposure_ms": 1.5,
+    "vs_amplitude": "normal",
+    "roi_super_pixels": 1
+  },
+  "conventions": {
+    "x": "ROI sum in ADU (integer)",
+    "B": "centre of the read-noise Gaussian; integer bins [k-1/2, k+1/2]",
+    "sigma": "Gaussian read noise per read, ADU, frame-to-frame common mode included",
+    "g": "ADU per electron entering the EM register",
+    "c_s": "serial (partial-gain) CIC events per super-pixel per frame; output exponential with log-uniform mean between g/200 and g",
+    "lam_cic": "full-gain events per super-pixel per frame (parallel CIC + dark current): the camera part of lam_bg"
+  },
+  "fixed": {
+    "sigma_adu": 8.66,
+    "sigma_adu_err": 0.03,
+    "n_pix": 1,
+    "G_real": 168,
+    "S_e_per_adu_factory": 4.39
+  },
+  "g_adu_per_e": {
+    "value_4x4": 38.64,
+    "value_4x4_err": 0.13,
+    "steady_5mhz_1x1": 38.19,
+    "steady_5mhz_1x1_sd": 0.57,
+    "prior_suggested": [
+      38.5,
+      0.8
+    ],
+    "after_10min_other_rate": {
+      "17MHz": -0.14,
+      "10MHz": -0.065,
+      "1MHz": 0.04
+    },
+    "use": "per session: fit with the prior, or measure in the same session"
+  },
+  "B_adu": {
+    "region_mean_4x4": 499.67,
+    "column_rms_4x4": 2.0,
+    "row_rms_4x4": 0.54,
+    "use": "fit per ROI and data set (column pattern; moves ~1 ADU with the shift speed)"
+  },
+  "per_vs_speed_us": {
+    "3.3": {
+      "lam_cic": 0.331,
+      "lam_cic_err": 0.0032,
+      "c_s": 0.4289,
+      "c_s_err": 0.0135,
+      "basis": "measured at 4x4",
+      "predicted_spam_error": [
+        0.0508,
+        0.0508
+      ],
+      "optimal_threshold_above_B_adu": 119
+    },
+    "1.7": {
+      "lam_cic": 0.116,
+      "lam_cic_err": 0.0078,
+      "c_s": 0.247,
+      "c_s_err": 0.0219,
+      "lam_cic_alt": 0.1383,
+      "c_s_alt": 0.1792,
+      "basis": "1x1 fit scaled by the 3.3 us binning ratios; alt = scaled by the total event rate",
+      "predicted_spam_error": [
+        0.0409,
+        0.042
+      ],
+      "optimal_threshold_above_B_adu": 81
+    },
+    "0.9": {
+      "lam_cic": 0.044,
+      "lam_cic_err": 0.0066,
+      "c_s": 0.1812,
+      "c_s_err": 0.0168,
+      "lam_cic_alt": 0.0684,
+      "c_s_alt": 0.0886,
+      "basis": "1x1 fit scaled by the 3.3 us binning ratios; alt = scaled by the total event rate",
+      "predicted_spam_error": [
+        0.0343,
+        0.0361
+      ],
+      "optimal_threshold_above_B_adu": 55
+    },
+    "0.5": {
+      "lam_cic": 0.0112,
+      "lam_cic_err": 0.0061,
+      "c_s": 0.1058,
+      "c_s_err": 0.0117,
+      "lam_cic_alt": 0.0296,
+      "c_s_alt": 0.0383,
+      "basis": "1x1 fit scaled by the 3.3 us binning ratios; alt = scaled by the total event rate",
+      "predicted_spam_error": [
+        0.0279,
+        0.0298
+      ],
+      "optimal_threshold_above_B_adu": 33
+    },
+    "0.3": {
+      "lam_cic": 0.014,
+      "lam_cic_err": 0.0038,
+      "c_s": 0.0521,
+      "c_s_err": 0.0107,
+      "lam_cic_alt": 0.0203,
+      "c_s_alt": 0.0263,
+      "basis": "1x1 fit scaled by the 3.3 us binning ratios; alt = scaled by the total event rate",
+      "predicted_spam_error": [
+        0.0269,
+        0.0274
+      ],
+      "optimal_threshold_above_B_adu": 30
+    }
+  },
+  "aqroi_column_factor": {
+    "value": 1.1,
+    "range": [
+      1.08,
+      1.12
+    ],
+    "applies_to": "x 347-355 (13 Oct AQROI) against the measured region; multiply lam_cic and c_s"
+  },
+  "dark_current_e_per_px_s": {
+    "-70C": 0.003,
+    "-60C": 0.012
+  },
+  "cic_temperature": {
+    "-70C_1x1": 0.02,
+    "-60C_1x1": 0.0227
+  },
+  "ion_used_for_predictions": "run 106415: lam_B 12.83 e-, a_bd 0.2311, a_db 0.01478, 1.1 ms beam, no light"
+}
