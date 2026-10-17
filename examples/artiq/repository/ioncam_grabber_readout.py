@@ -45,8 +45,8 @@ class IonCamGrabberReadout(EnvExperiment):
         if self.recalibrate or not self.ioncam.is_readout_valid():
             plan = self.ioncam.calibrate_readout(n_ions=n)
         else:
-            plan = self.ioncam.get_readout_plan()
-            self.ioncam.arm_readout()
+            # the plan armed: it follows the crystal on screen if that changed
+            plan = self.ioncam.arm_readout()
         for w in plan["warnings"]:
             print("ioncam warning:", w)
         print("AQROI (Solis L,R,B,T) {}, binning {}, Grabber frame {}x{} - check the core log "

@@ -366,11 +366,14 @@ class IonCamAPI:
         """Move the AQROI by (dx, dy) sensor px, e.g. 1 px steps to centre the
         ions in their ROIs by hand.  The Grabber ROIs are frame coordinates, so
         they move with it and stay the same numbers; containment and crosstalk
-        are re-computed, an armed readout is re-armed.  Returns the plan."""
+        are re-computed, an armed readout is re-armed.  If the live tracking saw
+        the crystal change since the plan, the ROIs are placed again for the
+        ions on screen inside the moved AQROI.  Returns the plan."""
         return _plain(await self._run(self._engine.nudge_readout, int(dx), int(dy)))
 
     async def replan_readout(self, hbin=0, vbin=0, aqroi=None, roi_size=None):
-        """Plan again from the located ions (no new locate): another binning
+        """Plan again from the located ions (no new locate; the ions on screen
+        if the crystal changed since the locate): another binning
         and/or a fixed AQROI [x0, y0, x1, y1] (sensor px, half-open, a multiple
         of the binning) inside which the ROIs are placed.  Ions too close to
         separate get overlapping ROIs plus a warning, never an error.  Re-arms
@@ -380,7 +383,8 @@ class IonCamAPI:
 
     async def manual_aqroi(self, cols, rows=0, x=None, y=None, hbin=0, vbin=0, roi_size=None):
         """An AQROI set by hand: cols x rows super-pixels (square if rows is 0)
-        centred on (x, y) sensor px - by default on the located ions - on the
+        centred on (x, y) sensor px - by default on the located ions (the ions
+        on screen if the crystal changed since the locate) - on the
         binning-grid phase that centres those ions in their super-pixels.  The
         ions inside get Grabber ROIs, spots outside are left out (a warning
         lists them).  Re-arms if armed; not verified.  Returns the plan."""
@@ -412,7 +416,12 @@ class IonCamAPI:
         return _plain(await self._run(self._engine.verify_readout, bool(force)))
 
     async def arm_readout(self):
-        """Re-arm the Grabber readout with the existing plan (e.g. after live)."""
+        """Re-arm the Grabber readout with the existing plan (e.g. after live)
+        - made to follow the crystal on screen first if the live tracking saw
+        it change since the plan: moved - the AQROI moves with it, the Grabber
+        ROIs unchanged; ions trapped, lost or re-arranged - an AQROI of the
+        same size centred on them, the ROIs placed again.  Returns the plan
+        armed: use its ROIs."""
         return _plain(await self._run(self._engine.arm_readout))
 
     async def disarm_readout(self, resume_live=True):

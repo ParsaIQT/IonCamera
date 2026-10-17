@@ -29,10 +29,11 @@ class IonCamGrabberMappingCheck(EnvExperiment):
         self.setattr_argument("n_engines", NumberValue(16, precision=0, step=1, min=1, max=32))
 
     def prepare(self):
-        plan = self.ioncam.get_readout_plan()
-        if plan is None:
+        if self.ioncam.get_readout_plan() is None:
             plan = self.ioncam.calibrate_readout()
-        self.ioncam.arm_readout()
+        else:
+            # the plan armed: it follows the crystal on screen if that changed
+            plan = self.ioncam.arm_readout()
         self.w, self.h = plan["frame_size"]
         n_pix = self.w * self.h
         k = int(self.n_engines)

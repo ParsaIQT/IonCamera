@@ -32,6 +32,7 @@ from collections import deque
 from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+from scipy.optimize import linear_sum_assignment
 
 from ioncam import __version__, version_string
 from ioncam.analysis.chain import equilibrium_positions, fit_chain
@@ -51,6 +52,13 @@ from ioncam.events import EventLog
 logger = logging.getLogger(__name__)
 
 IDLE, LIVE, READOUT, BUSY, ERROR = "idle", "live", "readout", "busy", "error"
+
+# tracker events after which ion positions measured before may no longer
+# describe the crystal (they are then checked against the live tracking): the
+# crystal moved as a whole, or its ions changed
+CRYSTAL_MOVES = ("chain_moved",)
+CRYSTAL_CHANGES = ("ion_lost", "ion_trapped", "chain_reconfigured", "dark_ion_moved",
+                   "ions_detected", "ions_presumed_lost", "crystal_refined", "crystal_melted")
 
 
 class ProcedureError(RuntimeError):
@@ -93,6 +101,29 @@ def _merge_split_spots(positions, flux, n: int, sigma: float) -> np.ndarray:
         f[i] = f[i] + f[j]
         pos, f = np.delete(pos, j, axis=0), np.delete(f, j)
     return pos
+
+
+def _inside(rect, positions) -> np.ndarray:
+    """Which ``positions`` (sensor px) an AQROI ``rect`` holds (as the planner
+    counts them: pixel centres at whole numbers)."""
+    p = np.asarray(positions, float).reshape(-1, 2)
+    x0, y0, x1, y1 = rect
+    return (p[:, 0] >= x0 - 0.5) & (p[:, 0] < x1 - 0.5) & (p[:, 1] >= y0 - 0.5) & \
+        (p[:, 1] < y1 - 0.5)
+
+
+def _same_ions(a, b, tol: float) -> bool:
+    """``a`` and ``b`` (sensor px) are the same ions: as many, each within
+    ``tol`` px of its own counterpart."""
+    a = np.asarray(a, float).reshape(-1, 2)
+    b = np.asarray(b, float).reshape(-1, 2)
+    if len(a) != len(b):
+        return False
+    if not len(a):
+        return True
+    d = np.hypot(a[:, None, 0] - b[None, :, 0], a[:, None, 1] - b[None, :, 1])
+    i, j = linear_sum_assignment(d)
+    return bool(np.all(d[i, j] <= tol))
 
 
 def _crystal_spots(positions, sites, sigma: float, scale: float = 0.0) -> np.ndarray:
@@ -422,6 +453,8 @@ class IonCamEngine:
         self._plan: Optional[ReadoutPlan] = None
         self._plan_valid = False
         self._last_locate: Optional[dict] = None
+        # when the tracker last saw the crystal move / its ions change
+        self._crystal_moved_t = self._crystal_changed_t = 0.0
         self._verify_shots: Optional[dict] = None     # the last verification's frames
         self._stray_hint = False                      # the stray-light hint was given
         self._procedure: Optional[dict] = None
@@ -762,6 +795,11 @@ class IonCamEngine:
         self._stray_light_hint(snap)
         for ev in events:
             self.events.add(ev)
+            t_ev = float(ev.get("t") or time.time())
+            if ev["kind"] in CRYSTAL_MOVES:
+                self._crystal_moved_t = max(self._crystal_moved_t, t_ev)
+            elif ev["kind"] in CRYSTAL_CHANGES:
+                self._crystal_changed_t = max(self._crystal_changed_t, t_ev)
             sb = self.detector.static_background
             if ev["kind"] == "chain_moved" and sb is not None and not sb.info.get("moved"):
                 sb.info["moved"] = True
@@ -1251,6 +1289,7 @@ class IonCamEngine:
                             flip_x=cfg.grabber.flip_x, flip_y=cfg.grabber.flip_y,
                             res_width=cfg.grabber.res_width, ion_states=loc["states"],
                             aqroi=aqroi, **kw)
+        plan.positions_t = float(loc["t"])
         if auto_binning and aqroi is not None:
             plan.add_note("auto binning not used: the AQROI set by hand fixes the grid")
         for w in loc.get("warnings", []):
@@ -1359,27 +1398,39 @@ class IonCamEngine:
         the ions shift inside their ROIs (with binning by a fraction of a
         super-pixel) while the ROIs handed to ARTIQ stay the same.
         Containment and crosstalk are re-computed from the located positions;
-        an armed readout is re-armed with the new AQROI."""
+        an armed readout is re-armed with the new AQROI.  A plan for another
+        crystal than the one on screen (``_plan_outdated``) gets its ROIs placed
+        again for the ions on screen inside the moved AQROI."""
         def run():
             plan = self._editable_plan()
             new = reposition_plan(plan, int(dx), int(dy), self.camera.sensor_shape)
-            self._set_plan(new, "AQROI moved by ({:+d}, {:+d}) px".format(int(dx), int(dy)))
+            what = "AQROI moved by ({:+d}, {:+d}) px".format(int(dx), int(dy))
+            if self._plan_outdated(plan):
+                # the ROIs were placed for another crystal: placed again for this one
+                # (none of its ions inside yet: the ROIs as they were, step on)
+                try:
+                    new, why = self._follow_crystal(plan, new.roi)
+                    what += why
+                except PlanError:
+                    what += " - no ion on screen inside it yet: the ROIs as they were"
+            self._set_plan(new, what)
             return new.to_dict()
         return self._call(run)
 
     def replan_readout(self, hbin: int = 0, vbin: int = 0,
                        aqroi: Optional[Sequence[int]] = None,
                        roi_size: Optional[Sequence[int]] = None) -> dict:
-        """Plan again from the located positions without a new locate: another
+        """Plan again from the located positions without a new locate (those
+        on screen if the crystal changed since, ``_plan_source``): another
         binning, and/or a fixed AQROI ``(x0, y0, x1, y1)`` (sensor px, half-open,
         a multiple of the binning) inside which the per-ion ROIs are placed.
         Close ions get overlapping ROIs rather than an error (see warnings).
         Re-arms an armed readout; the plan is not verified (verify_readout)."""
         def run():
-            pos, sigma, halo, states, newer, source = self._plan_source()
+            pos, sigma, halo, states, newer, source, measured = self._plan_source()
             hb, vb = self._binning(hbin, vbin)
             kw = self._plan_kw(roi_size, halo)
-            plan = self._plan_from(pos, sigma, states, hb, vb, kw, source,
+            plan = self._plan_from(pos, sigma, states, hb, vb, kw, source, measured,
                                    tuple(int(v) for v in aqroi) if aqroi else None)
             plan.binning_advice = binning_advice(pos, sigma, self.camera.sensor_shape, **kw)
             if newer:
@@ -1396,16 +1447,18 @@ class IonCamEngine:
         ``rows`` is 0) centred on (``x``, ``y``) sensor px - by default on the
         located ions - on the binning-grid phase that centres the ions it holds
         in their super-pixels.  The ions inside get their Grabber ROIs; spots
-        outside are left out.  Positions: the last locate, else the plan, else
-        the live tracking.  Re-arms if armed; not verified."""
+        outside are left out.  Positions: ``_plan_source`` (the last locate
+        while it is the crystal on screen, else the live tracking's, the plan's
+        positions kept for ions that stayed).  Re-arms if armed; not verified."""
         def run():
-            pos, sigma, halo, states, newer, source = self._plan_source(allow_tracker=True)
+            pos, sigma, halo, states, newer, source, measured = \
+                self._plan_source(allow_tracker=True)
             hb, vb = self._binning(hbin, vbin)
             kw = self._plan_kw(roi_size, halo)
             center = None if x is None or y is None else (float(x), float(y))
             rect = square_aqroi(pos, sigma, self.camera.sensor_shape, hb, vb, int(cols),
                                 int(rows) or int(cols), center, **kw)
-            plan = self._plan_from(pos, sigma, states, hb, vb, kw, source, rect)
+            plan = self._plan_from(pos, sigma, states, hb, vb, kw, source, measured, rect)
             if newer or source == "tracking":
                 self._plan_valid = True
             self._set_plan(plan, "AQROI set by hand: {} x {} super-pixels".format(
@@ -1421,9 +1474,11 @@ class IonCamEngine:
         def run():
             plan = self._editable_plan()
             rect = resize_aqroi(plan, int(dcols), int(drows), self.camera.sensor_shape)
-            pos, sigma, halo, states, newer, source = self._plan_source(allow_tracker=True)
+            pos, sigma, halo, states, newer, source, measured = \
+                self._plan_source(allow_tracker=True)
             kw = self._plan_kw(plan.roi_size, halo)
-            new = self._plan_from(pos, sigma, states, plan.hbin, plan.vbin, kw, source, rect)
+            new = self._plan_from(pos, sigma, states, plan.hbin, plan.vbin, kw, source,
+                                  measured, rect)
             self._set_plan(new, "AQROI resized by hand to {} x {} super-pixels".format(
                 new.frame_size[0], new.frame_size[1]))
             return new.to_dict()
@@ -1442,15 +1497,18 @@ class IonCamEngine:
                     max_crosstalk=cal.max_crosstalk, max_rois=cfg.grabber.roi_engine_count,
                     background_roi=cal.background_roi, halo=halo)
 
-    def _plan_from(self, pos, sigma, states, hb, vb, kw, source, aqroi=None) -> ReadoutPlan:
+    def _plan_from(self, pos, sigma, states, hb, vb, kw, source, measured: float = 0.0,
+                   aqroi=None) -> ReadoutPlan:
         cfg = self.config
         plan = plan_readout(pos, sigma, self.camera.sensor_shape, hb, vb,
                             flip_x=cfg.grabber.flip_x, flip_y=cfg.grabber.flip_y,
                             res_width=cfg.grabber.res_width, ion_states=states, aqroi=aqroi,
                             **kw)
+        plan.positions_t = float(measured)
         if source == "tracking":
-            plan.add_note("ion positions from the live tracking (no locate yet): Calibrate + "
-                          "arm locates them precisely")
+            plan.add_note("ion positions from the live tracking ({}): Calibrate + arm locates "
+                          "them precisely".format("no locate yet" if self._last_locate is None
+                                                  else "the crystal changed since the locate"))
         return plan
 
     def _editable_plan(self) -> ReadoutPlan:
@@ -1462,46 +1520,163 @@ class IonCamEngine:
 
     def _plan_source(self, allow_tracker: bool = False):
         """The ions to plan for without a new locate: those of the last locate
-        (all it found - a plan set by hand may have left some out), else the
-        plan's, else (``allow_tracker``) the live tracking's ->
-        (positions, sigma, halo, states, newer_than_plan, source)."""
+        (all it found - a plan set by hand may have left some out) while they
+        are the crystal on screen (``_outdated``); else those the live tracking
+        shows (without a locate or a plan: only if ``allow_tracker``) - the
+        plan's ions at the plan's positions while within 1 px of them, so plans
+        by hand in a row stay put; else the plan's ->
+        (positions, sigma, halo, states, newer_than_plan, source, time the
+        positions were measured)."""
         if self._procedure is not None:
             raise ProcedureError("busy with '{}'".format(self._procedure["name"]))
         plan, loc = self._plan, self._last_locate
         d = self.config.detection
-        if loc is not None:
+        view = self._crystal_in_view()
+        if loc is not None and not self._locate_outdated(loc, view):
             halo = tuple(loc["psf_halo"]) if loc["psf_halo"][0] > 0 else \
                 (d.psf_halo_fraction, d.psf_halo_sigma)
             return (np.array(loc["positions"], float), tuple(loc["psf_sigma"]), halo,
-                    list(loc["states"]), plan is None or loc["t"] > plan.created, "locate")
-        if plan is not None:
-            return (np.array(plan.positions, float), tuple(plan.psf_sigma),
-                    tuple(plan.psf_halo), list(plan.ion_states), False, "plan")
-        sites = self._snapshot.get("sites") or []
-        if allow_tracker and sites:
-            return (np.array([[s_["x"], s_["y"]] for s_ in sites], float),
-                    (d.psf_sigma, d.psf_sigma), (d.psf_halo_fraction, d.psf_halo_sigma),
-                    [s_["state"] for s_ in sites], True, "tracking")
+                    list(loc["states"]), plan is None or loc["t"] > plan.created, "locate",
+                    float(loc["t"]))
+        planned = None if plan is None else \
+            (np.array(plan.positions, float).reshape(-1, 2), tuple(plan.psf_sigma),
+             tuple(plan.psf_halo), list(plan.ion_states), False, "plan",
+             plan.positions_t or plan.created)
+        if view is not None and (allow_tracker or loc is not None or plan is not None):
+            pos = view["positions"].copy()
+            sigma, halo = (d.psf_sigma, d.psf_sigma), (d.psf_halo_fraction, d.psf_halo_sigma)
+            if planned is not None and len(planned[0]):
+                old = planned[0]
+                dd = np.hypot(pos[:, None, 0] - old[None, :, 0], pos[:, None, 1] - old[None, :, 1])
+                kept = [(a, b) for a, b in zip(*linear_sum_assignment(dd)) if dd[a, b] <= 1.0]
+                if len(kept) == len(old) == len(pos):
+                    return planned                       # the plan's crystal, as it was
+                for a, b in kept:
+                    pos[a] = old[b]
+                sigma, halo = planned[1], planned[2]
+            return (pos, sigma, halo, list(view["states"]), True, "tracking", view["t"])
+        if planned is not None:
+            return planned
         raise ProcedureError("no located ions - locate them (or calibrate) first")
 
-    def _set_plan(self, plan: ReadoutPlan, what: str) -> None:
-        """Adopt a plan changed by hand (re-arming an armed readout)."""
+    def _crystal_in_view(self) -> Optional[dict]:
+        """The crystal the live tracking shows, if confirmed and no change is
+        pending (at least one ion): positions (sensor px), states and the time
+        of its latest frame."""
+        snap = self._snapshot or {}
+        sites = snap.get("sites") or []
+        confirmed = snap.get("stable") or (snap.get("state") == "stable" and
+                                           not snap.get("pending"))
+        if not confirmed or not sites:
+            return None
+        return {"positions": np.array([[s_["x"], s_["y"]] for s_ in sites], float),
+                "states": [s_["state"] for s_ in sites],
+                "t": float(snap.get("last_update") or 0.0)}
+
+    def _outdated(self, positions, t: float, view: Optional[dict], region=None) -> bool:
+        """Ion positions measured at ``t`` no longer describe the crystal: the
+        live tracking saw it change since (ions trapped or lost, the crystal
+        re-arranged or moved) and shows other ions now (inside ``region``, if
+        given) - more, fewer, or one more than 1 px from where it was.
+        (Without a change seen since, a locate is trusted over the tracking:
+        it is the more precise.)"""
+        if view is None or view["t"] <= t or \
+                max(self._crystal_changed_t, self._crystal_moved_t) <= t:
+            return False
+        v = view["positions"]
+        if region is not None:
+            v = v[_inside(region, v)]
+        return not _same_ions(positions, v, 1.0)
+
+    def _locate_outdated(self, loc: dict, view: Optional[dict]) -> bool:
+        return self._outdated(loc["positions"], loc["t"], view, loc.get("search_region"))
+
+    def _plan_outdated(self, plan: ReadoutPlan, view: Optional[dict] = None) -> bool:
+        """The plan's ions are no longer the ions on screen in its AQROI."""
+        return self._outdated(plan.positions, plan.positions_t or plan.created,
+                              self._crystal_in_view() if view is None else view, plan.roi)
+
+    def _follow_crystal(self, plan: ReadoutPlan, rect=None) -> Tuple[ReadoutPlan, str]:
+        """``plan`` (outdated) for the crystal on screen: in the AQROI ``rect``
+        if given (its ROIs placed again).  Else, if the crystal only moved and
+        took the plan's ions along, the AQROI moved with them by whole pixels
+        (the ROIs handed to ARTIQ unchanged); if its ions changed (trapped,
+        lost, re-arranged), an AQROI of the same size centred on those near
+        the old one, its ROIs placed again -> (new plan, what changed)."""
+        pos, sigma, halo, states, newer, source, measured = \
+            self._plan_source(allow_tracker=True)
+        old = np.asarray(plan.positions, float).reshape(-1, 2)
+        sensor = self.camera.sensor_shape
+        t_plan = plan.positions_t or plan.created
+        new = None
+        if rect is None and self._crystal_changed_t <= t_plan:
+            shift, pairs, _, _ = align(old, pos, 1.0, 20.0)
+            d = (int(round(float(shift[0]))), int(round(float(shift[1]))))
+            moved = tuple(v + d[k % 2] for k, v in enumerate(plan.roi))
+            hold = _inside(moved, pos)
+            if len(pairs) == len(old) and int(hold.sum()) == len(old) and \
+                    all(hold[j] for _, j in pairs):
+                pairs = sorted(pairs)
+                base = dataclasses.replace(
+                    plan, positions=[(float(pos[j][0]), float(pos[j][1])) for _, j in pairs],
+                    ion_states=[states[j] for _, j in pairs], positions_t=measured,
+                    # (not a move by hand: the offset from the computed plan stays)
+                    manual_offset=(plan.manual_offset[0] - d[0], plan.manual_offset[1] - d[1]))
+                try:
+                    new = reposition_plan(base, d[0], d[1], sensor)
+                    why = " - the crystal moved by ({:+.1f}, {:+.1f}) px since the plan: the " \
+                        "AQROI moved with it, ROIs unchanged".format(*shift)
+                except PlanError:
+                    new = None
+        if new is None:
+            kw = self._plan_kw(plan.roi_size, halo)
+            if rect is None:
+                x0, y0, x1, y1 = plan.roi
+                m = 0.5 * max(plan.hbin, plan.vbin)
+                near = pos[_inside((x0 - m, y0 - m, x1 + m, y1 + m), pos)]
+                cols, rows = plan.frame_size
+                rect = square_aqroi(near if len(near) else pos, sigma, sensor, plan.hbin,
+                                    plan.vbin, cols, rows, None, **kw)
+                how = "the ions changed since the plan ({} -> {} ion{} read out): an AQROI " \
+                    "of the same size centred on them"
+            else:
+                how = "the crystal changed since the plan ({} -> {} ion{} read out): ROIs " \
+                    "placed again for the ions on screen"
+            new = self._plan_from(pos, sigma, states, plan.hbin, plan.vbin, kw, source,
+                                  measured, tuple(rect))
+            why = " - " + how.format(plan.n_ions, new.n_ions, "s" * (new.n_ions != 1))
+        if newer or source == "tracking":
+            self._plan_valid = True
+        return new, why
+
+    def _set_plan(self, plan: ReadoutPlan, what: str, arm: bool = False) -> None:
+        """Adopt a plan changed by hand (re-arming an armed readout; arming it
+        if ``arm``)."""
         self._plan = plan
-        if self._mode == READOUT:
-            self._arm_internal(plan)
         d = plan.to_dict()
         self.events.emit("readout_adjusted", "Readout {}: AQROI {} (Solis L,R,B,T), {}x{} "
                          "binning, containment {}".format(
                              what, d["aqroi_solis"], plan.hbin, plan.vbin,
                              " ".join("{:.0%}".format(c) for c in plan.containment)), "info",
                          aqroi=d["aqroi"], grabber_rois=d["grabber_rois"])
+        if arm or self._mode == READOUT:
+            self._arm_internal(plan)
 
     def arm_readout(self) -> dict:
-        """(Re-)arm the Grabber readout with the current plan."""
+        """(Re-)arm the Grabber readout with the current plan - made to follow
+        the crystal on screen first if that is no longer the plan's
+        (``_follow_crystal``: moved - the AQROI moves with it; ions trapped,
+        lost or re-arranged - the AQROI re-centred, the ROIs placed again).
+        Returns the plan armed."""
         def run():
-            if self._plan is None:
+            plan = self._plan
+            if plan is None:
                 raise ProcedureError("no readout plan - call calibrate_readout first")
-            self._arm_internal(self._plan)
+            if self._plan_outdated(plan):
+                new, why = self._follow_crystal(plan)
+                self._set_plan(new, "armed" + why, arm=True)
+            else:
+                self._arm_internal(plan)
             return self._plan.to_dict()
         return self._call(run)
 
@@ -1526,18 +1701,28 @@ class IonCamEngine:
                          "info", min_trigger_period=applied.min_trigger_period)
 
     def _crystal_for(self, plan: ReadoutPlan) -> np.ndarray:
-        """Every ion of the crystal read out by ``plan``: those of the last
-        locate if it found the plan's ions (ions outside the AQROI tell where
-        the others go when one is lost), else the plan's."""
+        """Every ion of the crystal read out by ``plan``: the plan's ions (in
+        its order), then those of the last locate, else of the live tracking,
+        outside the AQROI (they tell where the others go when one is lost) - a
+        locate only while it is the crystal on screen."""
         pos = np.asarray(plan.positions, float).reshape(-1, 2)
+        if not len(pos):
+            return pos
+        view = self._crystal_in_view()
         loc = self._last_locate
-        if loc is None or not len(pos):
-            return pos
-        found = np.asarray(loc.get("positions") or [], float).reshape(-1, 2)
-        if len(found) < len(pos):
-            return pos
-        d = np.hypot(pos[:, None, 0] - found[None, :, 0], pos[:, None, 1] - found[None, :, 1])
-        return found if bool(np.all(d.min(axis=1) <= 0.75)) else pos
+        cands = []
+        if loc is not None and not self._locate_outdated(loc, view):
+            cands.append((np.asarray(loc.get("positions") or [], float).reshape(-1, 2), 0.75))
+        if view is not None:
+            cands.append((view["positions"], 1.0))
+        for found, tol in cands:
+            if len(found) <= len(pos):
+                continue
+            d = np.hypot(pos[:, None, 0] - found[None, :, 0], pos[:, None, 1] - found[None, :, 1])
+            near = d.argmin(axis=1)
+            if bool(np.all(d.min(axis=1) <= tol)) and len(set(near.tolist())) == len(pos):
+                return np.vstack([pos, np.delete(found, near, axis=0)])
+        return pos
 
     def readout_check(self, last: int = 0) -> dict:
         """Is the crystal still there?  The latest check of the averaged

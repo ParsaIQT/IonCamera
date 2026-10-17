@@ -89,6 +89,7 @@ class ReadoutPlan:
     targets: Tuple[float, float] = (0.6, 0.12)        # (min containment, max crosstalk)
     manual_offset: Tuple[int, int] = (0, 0)           # AQROI moved by hand [sensor px]
     aqroi_by_hand: bool = False                       # AQROI set by hand, ROIs placed in it
+    positions_t: float = 0.0          # when the ion positions were measured (0: at ``created``)
 
     @property
     def n_rois(self) -> int:
@@ -171,6 +172,7 @@ class ReadoutPlan:
             "manual_offset": list(self.manual_offset),
             "aqroi_by_hand": self.aqroi_by_hand,
             "created": self.created,
+            "positions_t": self.positions_t or self.created,
             "verification": self.verification,
             "applied": self.applied,
             "binning_advice": self.binning_advice,

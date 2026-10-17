@@ -56,7 +56,7 @@ pip install git+https://github.com/m-labs/sipyco      # not on PyPI (ARTIQ envs 
 ioncam_gui --simulate          # GUI + simulated trap; use the "Simulation" tab to play
 ioncam_gui --simulate --sim-camera 888    # ... as an iXon Ultra 888 (1024 x 1024)
 aqctl_ioncam --simulate        # headless RPC server with the simulator
-pytest                         # 169 tests (~6 min), all on the simulator / emulated SDK
+pytest                         # 172 tests (~6 min), all on the simulator / emulated SDK
 ```
 
 ### The GUI
@@ -164,7 +164,7 @@ with their docstrings):
 | `replan_readout(hbin, vbin, aqroi)` | plan again from the located ions: another binning and/or a fixed AQROI (ions outside it are left out) |
 | `verify_readout()` | test frames with the current plan (e.g. after adjusting it by hand) |
 | `get_readout_plan()` / `get_grabber_rois()` / `get_grabber_roi_lists()` / `is_readout_valid()` | the plan |
-| `arm_readout()` / `disarm_readout(resume_live)` | external trigger + Camera Link on/off |
+| `arm_readout()` / `disarm_readout(resume_live)` | external trigger + Camera Link on/off; arming follows the crystal on screen first if it changed since the plan, and returns the plan armed |
 | `get_readout_counts(since_shot)` / `get_readout_stats()` | per-ROI sums of every shot (USB copy), threshold fits |
 | `get_readout_histograms(source)` | histograms of every ROI (verification or triggered shots) and, with every shot prepared bright, a threshold and quick fidelity estimate per ion |
 | `get_readout_check(last)` | while armed: is the crystal still there? `verdict` ok / dark / lost / no_light from the averaged readout frames, every ion's light (see below) |
@@ -326,8 +326,9 @@ get 58 % / 11 % at 4×4, 80 % / 10 % at 3×3 and 71 % / 4 % at 1×1.
 On the image every Grabber ROI has its own colour and a label beside it - **ion 0 87 %**
 is Grabber ROI 0 with the share of ion 0's light it contains (chain order, as in the plan
 table), **bg** the background ROI - plus the AQROI (dashed) and the binning grid
-(dotted). The Readout tab's **AQROI by hand** box keeps the located positions (or, before
-any locate, the tracked ones) and re-computes containment and crosstalk at once:
+(dotted). The Readout tab's **AQROI by hand** box plans for the located positions (before
+any locate, the tracked ones; once the crystal changed, the ions on screen - see *When the
+crystal changes* below) and re-computes containment and crosstalk at once:
 
 * **New AQROI**: a square AQROI of N × N super-pixels (5 by default) on the ions in view -
   zoom to the ion first - or the middle of the view, on the binning-grid phase that
@@ -354,6 +355,27 @@ warnings, not an error. With **inside the AQROI set by hand** ticked (it is, onc
 make one), **Calibrate + arm** keeps that AQROI: it searches for the ions only inside it,
 locates them precisely, places their ROIs in it, verifies and arms. An armed readout is
 re-armed after every change by hand.
+
+**When the crystal changes.** A plan reads out the ions it was made for. Once the live
+tracking sees the crystal change after they were located - an ion trapped or lost, the
+crystal re-arranged or moved - and shows other ions in the AQROI, the plan is outdated
+(the *plan outdated* chip), and the next step follows the crystal on screen:
+
+* **Arm**: if the crystal only moved and took the planned ions along, the AQROI moves
+  with it by whole pixels and the Grabber ROIs stay as they were. If ions were trapped,
+  lost or re-arranged, an AQROI of the same size is centred on the ions near the old one
+  and their ROIs are placed again. The event log says which (`readout_adjusted`);
+  `arm_readout()` returns the plan it armed - use its ROIs.
+* **D-pad**: the AQROI moves as asked, and the ROIs are placed again for the ions on
+  screen inside it (none inside yet: the ROIs stay as they were, so the AQROI can be
+  walked over to the ions).
+* **New AQROI**, the size pad and **Re-plan** plan for the ions on screen.
+
+Ions that moved by less than 1 px keep their planned positions, so plans by hand in a row
+stay put. Without a change seen since the locate, the locate wins over the tracking (it
+is the more precise). Before, these steps planned for the last locate's ions however
+long ago it ran: with a locate of one ion and a second ion loaded since, a 2 × 2 AQROI
+by hand read out one ion, and the armed readout's banner said **1 ion**.
 
 From ARTIQ the same is `manual_aqroi(cols, rows, x, y)`, `resize_readout(dcols, drows)`,
 `nudge_readout(dx, dy)`, `replan_readout(hbin, vbin, aqroi)`, `verify_readout()` and
@@ -974,7 +996,7 @@ These are worth knowing, because several would silently corrupt data:
 
 ## Tests
 
-`pytest` runs 169 tests in about 6 minutes, in the realistic regime (13k photons/s
+`pytest` runs 172 tests in about 6 minutes, in the realistic regime (13k photons/s
 per ion, blurred PSF with halo, laser scatter, surface defects):
 - chain physics against James' published values;
 - detector accuracy (photon-limited) and false-alarm rates at EM gain 1, 50 and 300,
@@ -1021,6 +1043,11 @@ per ion, blurred PSF with halo, laser scatter, surface defects):
   (any ion dark, one lost, two lost), a PSF 15 % off, a wrong calibration ("unclear"), and
   on the simulator while armed with random qubit states: the events for dark, back, lost
   (the plan outdated), over RPC and in the banner;
+- the plan following the crystal on screen: a locate of one ion and a second loaded
+  since (a 2 × 2 AQROI by hand holds both, the banner says 2 ions), an ion lost (Arm
+  re-centres the AQROI), the crystal moved (Arm moves the AQROI, the Grabber ROIs
+  unchanged), nothing changed (the plan armed as it is), the D-pad on an outdated plan,
+  and a locate trusted over a tracking that saw no change;
 - the camera characterization: fits of synthetic EMCCD dark frames with known read
   noise, gain, CIC and hot pixels (unbiased, honest errors; the gain fixed at moderate
   gain), SPAM predictions against Monte Carlo shots (ROI sums, depumping), detection
