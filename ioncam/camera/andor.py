@@ -629,6 +629,8 @@ class AndorCamera(CameraBase):
     # -- temperature ------------------------------------------------------------------
 
     def get_temperature(self) -> Tuple[float, str]:
+        if not self._open:
+            return self._last_temp          # no camera (the open failed or is to come)
         ret, temp = self._sdk.GetTemperatureF()
         if ret == DRV_ACQUIRING or ret == DRV_NOT_INITIALIZED:
             return self._last_temp

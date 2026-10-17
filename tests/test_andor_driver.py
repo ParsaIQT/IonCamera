@@ -314,3 +314,28 @@ def test_shutter_and_fan_as_a_real_camera_answers(cam):
     assert c.set_shutter("closed") == "SetShutter accepted" and sdk.sim.shutter == "closed"
     del sdk.SetShutterEx
 
+
+
+def test_no_camera_no_false_alarm(tmp_path, monkeypatch):
+    """The camera could not be opened (here: Andor's pyAndorSDK2 missing): the
+    caller hears why, and the event log gets no 'camera error' from the
+    temperature poll of a camera that never opened."""
+    import sys
+
+    from ioncam.server import build
+    monkeypatch.setitem(sys.modules, "pyAndorSDK2", None)    # never the lab's camera
+    assert AndorCamera(Config().camera).get_temperature()[1] == "unknown"
+    cfg = Config()
+    cfg.storage.data_dir = str(tmp_path)
+    cfg.camera.backend = "andor"
+    cfg.camera.temperature_poll_s = 0.0
+    engine, _ = build(cfg)
+    try:
+        with pytest.raises(CameraError, match="pyAndorSDK2"):
+            engine.start()
+        time.sleep(0.5)
+        assert not [e for e in engine.events.since(0) if e["kind"] == "camera_error"]
+        engine._camera_thread.join(1.0)
+        assert not engine._camera_thread.is_alive()
+    finally:
+        engine.shutdown()

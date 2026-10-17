@@ -56,7 +56,7 @@ pip install git+https://github.com/m-labs/sipyco      # not on PyPI (ARTIQ envs 
 ioncam_gui --simulate          # GUI + simulated trap; use the "Simulation" tab to play
 ioncam_gui --simulate --sim-camera 888    # ... as an iXon Ultra 888 (1024 x 1024)
 aqctl_ioncam --simulate        # headless RPC server with the simulator
-pytest                         # 164 tests (~6 min), all on the simulator / emulated SDK
+pytest                         # 166 tests (~6 min), all on the simulator / emulated SDK
 ```
 
 ### The GUI
@@ -440,7 +440,9 @@ Some points that matter when using the Grabber:
 * **During experiments.** USB copies of every frame feed `get_readout_counts()`,
   `get_readout_stats()` and `get_readout_histograms()`. If more light than at arming
   falls outside the ROIs, you get `readout_geometry_changed` (in frames with pixels away
-  from the ions to measure it against); any crystal change in live mode marks the plan
+  from the ions to measure it against; from the light of the last 1000 shots added up,
+  as one shot's few photo-electrons drown in its EM noise and clock-induced charge, and
+  only once there is light enough to tell); any crystal change in live mode marks the plan
   **outdated** (`is_readout_valid()` returns False). The crystal check below watches the
   ions themselves.
 
@@ -936,7 +938,7 @@ These are worth knowing, because several would silently corrupt data:
 
 ## Tests
 
-`pytest` runs 164 tests in about 6 minutes, in the realistic regime (13k photons/s
+`pytest` runs 166 tests in about 6 minutes, in the realistic regime (13k photons/s
 per ion, blurred PSF with halo, laser scatter, surface defects):
 - chain physics against James' published values;
 - detector accuracy (photon-limited) and false-alarm rates at EM gain 1, 50 and 300,

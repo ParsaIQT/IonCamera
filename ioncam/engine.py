@@ -162,11 +162,16 @@ class ReadoutMonitor:
             self.dark: Deque[np.ndarray] = deque(maxlen=self._maxlen)
             self.dark_mask = dark_pixel_mask(plan) if plan is not None else None
             self.times: Deque[float] = deque(maxlen=self._maxlen)
-            self.outside: Deque[float] = deque(maxlen=2000)
+            # (ion ROIs, whole frame) light of the last shots, dark level taken off
+            self.light: Deque[Tuple[float, float]] = deque(maxlen=1000)
             self.frames: Deque[np.ndarray] = deque(maxlen=200)
             self.shots = 0
             self.first_shot = 0
+            self.outside_now: Optional[Tuple[float, float]] = None
             self.outside_baseline: Optional[float] = None
+            self._baseline_err = 0.0
+            self._outside_rises = 0
+            self._since_outside = 0
             self.geometry_warning = False
             # the crystal check: the last frames, its latest result, the
             # crystal right after arming, the verdicts awaiting confirmation
@@ -199,10 +204,12 @@ class ReadoutMonitor:
             n = plan.n_ions
             area = np.array([(r[2] - r[0]) * (r[3] - r[1]) for r in plan.sdk_rois()], float)
             total = data.reshape(len(data), -1).sum(axis=1).astype(float)
+            # the dark level of each shot: a mean, as clock-induced charge adds
+            # as much to every pixel on average
             if plan.background_roi is not None:
                 bias = sums[:, n] / area[n]
             elif self.dark_mask is not None and self.dark_mask.any():
-                bias = np.median(dark, axis=1)
+                bias = dark.mean(axis=1)
             else:
                 bias = None      # every pixel holds ion light: the crystal check judges it
             if bias is not None:
@@ -215,21 +222,31 @@ class ReadoutMonitor:
                 self.dark.append(dark[k])
                 self.times.append(f.timestamp)
                 self.shots += 1
-                # fraction of the light outside the ion ROIs (only when ions shine)
-                if bias is not None and sig_total[k] > 50.0 * math.sqrt(max(w * h, 1)):
-                    self.outside.append(float(1.0 - sig_ions[k] / sig_total[k]))
-            if len(self.outside) >= 50:
-                recent = float(np.median(list(self.outside)[-50:]))
-                if self.outside_baseline is None:
-                    self.outside_baseline = recent
-                elif not self.geometry_warning and recent > self.outside_baseline + 0.2:
-                    self.geometry_warning = True
-                    events.append({"kind": "readout_geometry_changed", "severity": "warning",
-                                   "message": "{:.0%} of the ion light now falls outside the ROIs "
-                                              "(was {:.0%} after arming): ions moved or were lost? "
-                                              "Recalibrate.".format(recent, self.outside_baseline),
-                                   "details": {"outside": recent,
-                                               "baseline": self.outside_baseline}})
+                if bias is not None:
+                    self.light.append((float(sig_ions[k]), float(sig_total[k])))
+                    self._since_outside += 1
+            if self._since_outside >= 100:
+                self._since_outside = 0
+                est = self._outside()
+                if est is not None:
+                    self.outside_now = est
+                    if self.outside_baseline is None or len(self.light) < self.light.maxlen:
+                        # after arming: refined until the first 1000 shots are in
+                        self.outside_baseline, self._baseline_err = est
+                    elif not self.geometry_warning:
+                        (recent, err), base = est, self.outside_baseline
+                        rise = recent > base + 0.2 and \
+                            recent - base > 4.0 * math.hypot(err, self._baseline_err)
+                        self._outside_rises = self._outside_rises + 1 if rise else 0
+                        if self._outside_rises >= 2:
+                            self.geometry_warning = True
+                            events.append({
+                                "kind": "readout_geometry_changed", "severity": "warning",
+                                "message": "{:.0%} of the ion light now falls outside the ROIs "
+                                           "(was {:.0%} after arming): ions moved or were lost? "
+                                           "Recalibrate.".format(recent, base),
+                                "details": {"outside": recent, "baseline": base,
+                                            "error": math.hypot(err, self._baseline_err)}})
             cfg = self.check_cfg
             self._since_check += len(data)
             if cfg.enabled and self._since_check >= max(int(cfg.every), 1) and \
@@ -240,6 +257,22 @@ class ReadoutMonitor:
         if run is not None:
             events += self._check(*run)
         return events
+
+    def _outside(self) -> Optional[Tuple[float, float]]:
+        """The fraction of the ion light outside the ion ROIs, and its error,
+        from the light of the last shots added up: one shot holds a few
+        photo-electrons, less than its EM noise and clock-induced charge.
+        None while there is too little light to tell (a dark crystal)."""
+        if len(self.light) < 200:
+            return None
+        x = np.array(self.light)
+        ions, tot = x[:, 0], x[:, 1]
+        mean = float(tot.mean())
+        if mean <= 0.0:
+            return None
+        r = float(ions.mean()) / mean
+        err = float(np.std(ions - r * tot)) / (mean * math.sqrt(len(x)))
+        return (1.0 - r, err) if err <= 0.05 else None
 
     def _check(self, plan, frames, crystal, reference, g) -> List[dict]:
         """The crystal from the last shots (outside the lock: a few ms)."""
@@ -338,7 +371,7 @@ class ReadoutMonitor:
             plan = self.plan
             arr = np.array(list(self.sums)[-last:]) if self.sums else np.zeros((0, 0))
             shots = self.shots
-            outside = float(np.median(list(self.outside)[-200:])) if self.outside else None
+            outside = self.outside_now[0] if self.outside_now else None
             baseline = self.outside_baseline
         out = {"shots": shots, "used": int(len(arr)), "rois": [],
                "outside_fraction": outside, "outside_baseline": baseline}
@@ -435,7 +468,11 @@ class IonCamEngine:
                                                  name="ioncam-analysis", daemon=True)
         self._camera_thread.start()
         self._analysis_thread.start()
-        self.info = self._call(self._open_camera, timeout=60.0)
+        try:
+            self.info = self._call(self._open_camera, timeout=60.0)
+        except BaseException:
+            self._running = False       # no camera: the threads stop, the caller hears why
+            raise
         self.events.emit("started", "ioncam {} started with {}".format(
             version_string(), self.info.get("model", "camera")), "info", **self.info)
         if auto_live:

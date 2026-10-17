@@ -46,11 +46,11 @@ def three_ion_chain():
 
 
 def shots(plan, ions, n, seed, bright_p=1.0, photons=12.0, background=0.25, psf=PSF,
-          halo=HALO):
+          halo=HALO, cic=0.0):
     """Readout frames: every ion at ``ions`` (sensor px) bright with
     probability ``bright_p`` in each shot (``photons`` photo-electrons, all
     its light), a uniform ``background`` (photo-electrons per super-pixel),
-    the EMCCD (EM gain, read noise, bias 100)."""
+    the EMCCD (EM gain, read noise, bias 100, ``cic`` per super-pixel)."""
     rng = np.random.default_rng(seed)
     w, h = plan.frame_size
     ions = np.asarray(ions, float).reshape(-1, 2)
@@ -59,7 +59,7 @@ def shots(plan, ions, n, seed, bright_p=1.0, photons=12.0, background=0.25, psf=
         K = frame_light(dataclasses.replace(plan, psf_sigma=psf), ions, halo)
     lit = rng.random((n, len(ions))) < bright_p
     el = (lit * photons) @ K.T + background
-    return emccd_counts(el.reshape(n, h, w), EM_GAIN, True, SENS, READ_E, 100.0, 0.0, rng)
+    return emccd_counts(el.reshape(n, h, w), EM_GAIN, True, SENS, READ_E, 100.0, cic, rng)
 
 
 def test_zero_light_level():
@@ -176,6 +176,42 @@ def test_combine_recent_and_full_windows():
     assert r["verdict"] == "dark" and r["window"] == "recent" and "changed" in r["message"]
     assert combine(ok, unsure)["verdict"] == "ok"
 
+
+def test_light_outside_the_rois():
+    """One ion in the corner super-pixel of a 2 x 2 AQROI, its neighbour the
+    background ROI (with some of its light), clock-induced charge as at a slow
+    vertical shift: no 'ions moved' when the experiment leaves the ion bright
+    less often (one shot is too noisy to tell where its light fell); a
+    warning when the ion moves by half a super-pixel."""
+    from types import SimpleNamespace
+
+    from ioncam.config import ReadoutCheckConfig
+    from ioncam.engine import ReadoutMonitor
+    pos = np.array([[257.5, 163.5]])
+    plan = plan_readout(pos, PSF, SENSOR, 4, 4, aqroi=(256, 162, 264, 170), roi_size=(1, 1),
+                        halo=HALO)
+    assert plan.ion_rois == [(0, 0, 1, 1)] and plan.background_roi == (0, 1, 1, 2)
+    assert plan.background_contamination > 0.03
+
+    def watch(*phases):
+        m = ReadoutMonitor(check=ReadoutCheckConfig(enabled=False))
+        m.reset(plan)
+        events = []
+        for k, (ions, p) in enumerate(phases):
+            frames = shots(plan, ions, 2000, 80 + k, p, background=0.0, cic=0.3)
+            for i in range(0, len(frames), 50):
+                events += [e for e in m.add([SimpleNamespace(data=f, timestamp=0.0)
+                                             for f in frames[i:i + 50]])
+                           if e["kind"] == "readout_geometry_changed"]
+        return m.stats(), events
+
+    for p0, p1 in ((0.5, 0.15), (0.9, 0.3), (0.3, 0.02)):
+        st, events = watch((pos, p0), (pos, p1))
+        assert not events, (p0, p1, events[0]["message"])
+        assert abs(st["outside_baseline"]) < 0.1
+    st, events = watch((pos, 0.5), (pos + [2.0, 0.0], 0.5))
+    assert len(events) == 1 and events[0]["details"]["outside"] > 0.25
+    assert st["outside_fraction"] > 0.4
 
 def test_crystal_check_while_armed(tmp_path):
     """The simulator, armed with the lab's readout (two ions at 45 deg in a
