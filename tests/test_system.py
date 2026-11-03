@@ -679,6 +679,11 @@ def test_gui_smoke(tmp_path):
         labels = [it.textItem.toPlainText() for it in win.image._rects
                   if isinstance(it, pg.TextItem)]
         assert labels[:3] == ["ion 0 80%", "ion 1 75%", "bg"] and "AQROI" in labels
+        # what the boxes are: a key in the image's corner
+        assert win.image.key.isVisible()
+        keys = [lab.text for _, lab in win.image.key.items]
+        assert any(k.startswith("bg: background ROI") for k in keys) and \
+            any(k.startswith("AQROI") for k in keys) and keys[0].startswith("ion 0: Grabber ROI 0")
         # shot histograms: every ROI a curve, each ion its threshold and fidelity
         win._got_hist({"source": "trigger", "shots": 3, "dark_reference": "background ROI",
                        "dark_pixels": 2, "available": {"trigger": 3, "verify": 0},

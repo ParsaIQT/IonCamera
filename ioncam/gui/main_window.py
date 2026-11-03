@@ -207,9 +207,15 @@ def format_plan(plan):
     lines.append("Readout plan  {}   {}".format(
         time.strftime("%H:%M:%S", time.localtime(plan["created"])),
         "VALID" if plan.get("valid", True) else "OUTDATED - crystal changed, recalibrate"))
-    lines.append("ions {}   binning {}x{}   Grabber frame {} x {} (W x H)".format(
-        plan["n_ions"], plan["binning"][0], plan["binning"][1], w, h))
-    lines.append("  -> core device log should say: grabber0 frame size: {}x{}".format(w, h))
+    gw, gh = plan.get("grabber_frame") or (w, h)
+    lines.append("ions {}   binning {}x{}   frame {} x {} super-pixels   Grabber frame {} x {} "
+                 "(W x H)".format(plan["n_ions"], plan["binning"][0], plan["binning"][1], w, h,
+                                  gw, gh))
+    lines.append("  -> core device log should say: grabber0 frame size: {}x{}{}".format(
+        gw, gh, "" if (gw, gh) == (w, h) else " (or more)"))
+    if plan.get("grabber_summary"):
+        lines.append("Camera Link layout: {}".format(plan["grabber_summary"]))
+        lines.append("  {}".format(plan.get("grabber_source", "")))
     lines.append("AQROI (Solis Left, Right, Bottom, Top): {}".format(
         ", ".join(str(v) for v in plan["aqroi_solis"])))
     off = plan.get("manual_offset") or [0, 0]
@@ -312,12 +318,27 @@ def artiq_snippet(plan):
     if not plan:
         return ""
     g = plan["grabber_rois"]
-    return ("# ioncam readout plan, AQROI (Solis L,R,B,T) = {aq}, binning {b}\n"
+    gw, gh = plan.get("grabber_frame") or plan["frame_size"]
+    head = ["# ioncam readout plan, AQROI (Solis L,R,B,T) = {}, binning {}".format(
+        plan["aqroi_solis"], "x".join(str(v) for v in plan["binning"])),
+        "# Grabber ROIs (ions, then bg): x0, y0 and x1, y1 (exclusive) in pixels of the",
+        "# Grabber's {} x {} Camera Link frame - counted from the AQROI's first pixel, not".format(
+            gw, gh),
+        "# sensor pixels.  Camera Link layout: {}".format(
+            plan.get("grabber_summary") or "one pixel per super-pixel")]
+    src = plan.get("grabber_source") or ""
+    if src.startswith("assumed"):
+        head.append("# NOT measured on this camera: run ioncam_grabber_mapping_check once")
+    gain, offset = plan.get("grabber_counts") or (1.0, 0.0)
+    if (gain, offset) != (1.0, 0.0):
+        head.append("# Grabber sum = {} x USB sum + {} per super-pixel (use grabber_threshold)"
+                    .format(gain, offset))
+    return ("\n".join(head) + "\n"
             "N_IONS = {n}\n"
             "ROI_X0 = {x0}\nROI_Y0 = {y0}\nROI_X1 = {x1}\nROI_Y1 = {y1}\n"
             "ION_MASK = {im}\nFULL_MASK = {fm}\n").format(
-        aq=plan["aqroi_solis"], b="x".join(str(v) for v in plan["binning"]), n=plan["n_ions"],
-        x0=[r[0] for r in g], y0=[r[1] for r in g], x1=[r[2] for r in g], y1=[r[3] for r in g],
+        n=plan["n_ions"], x0=[r[0] for r in g], y0=[r[1] for r in g],
+        x1=[r[2] for r in g], y1=[r[3] for r in g],
         im=bin(plan["ion_mask"]), fm=bin(plan["full_mask"]))
 
 

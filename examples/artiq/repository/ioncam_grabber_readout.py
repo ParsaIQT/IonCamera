@@ -14,7 +14,9 @@ analyze():  bright/dark thresholds per ion from the histograms.  With
 
 Wiring: a TTL output -> iXon EXT TRIG input; iXon Camera Link -> Grabber
 (base configuration).  After arming, the core device log should report
-"grabber0 frame size: WxH" with the W x H printed below.
+"grabber0 frame size: WxH" with the Grabber frame printed below.  On a camera
+not yet measured (the 897's layout is assumed), run ioncam_grabber_mapping_check
+once: it measures how the camera puts its frame on Camera Link.
 """
 
 import numpy as np
@@ -49,9 +51,11 @@ class IonCamGrabberReadout(EnvExperiment):
             plan = self.ioncam.arm_readout()
         for w in plan["warnings"]:
             print("ioncam warning:", w)
+        gw, gh = plan.get("grabber_frame", plan["frame_size"])
         print("AQROI (Solis L,R,B,T) {}, binning {}, Grabber frame {}x{} - check the core log "
-              "for 'grabber0 frame size: {}x{}'".format(
-                  plan["aqroi_solis"], plan["binning"], *plan["frame_size"], *plan["frame_size"]))
+              "for 'grabber0 frame size: {}x{}'; Camera Link layout {}".format(
+                  plan["aqroi_solis"], plan["binning"], gw, gh, gw, gh,
+                  plan.get("grabber_source", "")))
         self.n_rois = int(plan["n_rois"])
         self.n_ion_rois = int(plan["n_ions"])
         self.roi_x0 = [int(v) for v in plan["grabber_x0"]]
@@ -128,10 +132,13 @@ class IonCamGrabberReadout(EnvExperiment):
             est = self.ioncam.get_readout_histograms("trigger", self.n_shots_int)
             for r in est["ions"]:
                 if r.get("ok"):
-                    thresholds.append(r["threshold"])
+                    # (in Grabber counts: a stream that is not binned adds a bias
+                    # per stream pixel - the Grabber mapping check measures it)
+                    th = r.get("grabber_threshold", r["threshold"])
+                    thresholds.append(th)
                     print("ion {}: bright if sum > {}, fidelity ~{:.2%} (bright->dark {:.2%}, "
                           "dark->bright {:.2%}; {:.2%} with the neighbours bright)".format(
-                              r["index"], r["threshold"], r["fidelity"], r["bright_error"],
+                              r["index"], th, r["fidelity"], r["bright_error"],
                               r["dark_error"], r.get("dark_error_neighbours_bright",
                                                      r["dark_error"])))
                 else:
@@ -139,15 +146,16 @@ class IonCamGrabberReadout(EnvExperiment):
                     print("ion {}: no estimate ({})".format(r["index"], r.get("reason")))
             self.set_dataset("ioncam.thresholds", np.array(thresholds), broadcast=True)
             return
-        # mixed bright and dark shots: server-side two-population fits
+        # mixed bright and dark shots: server-side two-population fits (on the
+        # USB copies of the shots; grabber_threshold is in Grabber counts)
         stats = self.ioncam.get_readout_stats(self.n_shots_int)
         for i in range(self.n_ion_rois):
             th = stats["rois"][i].get("threshold", {}) if i < len(stats["rois"]) else {}
             if th.get("ok"):
-                thresholds.append(th["threshold"])
+                t = th.get("grabber_threshold", th["threshold"])
+                thresholds.append(t)
                 print("ion {}: threshold {:.0f}, est. fidelity {:.4f}, bright {:.1%}".format(
-                    i, th["threshold"], th["fidelity"],
-                    float(np.mean(sums[:, i] > th["threshold"]))))
+                    i, t, th["fidelity"], float(np.mean(sums[:, i] > t))))
             else:
                 thresholds.append(float("nan"))
                 print("ion {}: no bright/dark separation ({})".format(i, th.get("reason")))

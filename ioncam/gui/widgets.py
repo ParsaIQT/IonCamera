@@ -139,6 +139,11 @@ class ImagePanel(QtWidgets.QWidget):
         self._labels = []
         self._rects = []
         self._roi_items = []
+        # what the plan's boxes are: a key in the image's lower left corner
+        self.key = pg.LegendItem(offset=(8, -8), labelTextSize="8pt",
+                                 brush=pg.mkBrush(0, 0, 0, 150), pen=pg.mkPen(90, 90, 90))
+        self.key.setParentItem(self.vb)
+        self.key.setVisible(False)
         self._plan = None
         self._sites = ([], (), (), None)
         self.auto_levels = True
@@ -325,6 +330,11 @@ class ImagePanel(QtWidgets.QWidget):
         # beside a (screen-)vertical chain, above a horizontal one
         return (-0.5, 0.5) if int(self.rotation) % 180 == 90 else (0.5, 1.6)
 
+    # the plan's overlays: every box outlined in dark under its colour, so it
+    # stands out on any image and colour map
+    BG_COLOR = (240, 240, 240)
+    AQ_COLOR = (42, 212, 255)
+
     def set_plan(self, plan):
         self._plan = plan
         for r in self._rects:
@@ -332,6 +342,8 @@ class ImagePanel(QtWidgets.QWidget):
             if r.scene() is not None:
                 r.scene().removeItem(r)
         self._rects = []
+        self.key.clear()
+        self.key.setVisible(False)
         if not plan or not self.show_overlays or not self.show["rois"]:
             return
         x0, y0, x1, y1 = plan["aqroi"]
@@ -339,6 +351,7 @@ class ImagePanel(QtWidgets.QWidget):
         # the binning grid: Grabber ROI edges can only lie on these lines, which
         # is why an ion is generally not in the middle of its ROI
         w, h = (x1 - x0) // hb, (y1 - y0) // vb
+        grid_pen = _pen(self.AQ_COLOR + (120,), 1.0, QtCore.Qt.PenStyle.DotLine)
         if 1 < max(w, h) <= 128:
             path = QtGui.QPainterPath()
             for k in range(1, w):
@@ -348,11 +361,11 @@ class ImagePanel(QtWidgets.QWidget):
                 path.moveTo(x0 - 0.5, y0 + k * vb - 0.5)
                 path.lineTo(x1 - 0.5, y0 + k * vb - 0.5)
             grid = QtWidgets.QGraphicsPathItem(path)
-            grid.setPen(_pen((42, 212, 255, 90), 1.0, QtCore.Qt.PenStyle.DotLine))
+            grid.setPen(grid_pen)
             grid.setParentItem(self.group)
             self._rects.append(grid)
         aq_rect = (x0 - 0.5, y0 - 0.5, x1 - x0, y1 - y0)
-        self._add_rect(*aq_rect, "#2ad4ff", QtCore.Qt.PenStyle.DashLine)
+        self._add_rect(*aq_rect, self.AQ_COLOR, QtCore.Qt.PenStyle.DashLine)
         # every Grabber ROI with its own colour and a label saying what it
         # measures - "ion 0" is Grabber ROI 0 (chain order, as in the plan
         # table) with the share of that ion's light inside it.  The labels sit
@@ -364,12 +377,13 @@ class ImagePanel(QtWidgets.QWidget):
         for i, (u0, v0, u1, v1) in enumerate(rois):
             rect = (x0 + u0 * hb - 0.5, y0 + v0 * vb - 0.5, (u1 - u0) * hb, (v1 - v0) * vb)
             if i < plan["n_ions"]:
-                color = ION_COLORS[i % len(ION_COLORS)]
+                color = _lighter(ION_COLORS[i % len(ION_COLORS)], 0.4)
                 text = "ion {}".format(i) + (" {:.0%}".format(cont[i]) if i < len(cont) else "")
+                self._add_rect(*rect, color, QtCore.Qt.PenStyle.SolidLine)
             else:
-                color, text = (170, 170, 170), "bg"
-            self._add_rect(*rect, color, QtCore.Qt.PenStyle.SolidLine)
-            boxes.append((text, _lighter(color), self.group.mapRectToParent(QtCore.QRectF(*rect))))
+                color, text = self.BG_COLOR, "bg"
+                self._add_rect(*rect, color, QtCore.Qt.PenStyle.DashLine)
+            boxes.append((text, color, self.group.mapRectToParent(QtCore.QRectF(*rect))))
         aq = self.group.mapRectToParent(QtCore.QRectF(*aq_rect))      # view coords, y up
         along_y = aq.height() >= aq.width()           # chain runs up/down on screen
         bg = boxes[plan["n_ions"]][2] if len(boxes) > plan["n_ions"] else None
@@ -381,13 +395,33 @@ class ImagePanel(QtWidgets.QWidget):
             ion_side, bg_side = ("top", "bottom") if bg_low else ("bottom", "top")
         for i, (text, color, box) in enumerate(boxes):
             self._add_label(text, color, aq, box, ion_side if i < plan["n_ions"] else bg_side)
-        self._add_label("AQROI", "#2ad4ff", aq, aq, "bottom" if along_y else "left")
+        self._add_label("AQROI", self.AQ_COLOR, aq, aq, "bottom" if along_y else "left")
+        # the key
+        for i in range(min(plan["n_ions"], 3)):
+            self.key.addItem(self._key_sample(_lighter(ION_COLORS[i % len(ION_COLORS)], 0.4),
+                                              QtCore.Qt.PenStyle.SolidLine),
+                             "ion {}: Grabber ROI {} (% = share of the ion's light in it)"
+                             .format(i, i) if i == 0 else "ion {}: Grabber ROI {}".format(i, i))
+        if plan.get("background_roi"):
+            self.key.addItem(self._key_sample(self.BG_COLOR, QtCore.Qt.PenStyle.DashLine),
+                             "bg: background ROI (the dark reference)")
+        self.key.addItem(self._key_sample(self.AQ_COLOR, QtCore.Qt.PenStyle.DashLine),
+                         "AQROI: what the camera reads out")
+        self.key.addItem(pg.PlotDataItem([], [], pen=grid_pen),
+                         "grid: super-pixels ({} x {} binning)".format(hb, vb))
+        self.key.setVisible(True)
+
+    @staticmethod
+    def _key_sample(color, style):
+        return pg.PlotDataItem([], [], pen=_pen(color, 2.2, style))
 
     def _add_rect(self, x, y, w, h, color, style):
-        r = QtWidgets.QGraphicsRectItem(x, y, w, h)
-        r.setPen(_pen(color, 1.5, style))
-        r.setParentItem(self.group)
-        self._rects.append(r)
+        # a dark outline under the coloured line: visible on bright and dark pixels
+        for pen in (_pen((0, 0, 0, 170), 4.4), _pen(color, 2.2, style)):
+            r = QtWidgets.QGraphicsRectItem(x, y, w, h)
+            r.setPen(pen)
+            r.setParentItem(self.group)
+            self._rects.append(r)
 
     def _add_label(self, text, color, aq, box, side):
         """Text just outside the AQROI ``aq`` on ``side`` (as seen on screen),
@@ -401,7 +435,10 @@ class ImagePanel(QtWidgets.QWidget):
             pos, anchor = (box.center().x(), aq.bottom() + gap), (0.5, 1.0)
         else:
             pos, anchor = (box.center().x(), aq.top() - gap), (0.5, 0.0)
-        t = pg.TextItem(text, color=color, anchor=anchor)
+        t = pg.TextItem(text, color=color, anchor=anchor, fill=pg.mkBrush(0, 0, 0, 170))
+        f = t.textItem.font()
+        f.setBold(True)
+        t.setFont(f)
         t.setParentItem(self.group)
         t.setPos(self.group.mapFromParent(QtCore.QPointF(*pos)))
         self._rects.append(t)

@@ -335,10 +335,18 @@ marker_settle_time = 5.0
 
 # ARTIQ Grabber geometry
 [grabber]
-# Grabber x runs opposite to the SDK image x (set from check_grabber_mapping if needed)
+# Grabber x runs opposite to the SDK image x
 flip_x = false
 # Grabber y runs opposite to the SDK image y
 flip_y = false
+# Camera Link pixels per binned pixel along x (1: the stream is binned like the USB image; 0: not binned - the binning)
+x_scale = 1
+# Camera Link pixels per binned pixel along y (0: the binning)
+y_scale = 1
+# Camera Link pixels before the image in every line (pre-scan)
+x_offset = 0
+# lines before the image in every frame
+y_offset = 0
 # ROI engines in the Grabber gateware
 roi_engine_count = 16
 # coordinate width of the Grabber gateware (max 2**12-1)
@@ -504,3 +512,5 @@ drift_px_per_s = 0.0
 auto_trigger_hz = 0.0
 # random seed (-1 = random)
 seed = -1
+# how the simulated camera puts its frame on Camera Link (sim_grabber_sums): x and y stream pixels per binned pixel (0 = not binned), x and y offset, mirrored in x, in y (0/1)
+camera_link = [1, 1, 0, 0, 0, 0]

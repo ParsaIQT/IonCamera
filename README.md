@@ -56,7 +56,7 @@ pip install git+https://github.com/m-labs/sipyco      # not on PyPI (ARTIQ envs 
 ioncam_gui --simulate          # GUI + simulated trap; use the "Simulation" tab to play
 ioncam_gui --simulate --sim-camera 888    # ... as an iXon Ultra 888 (1024 x 1024)
 aqctl_ioncam --simulate        # headless RPC server with the simulator
-pytest                         # 177 tests (~6 min), all on the simulator / emulated SDK
+pytest                         # 189 tests (~6 min), all on the simulator / emulated SDK
 ```
 
 ### The GUI
@@ -144,7 +144,7 @@ Complete experiments are in `examples/artiq/repository/`:
 |---|---|
 | `ioncam_load_ions.py` | loading until ioncam confirms N ions, with a control lease |
 | `ioncam_grabber_readout.py` | calibrate + arm, Grabber ROI setup, triggered shots, thresholds |
-| `ioncam_grabber_mapping_check.py` | rebuilds the Grabber frame from single-pixel ROIs and checks its orientation against ioncam |
+| `ioncam_grabber_mapping_check.py` | measures how the camera puts its frame on Camera Link (frame size, every pixel) and makes ioncam map the ROIs with it - once per camera |
 | `ioncam_shuttle.py` | `hold_tracking()` around transport, survival check, position-vs-voltage scan with `locate_ions()` |
 
 The most used RPC methods (`sipyco_rpctool <host> 3270 list-methods` lists all of them
@@ -164,6 +164,7 @@ with their docstrings):
 | `replan_readout(hbin, vbin, aqroi)` | plan again from the located ions: another binning and/or a fixed AQROI (ions outside it are left out) |
 | `verify_readout()` | test frames with the current plan (e.g. after adjusting it by hand) |
 | `get_readout_plan()` / `get_grabber_rois()` / `get_grabber_roi_lists()` / `is_readout_valid()` | the plan |
+| `check_grabber_mapping(image)` / `get_grabber_mapping()` / `forget_grabber_mapping()` | how the camera puts its frame on Camera Link: measured from a frame the Grabber saw (the mapping check experiment), kept per camera |
 | `arm_readout()` / `disarm_readout(resume_live)` | external trigger + Camera Link on/off; arming follows the crystal on screen first if it changed since the plan, and returns the plan armed |
 | `get_readout_counts(since_shot)` / `get_readout_stats()` | per-ROI sums of every shot (USB copy), threshold fits |
 | `get_readout_histograms(source)` | histograms of every ROI (verification or triggered shots) and, with every shot prepared bright, a threshold and quick fidelity estimate per ion |
@@ -324,9 +325,11 @@ get 58 % / 11 % at 4×4, 80 % / 10 % at 3×3 and 71 % / 4 % at 1×1.
 ### The AQROI by hand
 
 On the image every Grabber ROI has its own colour and a label beside it - **ion 0 87 %**
-is Grabber ROI 0 with the share of ion 0's light it contains (chain order, as in the plan
-table), **bg** the background ROI - plus the AQROI (dashed) and the binning grid
-(dotted). The Readout tab's **AQROI by hand** box plans for the located positions (before
+(solid, in the ion's colour) is Grabber ROI 0 with the share of ion 0's light it contains
+(chain order, as in the plan table), **bg** (dashed white) the background ROI, the dark
+reference - plus the AQROI (dashed cyan: what the camera reads out) and the binning grid
+(dotted: the super-pixels). Every box has a dark outline, so it stands out on any image,
+and a key in the image's corner says what each one is. The Readout tab's **AQROI by hand** box plans for the located positions (before
 any locate, the tracked ones; once the crystal changed, the ions on screen - see *When the
 crystal changes* below) and re-computes containment and crosstalk at once:
 
@@ -444,13 +447,37 @@ Your Solis readout settings map onto `[readout]` (the defaults):
 
 Some points that matter when using the Grabber:
 
-* **Orientation.** Andor applies rotate/flip in host software, never in the camera, so
-  Camera Link carries the raw sensor order. ioncam never uses the SDK's rotate/flip: all
-  geometry is in raw sensor coordinates, and rotation exists only in the GUI display. If
-  you want to confirm this on your hardware, run `ioncam_grabber_mapping_check.py` once
-  (`grabber.flip_x/flip_y` exist just in case).
+* **Grabber coordinates.** The ROIs handed to ARTIQ (`grabber_rois`, the ARTIQ tab) are
+  pixels of the Grabber's Camera Link frame, counted from the AQROI's first pixel - not
+  sensor pixels. Andor applies rotate/flip in host software, never in the camera, and
+  ioncam never uses them (rotation exists only in the GUI display).
+* **The Camera Link layout differs between cameras.** The Grabber counts x as the
+  stream's pixels in a line and y as its lines. An iXon Ultra 897 sends one pixel per
+  super-pixel, so the ROIs are the super-pixels; another camera may send its lines
+  unbinned, start them with pre-scan pixels or run them the other way. On the lab's 888
+  at 4×4 binning, ROIs at x = 1 and x = 3 both read its first super-pixel, so its stream
+  is not laid out like the 897's. **Run `ioncam_grabber_mapping_check.py` once per
+  camera** (and after changing the binning), armed, with one ion dark or a single ion
+  off-centre and a small AQROI with some structure (e.g. 4 × 4 super-pixels). It finds
+  the Grabber's frame size (a single-column ROI sums the bias inside the frame and
+  nothing beyond it), reads every
+  stream pixel with single-pixel ROIs and calls `check_grabber_mapping(image)`. ioncam
+  tries every layout that fits - stream pixels per super-pixel, offset, mirroring, per
+  axis - against the frames it received over USB. A layout must give back each
+  super-pixel's light (gain 1, or as many copies as are sent), and every other way round
+  must fit clearly worse; a symmetric picture is refused, with what to change. The answer
+  is kept per camera (model and serial, `grabber_mapping.json` in the data folder), used
+  for every plan from then on, also after a restart, and the current plan is mapped at
+  once. The ARTIQ tab and the plan say which layout they use and where it comes from;
+  "NOT measured on this camera" means the 897's layout is assumed (`[grabber]` x_scale,
+  y_scale, x_offset, y_offset, flip_x, flip_y; `forget_grabber_mapping()` returns to it).
+* **Thresholds in Grabber counts.** A stream that is not binned reads every sensor pixel
+  with its own bias, so a Grabber ROI sum is the USB sum plus a bias per extra stream
+  pixel (the mapping check measures it: `grabber_counts`). Thresholds from
+  `get_readout_histograms()` and `get_readout_stats()` come with `grabber_threshold`, to
+  compare the Grabber's sums with (the readout example does).
 * **Frame size check.** After arming, the core device log should print
-  `grabber0 frame size: WxH` with the W×H of the plan.
+  `grabber0 frame size: WxH` with the Grabber frame of the plan (the plan table shows it).
 * **ROI semantics.** Grabber ROIs are half-open, `x0 ≤ x < x1`. The gateware only clears
   its "in ROI" x flag when the pixel counter *equals* `x1`, so an ROI with `x1` beyond the
   frame width silently sums whole rows. ioncam never produces that, and
@@ -1010,7 +1037,7 @@ These are worth knowing, because several would silently corrupt data:
 
 ## Tests
 
-`pytest` runs 177 tests in about 6 minutes, in the realistic regime (13k photons/s
+`pytest` runs 189 tests in about 6 minutes, in the realistic regime (13k photons/s
 per ion, blurred PSF with halo, laser scatter, surface defects):
 - chain physics against James' published values;
 - detector accuracy (photon-limited) and false-alarm rates at EM gain 1, 50 and 300,
@@ -1059,6 +1086,11 @@ per ion, blurred PSF with halo, laser scatter, surface defects):
   (any ion dark, one lost, two lost), a PSF 15 % off, a wrong calibration ("unclear"), and
   on the simulator while armed with random qubit states: the events for dark, back, lost
   (the plan outdated), over RPC and in the banner;
+- the Camera Link layout: Grabber ROIs mapped for a stream that is not binned, offset
+  or mirrored; every layout found from a noisy stream frame of two ions, a symmetric frame
+  refused; a simulated 888 sending unbinned lines - the ROIs as planned read the wrong
+  pixels, the mapping check finds the layout, the Grabber's sums are then the ROIs' light
+  (thresholds in Grabber counts), kept across a restart, forgotten on request;
 - the plan following the crystal on screen: a locate of one ion and a second loaded
   since (a 2 × 2 AQROI by hand holds both, the banner says 2 ions), an ion lost (Arm
   re-centres the AQROI), the crystal moved (Arm moves the AQROI, the Grabber ROIs

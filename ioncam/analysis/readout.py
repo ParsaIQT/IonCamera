@@ -32,8 +32,14 @@ the ions by a fraction of a super-pixel inside their ROIs), and
 
 Grabber semantics (from the ARTIQ gateware, ``artiq/gateware/grabber/core.py``)
 -------------------------------------------------------------------------------
-* coordinates are 0-based binned pixels in Camera Link stream order, which is
-  the raw sensor order (Andor rotate/flip happen in host software only);
+* coordinates are 0-based pixels of the Camera Link stream: x counts the
+  stream's valid pixels (one 16-bit pixel per clock) in a line, y the lines
+  of a frame.  Andor rotate/flip happen in host software only and never
+  reach the stream.  How the camera's binned frame sits in the stream -
+  stream pixels per binned pixel, pixels before the image, the direction -
+  is a :class:`GrabberGeometry`: the identity (one pixel per binned pixel)
+  is what an iXon Ultra 897 sends; other cameras are measured with the
+  Grabber mapping check (:func:`infer_grabber_geometry`);
 * a ROI ``setup_roi(n, x0, y0, x1, y1)`` sums ``x0 <= x < x1, y0 <= y < y1``;
 * the x "in ROI" flag is only cleared when the pixel counter equals ``x1`` and
   otherwise persists across lines until end-of-frame - a ROI with
@@ -90,6 +96,10 @@ class ReadoutPlan:
     manual_offset: Tuple[int, int] = (0, 0)           # AQROI moved by hand [sensor px]
     aqroi_by_hand: bool = False                       # AQROI set by hand, ROIs placed in it
     positions_t: float = 0.0          # when the ion positions were measured (0: at ``created``)
+    grabber: dict = field(default_factory=dict)       # GrabberGeometry the ROIs were mapped with
+    grabber_frame: Tuple[int, int] = (0, 0)           # the Grabber frame (W, H) they assume
+    grabber_source: str = ""                          # where that geometry comes from
+    grabber_counts: Tuple[float, float] = (1.0, 0.0)  # Grabber sum = gain x USB sum + offset x px
 
     @property
     def n_rois(self) -> int:
@@ -126,6 +136,14 @@ class ReadoutPlan:
     def sdk_rois(self) -> List[Rect]:
         """All ROIs (ions, then background) in SDK frame coordinates."""
         return list(self.ion_rois) + ([self.background_roi] if self.background_roi else [])
+
+    def to_grabber_counts(self, value: float, roi: int) -> float:
+        """An ROI sum of the USB frames (e.g. a threshold) as the Grabber
+        counts it for ROI ``roi``: a stream that is not binned reads every
+        sensor pixel with its own bias (``grabber_counts``)."""
+        u0, v0, u1, v1 = self.sdk_rois()[roi]
+        gain, offset = self.grabber_counts
+        return float(gain) * float(value) + float(offset) * (u1 - u0) * (v1 - v0)
 
     def roi_sums(self, frames: np.ndarray) -> np.ndarray:
         """Per-ROI sums of SDK-oriented frames: (n_frames, n_rois)."""
@@ -168,6 +186,13 @@ class ReadoutPlan:
             "background_contamination": round(float(self.background_contamination), 4),
             "flip_x": self.flip_x,
             "flip_y": self.flip_y,
+            "grabber_geometry": GrabberGeometry.from_dict(self.grabber).to_dict(),
+            "grabber_frame": list(self.grabber_frame) if any(self.grabber_frame)
+            else list(self.frame_size),
+            "grabber_source": self.grabber_source,
+            "grabber_counts": [round(float(v), 4) for v in self.grabber_counts],
+            "grabber_summary": GrabberGeometry.from_dict(self.grabber).describe(self.hbin,
+                                                                                self.vbin),
             "warnings": list(self.warnings),
             "manual_offset": list(self.manual_offset),
             "aqroi_by_hand": self.aqroi_by_hand,
@@ -429,7 +454,8 @@ def plan_readout(positions: Sequence[Sequence[float]], sigma: Tuple[float, float
                  flip_x: bool = False, flip_y: bool = False, res_width: int = 12,
                  ion_states: Optional[Sequence[str]] = None,
                  halo: Tuple[float, float] = (0.0, 0.0),
-                 aqroi: Optional[Sequence[int]] = None) -> ReadoutPlan:
+                 aqroi: Optional[Sequence[int]] = None,
+                 grabber: Optional["GrabberGeometry"] = None) -> ReadoutPlan:
     """Plan the AQROI and the per-ion Grabber ROIs (see module docstring).
 
     ``roi_size = (0, 0)`` lets every ion get its own optimal ROI size (an ion
@@ -438,6 +464,8 @@ def plan_readout(positions: Sequence[Sequence[float]], sigma: Tuple[float, float
     adds the PSF's broad wings (sensor px) to the containment/crosstalk.
     ``aqroi = (x0, y0, x1, y1)`` (sensor px, half-open, a multiple of the
     binning) fixes the AQROI: the ROIs are placed inside it, on its grid.
+    ``grabber``: how the frame sits in the Camera Link stream (default: one
+    stream pixel per binned pixel, mirrored as ``flip_x`` / ``flip_y`` say).
 
     Ions too close for disjoint ROIs still get a plan: every ion its own best
     ROI, overlapping ROIs allowed (with a warning)."""
@@ -630,10 +658,12 @@ def plan_readout(positions: Sequence[Sequence[float]], sigma: Tuple[float, float
             notes.append("no room for a background ROI")
 
     rois = ion_rois + ([bg_rect] if bg_rect else [])
-    grabber = [map_rect(r, fw, fh, flip_x, flip_y) for r in rois]
+    geom = grabber if grabber is not None else GrabberGeometry(flip_x=flip_x, flip_y=flip_y)
+    gw, gh = geom.frame(fw, fh, hbin, vbin)
+    grabber_rects = [geom.rect(r, fw, fh, hbin, vbin) for r in rois]
     lim = (1 << res_width) - 1
-    for r in grabber:
-        problems = validate_roi(r, fw, fh, lim)
+    for r in grabber_rects:
+        problems = validate_roi(r, gw, gh, lim)
         if problems:
             raise PlanError("internal error, invalid Grabber ROI {}: {}".format(r, problems))
     crosstalk = xt.max(axis=1).tolist() if n > 1 else [0.0]
@@ -644,10 +674,11 @@ def plan_readout(positions: Sequence[Sequence[float]], sigma: Tuple[float, float
         psf_sigma=(sx, sy), hbin=hbin, vbin=vbin, roi=tuple(int(v) for v in aq),
         frame_size=(fw, fh), roi_size=sizes[0] if len(sizes) == 1 else (0, 0),
         ion_rois=ion_rois,
-        background_roi=bg_rect, grabber_rois=grabber,
+        background_roi=bg_rect, grabber_rois=grabber_rects,
         containment=[float(c) for c in cont], crosstalk=[float(c) for c in crosstalk],
         crosstalk_matrix=[[float(v) for v in row] for row in f],
-        background_contamination=bg_cont, flip_x=flip_x, flip_y=flip_y,
+        background_contamination=bg_cont, flip_x=geom.flip_x, flip_y=geom.flip_y,
+        grabber=geom.to_dict(), grabber_frame=(gw, gh),
         psf_halo=(float(halo[0]), float(halo[1])), warnings=notes + geometry, notes=notes,
         targets=(float(min_containment), float(max_crosstalk)), aqroi_by_hand=aqroi is not None)
 
@@ -804,6 +835,181 @@ def map_rect(r: Rect, w: int, h: int, flip_x: bool, flip_y: bool) -> Rect:
     if flip_y:
         v0, v1 = h - v1, h - v0
     return int(u0), int(v0), int(u1), int(v1)
+
+
+@dataclass(frozen=True)
+class GrabberGeometry:
+    """Where the camera's binned frame (as the SDK delivers it over USB) sits
+    in the Camera Link stream the Grabber counts, per axis: stream pixels per
+    binned pixel (``x_scale``; 0 = the binning: the stream is not binned
+    along that axis), stream pixels before the image in every line / lines
+    before it in every frame (``x_offset`` / ``y_offset``: pre-scan pixels)
+    and whether the stream runs the other way (``flip_x`` / ``flip_y``; the
+    offset comes first either way).  The identity is what an iXon Ultra 897
+    sends."""
+    x_scale: int = 1
+    y_scale: int = 1
+    x_offset: int = 0
+    y_offset: int = 0
+    flip_x: bool = False
+    flip_y: bool = False
+
+    def scales(self, hbin: int, vbin: int) -> Tuple[int, int]:
+        return (int(self.x_scale) or int(hbin), int(self.y_scale) or int(vbin))
+
+    def frame(self, w: int, h: int, hbin: int, vbin: int) -> Tuple[int, int]:
+        """The Grabber frame (stream pixels) holding a ``w x h`` binned frame
+        (at least: pixels after the image are not known)."""
+        sx, sy = self.scales(hbin, vbin)
+        return int(self.x_offset + w * sx), int(self.y_offset + h * sy)
+
+    def rect(self, r: Rect, w: int, h: int, hbin: int, vbin: int) -> Rect:
+        """A rectangle of the ``w x h`` binned (SDK) frame -> Grabber ROI."""
+        sx, sy = self.scales(hbin, vbin)
+        u0, v0, u1, v1 = map_rect(r, w, h, self.flip_x, self.flip_y)
+        return (int(self.x_offset + u0 * sx), int(self.y_offset + v0 * sy),
+                int(self.x_offset + u1 * sx), int(self.y_offset + v1 * sy))
+
+    @property
+    def identity(self) -> bool:
+        return self == GrabberGeometry()
+
+    def describe(self, hbin: int, vbin: int) -> str:
+        """In words, e.g. "4 stream pixels per super-pixel in x, 1 in y"."""
+        if self.identity:
+            return "one Camera Link pixel per super-pixel, no offset, not mirrored"
+        sx, sy = self.scales(hbin, vbin)
+        out = ["{} stream pixel{} per super-pixel in x{}, {} in y{}".format(
+            sx, "s" * (sx != 1), " (unbinned)" if sx == hbin != 1 else "", sy,
+            " (unbinned)" if sy == vbin != 1 else "")]
+        if self.x_offset or self.y_offset:
+            out.append("the image starts {} pixel{} into each line, {} line{} into the "
+                       "frame".format(self.x_offset, "s" * (self.x_offset != 1),
+                                      self.y_offset, "s" * (self.y_offset != 1)))
+        flips = [a for a, f in (("x", self.flip_x), ("y", self.flip_y)) if f]
+        out.append("mirrored in " + " and ".join(flips) if flips else "not mirrored")
+        return "; ".join(out)
+
+    def to_dict(self) -> dict:
+        return dataclasses.asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: Optional[dict]) -> "GrabberGeometry":
+        d = d or {}
+        names = {f.name for f in dataclasses.fields(cls)}
+        return cls(**{k: (bool(v) if k.startswith("flip") else int(v))
+                      for k, v in d.items() if k in names})
+
+
+def camera_link_frame(frame: np.ndarray, geom: GrabberGeometry, hbin: int, vbin: int,
+                      bias: float = 0.0, size: Optional[Tuple[int, int]] = None) -> np.ndarray:
+    """The binned (SDK) ``frame`` as a camera streaming it with ``geom`` puts
+    it on Camera Link (simulation and tests): a binned pixel's light shared
+    by its stream pixels, each read with its own ``bias``; offset pixels at
+    the bias.  ``size``: (W, H) of the stream frame, if larger."""
+    f = np.asarray(frame, float)
+    h, w = f.shape
+    sx, sy = geom.scales(hbin, vbin)
+    if geom.flip_x:
+        f = f[:, ::-1]
+    if geom.flip_y:
+        f = f[::-1, :]
+    block = np.repeat(np.repeat((f - bias) / (sx * sy), sy, axis=0), sx, axis=1) + bias
+    gw, gh = geom.frame(w, h, hbin, vbin)
+    if size is not None:
+        gw, gh = max(gw, int(size[0])), max(gh, int(size[1]))
+    out = np.full((gh, gw), float(bias))
+    out[geom.y_offset:geom.y_offset + h * sy, geom.x_offset:geom.x_offset + w * sx] = block
+    return out
+
+
+def infer_grabber_geometry(expected: np.ndarray, measured: np.ndarray, hbin: int = 1,
+                           vbin: int = 1, max_tries: int = 200000) -> dict:
+    """How a frame the Grabber saw (``measured``: H_g x W_g stream pixels,
+    e.g. rebuilt from single-pixel ROIs) holds the camera's binned frame
+    (``expected``: H x W, the mean of USB frames of the same light): every
+    geometry that fits - stream pixels per binned pixel, the image's offset,
+    the direction, per axis - is tried, the measured frame summed back into
+    binned pixels and compared with the expected one (correlation).  The best
+    wins if it explains the light (r >= 0.6) and every other way round - the
+    other mirrorings - fits clearly worse (by 0.03); a symmetric image cannot
+    tell those apart.  Also the intensity: summed stream pixels = ``gain`` x
+    USB pixel + ``offset`` (each stream pixel carries its own bias)."""
+    e = np.asarray(expected, float)
+    m = np.asarray(measured, float)
+    out: dict = {"ok": False, "frame": [int(m.shape[1]), int(m.shape[0])] if m.ndim == 2 else None}
+    if e.ndim != 2 or m.ndim != 2:
+        return dict(out, reason="frames must be 2-D")
+    h, w = e.shape
+    gh, gw = m.shape
+    if gh < h or gw < w:
+        return dict(out, reason="the Grabber frame ({} x {}) is smaller than the camera's "
+                                "({} x {})".format(gw, gh, w, h))
+
+    def axis(n, ng):
+        return [(s_, o, f) for s_ in range(1, ng // n + 1) for o in range(ng - n * s_ + 1)
+                for f in (False, True)]
+
+    cx, cy = axis(w, gw), axis(h, gh)
+    if len(cx) * len(cy) > max_tries:
+        # (large frames: the plausible scales only - binned, or not binned)
+        cx = [c for c in cx if c[0] in (1, hbin)]
+        cy = [c for c in cy if c[0] in (1, vbin)]
+    ez = e - e.mean()
+    en = float(np.sqrt((ez * ez).sum()))
+    if en <= 0:
+        return dict(out, reason="the camera's frame is uniform: put light into it (an ion)")
+    ev = ez.ravel() / (en * en)
+    best: dict = {}
+    for sx, ox, fx in cx:
+        cols = m[:, ox:ox + w * sx].reshape(gh, w, sx).sum(axis=2)
+        if fx:
+            cols = cols[:, ::-1]
+        for sy, oy, fy in cy:
+            b = cols[oy:oy + h * sy].reshape(h, sy, w).sum(axis=1)
+            if fy:
+                b = b[::-1]
+            bz = b - b.mean()
+            bn = float(np.sqrt((bz * bz).sum()))
+            r = float((ez * bz).sum()) / (en * bn) if bn > 0 else 0.0
+            # The stream pixels of a binned pixel hold its light: summed back,
+            # gain 1 (or as many times as copies of it are sent).  A geometry
+            # that sums part of the light, or a neighbour's, is no explanation.
+            gain = float(np.dot(ev, bz.ravel()))
+            n_px = sx * sy
+            if not (abs(gain - 1.0) <= 0.15 or abs(gain - n_px) <= 0.15 * n_px):
+                continue
+            # (equal fits: the simpler geometry)
+            score = r - 1e-9 * (sx + sy + ox + oy + fx + fy)
+            key = (fx, fy)
+            if key not in best or score > best[key][0]:
+                best[key] = (score, r, GrabberGeometry(sx, sy, ox, oy, fx, fy), b)
+    if not best:
+        return dict(out, reason="no geometry sums the Grabber's pixels back to the camera's "
+                                "light: is the readout armed with this plan, and light on it?")
+    ranked = sorted(best.values(), key=lambda v: -v[0])
+    _, r, geom, b = ranked[0]
+    other = ranked[1][1] if len(ranked) > 1 else -1.0
+    # the intensity: binned stream pixels against USB pixels
+    a_, c_ = np.polyfit(e.ravel(), b.ravel(), 1) if np.ptp(e) > 0 else (1.0, 0.0)
+    sx, sy = geom.scales(hbin, vbin)
+    # a scale equal to the binning is the stream not binned: stored as 0, so
+    # it follows the binning (a scale of 1 stays 1)
+    stored = GrabberGeometry(0 if sx == hbin != 1 else sx, 0 if sy == vbin != 1 else sy,
+                             geom.x_offset, geom.y_offset, geom.flip_x, geom.flip_y)
+    ok = r >= 0.6 and r - other >= 0.03
+    out.update(ok=bool(ok), geometry=stored.to_dict(), r=round(r, 4),
+               r_other_mirroring=round(other, 4), ambiguous=bool(r - other < 0.03),
+               gain=round(float(a_), 4), offset=round(float(c_), 2),
+               summary=stored.describe(hbin, vbin))
+    if not ok:
+        out["reason"] = ("two ways round fit about as well - the picture looks alike "
+                         "mirrored: make it asymmetric (one ion dark, or the AQROI moved by a "
+                         "super-pixel so the light is off-centre both ways) and repeat"
+                         if r >= 0.6 else
+                         "no geometry explains the Grabber's frame (r = {:.2f}): is the "
+                         "readout armed with this plan and light on the ions?".format(r))
+    return out
 
 
 def validate_roi(r: Rect, w: int, h: int, limit: int = 4095) -> List[str]:

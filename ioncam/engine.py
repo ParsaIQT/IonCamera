@@ -38,10 +38,11 @@ from ioncam import __version__, version_string
 from ioncam.analysis.chain import equilibrium_positions, fit_chain
 from ioncam.analysis.detection import DetectionResult, Detector
 from ioncam.analysis.fitting import PSF, fit_gaussians
-from ioncam.analysis.readout import (PlanError, ReadoutPlan, binning_advice,
-                                     compare_grabber_frame, dark_pixel_mask, fit_threshold,
+from ioncam.analysis.readout import (GrabberGeometry, PlanError, ReadoutPlan, binning_advice,
+                                     dark_pixel_mask, fit_threshold, infer_grabber_geometry,
                                      plan_readout, reposition_plan, resize_aqroi,
-                                     shot_histograms, square_aqroi, verify_plan)
+                                     shot_histograms, square_aqroi, validate_roi,
+                                     verify_plan)
 from ioncam.analysis.readout_check import check_crystal, combine
 from ioncam.analysis.tracker import BRIGHT, ChainTracker, adopt_learned_psf, align
 from ioncam.camera.base import (FAN_MODES, SHUTTER_MODES, AcquisitionSettings,
@@ -421,6 +422,8 @@ class ReadoutMonitor:
                 d["threshold"] = th
                 if th.get("ok"):
                     d["bright_fraction"] = float(np.mean(col > th["threshold"]))
+                    # (what the Grabber's sum of this ROI is compared with)
+                    th["grabber_threshold"] = round(plan.to_grabber_counts(th["threshold"], i), 1)
             out["rois"].append(d)
         return out
 
@@ -453,6 +456,9 @@ class IonCamEngine:
         self._plan: Optional[ReadoutPlan] = None
         self._plan_valid = False
         self._last_locate: Optional[dict] = None
+        # the Camera Link layout measured per camera (model #serial) by the
+        # Grabber mapping check, kept in the data folder
+        self._grabber_maps: Dict[str, dict] = {}
         # when the tracker last saw the crystal move / its ions change
         self._crystal_moved_t = self._crystal_changed_t = 0.0
         self._verify_shots: Optional[dict] = None     # the last verification's frames
@@ -506,6 +512,7 @@ class IonCamEngine:
         except BaseException:
             self._running = False       # no camera: the threads stop, the caller hears why
             raise
+        self._load_grabber_maps()
         self.events.emit("started", "ioncam {} started with {}".format(
             version_string(), self.info.get("model", "camera")), "info", **self.info)
         if auto_live:
@@ -1285,10 +1292,12 @@ class IonCamEngine:
             if good:
                 pick = min(good, key=lambda a: (a["pixels"], -a["min_containment"]))
                 hb, vb = pick["binning"]
+        geom, source = self._grabber_geometry()
         plan = plan_readout(pos, sigma, self.camera.sensor_shape, hb, vb,
-                            flip_x=cfg.grabber.flip_x, flip_y=cfg.grabber.flip_y,
                             res_width=cfg.grabber.res_width, ion_states=loc["states"],
-                            aqroi=aqroi, **kw)
+                            aqroi=aqroi, grabber=geom, **kw)
+        plan.grabber_source = source
+        plan.grabber_counts = self._grabber_counts(plan)
         plan.positions_t = float(loc["t"])
         if auto_binning and aqroi is not None:
             plan.add_note("auto binning not used: the AQROI set by hand fixes the grid")
@@ -1389,6 +1398,11 @@ class IonCamEngine:
             em = a.get("settings", {}).get("amplifier") == "em" and a.get("em_gain", 0) > 1
             enf = 2.0 if em else 1.0
         res = shot_histograms(plan, sums, dark, enf=enf)
+        for r in res.get("ions") or []:
+            if r.get("ok") and r.get("threshold") is not None and r.get("index") is not None:
+                # (what the Grabber's sum of this ROI is compared with)
+                r["grabber_threshold"] = round(plan.to_grabber_counts(r["threshold"],
+                                                                      int(r["index"])), 1)
         res.update(source=source, available=out["available"], plan_created=plan.created)
         return res
 
@@ -1500,10 +1514,12 @@ class IonCamEngine:
     def _plan_from(self, pos, sigma, states, hb, vb, kw, source, measured: float = 0.0,
                    aqroi=None) -> ReadoutPlan:
         cfg = self.config
+        geom, gsource = self._grabber_geometry()
         plan = plan_readout(pos, sigma, self.camera.sensor_shape, hb, vb,
-                            flip_x=cfg.grabber.flip_x, flip_y=cfg.grabber.flip_y,
                             res_width=cfg.grabber.res_width, ion_states=states, aqroi=aqroi,
-                            **kw)
+                            grabber=geom, **kw)
+        plan.grabber_source = gsource
+        plan.grabber_counts = self._grabber_counts(plan)
         plan.positions_t = float(measured)
         if source == "tracking":
             plan.add_note("ion positions from the live tracking ({}): Calibrate + arm locates "
@@ -1771,22 +1787,139 @@ class IonCamEngine:
         d["valid"] = self._plan_valid
         return d
 
-    def check_grabber_mapping(self, image) -> dict:
-        """Compare a Grabber-reconstructed frame with the SDK's view of the readout ROI."""
+    # -- the Camera Link layout (Grabber mapping) ---------------------------------------
+
+    def _camera_id(self) -> str:
+        return "{} #{}".format(self.info.get("model", "camera"), self.info.get("serial", 0))
+
+    def _grabber_maps_path(self) -> Optional[str]:
+        d = self.config.storage.data_dir
+        return os.path.join(d, "grabber_mapping.json") if d else None
+
+    def _load_grabber_maps(self) -> None:
+        path = self._grabber_maps_path()
+        if not path or not os.path.exists(path):
+            return
+        try:
+            with open(path, encoding="utf-8") as f:
+                maps = json.load(f)
+            self._grabber_maps = {str(k): dict(v) for k, v in maps.items()}
+        except (OSError, ValueError, AttributeError) as e:
+            logger.warning("could not read %s: %s", path, e)
+
+    def _save_grabber_maps(self) -> None:
+        path = self._grabber_maps_path()
+        if not path:
+            return
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self._grabber_maps, f, indent=1)
+        except OSError as e:  # pragma: no cover
+            logger.warning("could not save %s: %s", path, e)
+
+    def _grabber_geometry(self) -> Tuple[GrabberGeometry, str]:
+        """How the camera in use puts its binned frame on Camera Link: as the
+        Grabber mapping check measured it for this camera, else as [grabber]
+        assumes -> (geometry, where it comes from)."""
+        m = self._grabber_maps.get(self._camera_id())
+        if m:
+            return GrabberGeometry.from_dict(m), "measured on this camera {} ({}x{} binning, " \
+                "{} x {} Grabber frame)".format(
+                    time.strftime("%Y-%m-%d %H:%M", time.localtime(m.get("t", 0))),
+                    *(m.get("binning") or ["?", "?"]), *(m.get("frame") or ["?", "?"]))
+        g = self.config.grabber
+        geom = GrabberGeometry(int(g.x_scale), int(g.y_scale), int(g.x_offset), int(g.y_offset),
+                               bool(g.flip_x), bool(g.flip_y))
+        return geom, "assumed ([grabber] settings) - not measured on this camera: run the " \
+            "Grabber mapping check (ioncam_grabber_mapping_check)"
+
+    def _grabber_counts(self, plan: ReadoutPlan) -> Tuple[float, float]:
+        """(gain, offset per super-pixel): a Grabber ROI sum against the USB
+        one, as measured with the layout; else what the layout implies (a
+        stream that is not binned reads each of its pixels with the bias)."""
+        m = self._grabber_maps.get(self._camera_id())
+        if m and "gain" in m:
+            return float(m["gain"]), float(m.get("offset", 0.0))
+        return 1.0, 0.0
+
+    def _remap_plan(self, plan: ReadoutPlan) -> None:
+        """The plan's Grabber ROIs again, with the camera's Camera Link layout
+        (its ROIs in the frame stay)."""
+        geom, source = self._grabber_geometry()
+        w, h = plan.frame_size
+        gw, gh = geom.frame(w, h, plan.hbin, plan.vbin)
+        rects = [geom.rect(r, w, h, plan.hbin, plan.vbin) for r in plan.sdk_rois()]
+        lim = (1 << self.config.grabber.res_width) - 1
+        for r in rects:
+            problems = validate_roi(r, gw, gh, lim)
+            if problems:
+                raise ProcedureError("Grabber ROI {}: {}".format(r, "; ".join(problems)))
+        plan.grabber_rois = rects
+        plan.grabber = geom.to_dict()
+        plan.grabber_frame = (gw, gh)
+        plan.flip_x, plan.flip_y = geom.flip_x, geom.flip_y
+        plan.grabber_source = source
+        plan.grabber_counts = self._grabber_counts(plan)
+
+    def grabber_mapping(self) -> dict:
+        """The Camera Link layout used for the camera in use: geometry, in
+        words, where it comes from (measured here, or assumed)."""
+        geom, source = self._grabber_geometry()
+        m = self._grabber_maps.get(self._camera_id())
+        # (in words at the plan's binning, else at the one it was measured at)
+        hb, vb = (self._plan.hbin, self._plan.vbin) if self._plan else \
+            tuple((m or {}).get("binning") or (self._readout.hbin, self._readout.vbin))
+        return {"camera": self._camera_id(), "geometry": geom.to_dict(),
+                "summary": geom.describe(hb, vb), "source": source, "measured": m}
+
+    def forget_grabber_mapping(self) -> dict:
+        """Drop the layout measured for the camera in use: [grabber] applies
+        again (the plan's ROIs are mapped anew)."""
+        if self._grabber_maps.pop(self._camera_id(), None) is not None:
+            self._save_grabber_maps()
+            if self._plan is not None:
+                self._remap_plan(self._plan)
+        return self.grabber_mapping()
+
+    def check_grabber_mapping(self, image, apply: bool = True) -> dict:
+        """How the camera puts its frame on Camera Link, from ``image``: the
+        frame as the Grabber saw it (H_g x W_g stream pixels, its own size -
+        e.g. rebuilt from single-pixel ROIs by the ARTIQ mapping check) against
+        the readout frames received over USB (the readout armed with the
+        current plan, the same light).  Every layout that fits is tried
+        (:func:`infer_grabber_geometry`): stream pixels per binned pixel, the
+        image's offset, mirroring.  ``apply``: an unambiguous answer is kept
+        for this camera (data folder) and the plan's Grabber ROIs are mapped
+        with it - returned in ``plan``."""
         if self._plan is None:
             raise ProcedureError("no readout plan")
-        w, h = self._plan.frame_size
         img = np.asarray(image, float)
-        if img.shape != (h, w):
-            raise ProcedureError("image shape {} must be {}x{} (H x W)".format(img.shape, h, w))
+        if img.ndim != 2:
+            raise ProcedureError("the Grabber image must be 2-D (H x W), not {}".format(
+                img.shape))
         frames = self.monitor_recent_frames()
         if frames is None:
-            raise ProcedureError("no readout frames received over USB to compare with")
-        expected = frames.mean(axis=0)
-        res = compare_grabber_frame(expected, img)
-        if res.get("ambiguous"):
-            res["hint"] = ("the image is nearly mirror-symmetric; make it asymmetric (e.g. one "
-                           "ion dark, or a single ion off-centre) and repeat")
+            raise ProcedureError("no readout frames received over USB to compare with: arm the "
+                                 "readout and trigger it")
+        plan = self._plan
+        res = infer_grabber_geometry(frames.mean(axis=0), img, plan.hbin, plan.vbin)
+        res["camera"] = self._camera_id()
+        res["applied"] = False
+        if res.get("ok") and apply:
+            self._grabber_maps[self._camera_id()] = dict(
+                res["geometry"], t=time.time(), binning=[plan.hbin, plan.vbin],
+                aqroi=list(plan.roi), frame=res["frame"], gain=res["gain"],
+                offset=res["offset"])
+            self._save_grabber_maps()
+            self._remap_plan(plan)
+            res["applied"] = True
+            d = plan.to_dict()
+            res["plan"] = d
+            self.events.emit("grabber_mapping", "Grabber mapping measured on {}: {} - the "
+                             "Grabber ROIs are now {}".format(
+                                 self._camera_id(), res["summary"], d["grabber_rois"]), "info",
+                             geometry=res["geometry"], grabber_rois=d["grabber_rois"])
         return res
 
     def monitor_recent_frames(self) -> Optional[np.ndarray]:

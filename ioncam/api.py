@@ -26,7 +26,7 @@ import time
 import numpy as np
 
 from ioncam import version_string
-from ioncam.analysis.readout import grabber_roi_sums
+from ioncam.analysis.readout import GrabberGeometry, camera_link_frame, grabber_roi_sums
 from ioncam.camera.base import AcquisitionSettings
 from ioncam.config import config_help
 
@@ -487,11 +487,26 @@ class IonCamAPI:
         verification frames) or "auto" (the newer)."""
         return _plain(await self._run(self._engine.readout_histograms, str(source), int(last)))
 
-    def check_grabber_mapping(self, image):
-        """Compare an image reconstructed from Grabber single-pixel ROIs (H x W)
-        with the frames received over USB; returns the best orientation and the
-        grabber.flip_x / flip_y settings to use."""
-        return _plain(self._engine.check_grabber_mapping(np.asarray(image, float)))
+    def check_grabber_mapping(self, image, apply=True):
+        """How the camera puts its frame on Camera Link: ``image`` is the frame
+        as the Grabber saw it (H x W stream pixels, whatever its size - the
+        ARTIQ mapping check rebuilds it from single-pixel ROIs), compared with
+        the readout frames received over USB (readout armed, same light).
+        Returns the geometry (stream pixels per super-pixel, offset,
+        mirroring per axis), how well it fits and, if unambiguous and
+        ``apply``, keeps it for this camera and returns the plan with its
+        Grabber ROIs mapped anew (``plan``)."""
+        return _plain(self._engine.check_grabber_mapping(np.asarray(image, float), bool(apply)))
+
+    def get_grabber_mapping(self):
+        """The Camera Link layout used for the camera in use: geometry, in
+        words, and where it comes from (measured here by the mapping check,
+        or assumed from [grabber])."""
+        return _plain(self._engine.grabber_mapping())
+
+    def forget_grabber_mapping(self):
+        """Drop the layout measured for the camera in use ([grabber] applies)."""
+        return _plain(self._engine.forget_grabber_mapping())
 
     # --------------------------------------------------------------- background
 
@@ -703,7 +718,29 @@ class IonCamAPI:
         w, h = plan["frame_size"]
         if cam.last_frame.shape != (h, w):
             return None
-        return [int(v) for v in grabber_roi_sums(cam.last_frame, rois)]
+        # the frame as the simulated camera puts it on Camera Link
+        geom = self._sim_camera_link()
+        hb, vb = plan["binning"]
+        stream = camera_link_frame(cam.last_frame, geom, hb, vb, bias=float(cam._bias))
+        return [int(round(v)) for v in grabber_roi_sums(np.rint(stream), rois)]
+
+    def _sim_camera_link(self) -> GrabberGeometry:
+        c = list(self._engine.config.simulator.camera_link)
+        c += [1, 1, 0, 0, 0, 0][len(c):]
+        return GrabberGeometry(int(c[0]), int(c[1]), int(c[2]), int(c[3]), bool(c[4]),
+                               bool(c[5]))
+
+    def sim_grabber_frame(self):
+        """[simulation] The last readout frame as the Grabber receives it
+        (Camera Link stream pixels, simulator.camera_link) - what the ARTIQ
+        mapping check rebuilds from single-pixel ROIs."""
+        cam = self._engine.sim_camera()
+        plan = self._engine.readout_plan()
+        if cam is None or plan is None or cam.last_frame is None:
+            return None
+        geom = self._sim_camera_link()
+        hb, vb = plan["binning"]
+        return camera_link_frame(cam.last_frame, geom, hb, vb, bias=float(cam._bias)).tolist()
 
 
 def _settings(d):

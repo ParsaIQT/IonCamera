@@ -297,9 +297,16 @@ class CharacterizeConfig:
 
 @dataclass
 class GrabberConfig:
-    flip_x: bool = opt(False, "Grabber x runs opposite to the SDK image x (set from "
-                              "check_grabber_mapping if needed)")
+    # How the binned frame sits in the Camera Link stream when the Grabber
+    # mapping check has not measured it for the camera in use (a measurement
+    # is kept per camera, in the data folder, and wins)
+    flip_x: bool = opt(False, "Grabber x runs opposite to the SDK image x")
     flip_y: bool = opt(False, "Grabber y runs opposite to the SDK image y")
+    x_scale: int = opt(1, "Camera Link pixels per binned pixel along x (1: the stream is "
+                          "binned like the USB image; 0: not binned - the binning)")
+    y_scale: int = opt(1, "Camera Link pixels per binned pixel along y (0: the binning)")
+    x_offset: int = opt(0, "Camera Link pixels before the image in every line (pre-scan)")
+    y_offset: int = opt(0, "lines before the image in every frame")
     roi_engine_count: int = opt(16, "ROI engines in the Grabber gateware")
     res_width: int = opt(12, "coordinate width of the Grabber gateware (max 2**12-1)")
 
@@ -446,6 +453,11 @@ class SimulatorConfig:
     auto_trigger_hz: float = opt(0.0, "external-trigger rate when nobody triggers "
                                       "(0 = only sim_trigger())")
     seed: int = opt(-1, "random seed (-1 = random)")
+    camera_link: List[int] = opt([1, 1, 0, 0, 0, 0], "how the simulated camera puts its frame "
+                                                     "on Camera Link (sim_grabber_sums): x "
+                                                     "and y stream pixels per binned pixel (0 "
+                                                     "= not binned), x and y offset, mirrored "
+                                                     "in x, in y (0/1)")
 
 
 SECTIONS: Dict[str, type] = {
