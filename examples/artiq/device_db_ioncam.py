@@ -3,10 +3,14 @@
 # "ioncam" is the camera brain running on the camera PC (aqctl_ioncam).  With
 # the "command" field, artiq_ctlmgr on the camera PC starts/restarts it
 # automatically; otherwise start it by hand:  aqctl_ioncam -c ioncam.toml --bind '*'
+# or with its window:  ioncam_gui -c ioncam.toml --bind '*'
+# Without --bind '*' only an artiq_master on the camera PC can connect ("host":
+# "::1"); ARTIQ on another PC also needs the camera PC's firewall to let TCP
+# port 3270 in.  Test from the ARTIQ PC:  sipyco_rpctool <host> 3270 list-targets
 
 device_db["ioncam"] = {
     "type": "controller",
-    "host": "192.168.1.50",            # camera PC
+    "host": "192.168.1.50",            # the camera PC's address (a placeholder)
     "port": 3270,
     "target_name": "ioncam",
     "command": "aqctl_ioncam -p {port} --bind {bind} -c C:/ioncam/ioncam.toml",

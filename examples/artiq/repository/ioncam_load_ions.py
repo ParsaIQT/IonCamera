@@ -5,7 +5,32 @@ waits until the crystal is stable), so the loading sequence simply switches the
 oven / photo-ionisation on, waits for ioncam, and switches everything off.
 """
 
+import socket
+
 from artiq.experiment import *
+
+
+def get_ioncam(exp, timeout=5.0):
+    """The "ioncam" controller, once it answers - call it in prepare().
+
+    ARTIQ connects a controller requested in build() with no time limit of its
+    own: when it cannot reach ioncam, the experiment dies after 15 s with
+    "Timeout receiving data from worker" and no word of why."""
+    db = exp.get_device_db()
+    desc = db["ioncam"]
+    while isinstance(desc, str):            # an alias
+        desc = db[desc]
+    host, port = desc["host"], desc["port"]
+    try:
+        socket.create_connection((host, port), timeout).close()
+    except OSError as e:
+        raise ConnectionError(
+            "ioncam does not answer at {}:{} ({}). On the camera PC: is ioncam_gui (or "
+            "aqctl_ioncam) running, started with --bind '*' (otherwise only that PC can "
+            "connect), and does its firewall let TCP port {} in? Is {} that PC's address? "
+            "Test from here: sipyco_rpctool {} {} list-targets".format(
+                host, port, e, port, host, host, port)) from None
+    return exp.get_device("ioncam")
 
 
 class IonCamLoadIons(EnvExperiment):
@@ -14,13 +39,15 @@ class IonCamLoadIons(EnvExperiment):
     def build(self):
         self.setattr_device("core")
         self.setattr_device("scheduler")
-        self.setattr_device("ioncam")
         # ARTIQ < 7: use ndecimals=0 instead of precision=0
         self.setattr_argument("n_ions", NumberValue(1, precision=0, step=1, min=1, max=50))
         self.setattr_argument("at_least", BooleanValue(False))
         self.setattr_argument("timeout", NumberValue(300.0, unit="s", min=1.0, max=3600.0))
         # self.setattr_device("ttl_oven")        # your oven / PI-laser shutters
         # self.setattr_device("ttl_pi_shutter")
+
+    def prepare(self):
+        self.ioncam = get_ioncam(self)
 
     def run(self):
         n = int(self.n_ions)

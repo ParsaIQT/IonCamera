@@ -2,7 +2,8 @@
 
 * ``ioncam_gui --simulate``            try it without hardware
 * ``ioncam_gui -c ioncam.toml``        run the camera in this process (and serve RPC
-                                       for ARTIQ on port 3270, like aqctl_ioncam)
+                                       for ARTIQ on port 3270, like aqctl_ioncam) -
+                                       add ``--bind '*'`` when ARTIQ runs on another PC
 * ``ioncam_gui --host camera-pc``      view/control a running aqctl_ioncam remotely
 """
 
@@ -24,7 +25,9 @@ def get_argparser():
                    help="simulated camera model: iXon Ultra 897 (512 x 512) or 888 "
                         "(1024 x 1024); default: simulator.camera_model")
     p.add_argument("--bind", default=[], action="append",
-                   help="additional address for the RPC server to bind to ('*' = all)")
+                   help="additional address for the RPC server to bind to; '*' = every "
+                        "address of this PC, needed when ARTIQ runs on another PC "
+                        "(default: localhost only)")
     p.add_argument("--no-localhost-bind", action="store_true")
     p.add_argument("--no-server", action="store_true",
                    help="local mode without the RPC server (ARTIQ cannot connect)")
@@ -34,9 +37,8 @@ def get_argparser():
 
 
 def _bind(args):
-    if "*" in args.bind:
-        return None
-    return list(args.bind) if args.no_localhost_bind else ["localhost"] + list(args.bind)
+    from ioncam.server import bind_from_args
+    return bind_from_args(args)
 
 
 def show(backend):

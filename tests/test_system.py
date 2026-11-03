@@ -647,7 +647,18 @@ def test_gui_smoke(tmp_path):
             time.sleep(0.01)
         assert win.image.img.image is not None
         assert "ion" in win.banner.count.text()
+        # served on localhost only: ARTIQ on another PC cannot connect - said so
+        assert win.rpc_chip.text() == "RPC :{} (this PC only)".format(port)
+        assert "--bind '*'" in win.rpc_chip.toolTip()
+        assert "for this PC only" in backend.describe()
+        server.host = None                  # as if started with --bind '*'
+        server.addresses = ["192.168.1.50"]
+        win._show_rpc()
         assert win.rpc_chip.text() == "RPC :{}".format(port)
+        tip = win.rpc_chip.toolTip()
+        assert "every address of this PC (192.168.1.50)" in tip
+        assert '"host": "192.168.1.50", "port": {}'.format(port) in tip
+        server.host = ["localhost"]
         x0, y0, x1, y1 = win.image.visible_sensor_rect()
         assert x0 <= 170 and x1 >= 350          # whole live ROI visible
         # brightness levels dragged by hand stay put (auto levels switch off)
@@ -956,7 +967,7 @@ def test_gui_works_without_the_rpc_server(tmp_path, monkeypatch, caplog):
         b = backend_for(st1)
         win = MainWindow(b, b.call("get_config").result(10), b.call("get_info").result(10))
         win.show()
-        assert _pump(app, lambda: win.rpc_chip.text() == "RPC :{}".format(port))
+        assert _pump(app, lambda: win.rpc_chip.text().startswith("RPC :{}".format(port)))
         c = Client("localhost", port, "ioncam", timeout=10)
         c.terminate()
         c.close_rpc()

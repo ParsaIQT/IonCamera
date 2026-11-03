@@ -1882,7 +1882,8 @@ class IonCamEngine:
                 self._remap_plan(self._plan)
         return self.grabber_mapping()
 
-    def check_grabber_mapping(self, image, apply: bool = True) -> dict:
+    def check_grabber_mapping(self, image, apply: bool = True, usb_means=None,
+                              pixel_batch=None) -> dict:
         """How the camera puts its frame on Camera Link, from ``image``: the
         frame as the Grabber saw it (H_g x W_g stream pixels, its own size -
         e.g. rebuilt from single-pixel ROIs by the ARTIQ mapping check) against
@@ -1891,19 +1892,33 @@ class IonCamEngine:
         (:func:`infer_grabber_geometry`): stream pixels per binned pixel, the
         image's offset, mirroring.  ``apply``: an unambiguous answer is kept
         for this camera (data folder) and the plan's Grabber ROIs are mapped
-        with it - returned in ``plan``."""
+        with it - returned in ``plan``.
+
+        ``usb_means`` and ``pixel_batch``: the stream pixels were measured in
+        batches of shots - the USB mean frame of each batch's shots and the
+        batch of each pixel; each pixel is then compared with its own shots
+        (an ion's brightness changes from batch to batch)."""
         if self._plan is None:
             raise ProcedureError("no readout plan")
         img = np.asarray(image, float)
         if img.ndim != 2:
             raise ProcedureError("the Grabber image must be 2-D (H x W), not {}".format(
                 img.shape))
-        frames = self.monitor_recent_frames()
-        if frames is None:
-            raise ProcedureError("no readout frames received over USB to compare with: arm the "
-                                 "readout and trigger it")
         plan = self._plan
-        res = infer_grabber_geometry(frames.mean(axis=0), img, plan.hbin, plan.vbin)
+        if usb_means is not None and pixel_batch is not None:
+            expected = np.asarray(usb_means, float)
+            w, h = plan.frame_size
+            if expected.ndim != 3 or expected.shape[1:] != (h, w):
+                raise ProcedureError("usb_means must be frames of {} x {} (the plan's)".format(
+                    w, h))
+            batch = np.asarray(pixel_batch, int)
+        else:
+            frames = self.monitor_recent_frames()
+            if frames is None:
+                raise ProcedureError("no readout frames received over USB to compare with: arm "
+                                     "the readout and trigger it")
+            expected, batch = frames.mean(axis=0), None
+        res = infer_grabber_geometry(expected, img, plan.hbin, plan.vbin, pixel_batch=batch)
         res["camera"] = self._camera_id()
         res["applied"] = False
         if res.get("ok") and apply:
@@ -1924,6 +1939,24 @@ class IonCamEngine:
 
     def monitor_recent_frames(self) -> Optional[np.ndarray]:
         return self.monitor.recent_frames()
+
+    def readout_frames(self, last: int = 50, each: bool = False) -> dict:
+        """The newest ``last`` armed readout frames received over USB (the
+        last 200 are kept): how many, their shape [H, W], the mean frame and
+        each frame's sum - what the Grabber should see, for comparison;
+        ``each``: every frame too (``frames``, oldest first)."""
+        recent = self.monitor_recent_frames()
+        out = {"n": 0, "shape": None, "mean": None, "frame_sums": [],
+               "shots": int(self.monitor.shots)}
+        if recent is None or not len(recent):
+            return out
+        recent = recent[-max(1, int(last)):]
+        out.update(n=int(len(recent)), shape=[int(v) for v in recent.shape[1:]],
+                   mean=recent.mean(axis=0).tolist(),
+                   frame_sums=[float(v) for v in recent.sum(axis=(1, 2))])
+        if each:
+            out["frames"] = recent.tolist()
+        return out
 
     # -- tracking ------------------------------------------------------------------------
 

@@ -487,7 +487,7 @@ class IonCamAPI:
         verification frames) or "auto" (the newer)."""
         return _plain(await self._run(self._engine.readout_histograms, str(source), int(last)))
 
-    def check_grabber_mapping(self, image, apply=True):
+    def check_grabber_mapping(self, image, apply=True, usb_means=None, pixel_batch=None):
         """How the camera puts its frame on Camera Link: ``image`` is the frame
         as the Grabber saw it (H x W stream pixels, whatever its size - the
         ARTIQ mapping check rebuilds it from single-pixel ROIs), compared with
@@ -495,8 +495,20 @@ class IonCamAPI:
         Returns the geometry (stream pixels per super-pixel, offset,
         mirroring per axis), how well it fits and, if unambiguous and
         ``apply``, keeps it for this camera and returns the plan with its
-        Grabber ROIs mapped anew (``plan``)."""
-        return _plain(self._engine.check_grabber_mapping(np.asarray(image, float), bool(apply)))
+        Grabber ROIs mapped anew (``plan``).  ``usb_means`` (the USB mean
+        frame of each batch of shots) and ``pixel_batch`` (the batch each
+        stream pixel was measured in): each pixel is compared with the light
+        of its own shots."""
+        return _plain(self._engine.check_grabber_mapping(
+            np.asarray(image, float), bool(apply), usb_means, pixel_batch))
+
+    def get_readout_frames(self, last=50, each=False):
+        """The newest ``last`` armed readout frames received over USB (the
+        last 200 are kept): ``n``, ``shape`` [H, W], the ``mean`` frame and
+        each frame's sum (``frame_sums``) - what the Grabber should see; the
+        ARTIQ mapping check compares its whole-frame sums with them.
+        ``each``: every frame too (``frames``, oldest first)."""
+        return _plain(self._engine.readout_frames(int(last), bool(each)))
 
     def get_grabber_mapping(self):
         """The Camera Link layout used for the camera in use: geometry, in

@@ -42,8 +42,9 @@ class Backend:
 
     def rpc_state(self):
         """The RPC server ARTIQ talks to, as seen from here: None, or a dict
-        with "state" (running / starting / failed / stopped / off / remote) and
-        "text"."""
+        with "state" (running / starting / failed / stopped / off / remote),
+        "text", a "hint" and, while running, "lan" (False: it answers only on
+        this PC)."""
         return None
 
     def call(self, name, *args, callback=None, error=None, channel="cmd", **kwargs):
@@ -128,8 +129,12 @@ class LocalBackend(Backend):
                     "hint": "", "text": "no RPC server (--no-server): ARTIQ cannot connect"}
         out = {"state": st.state, "port": st.port, "reason": st.reason, "hint": ""}
         if st.state == "running":
-            out["text"] = "RPC server on port {}: ARTIQ connects to target 'ioncam'".format(
-                st.port)
+            # where it answers: only this PC unless started with --bind
+            where = st.listening()
+            out["lan"] = where["lan"]
+            out["text"] = "RPC server on port {}, {}: ARTIQ connects to target 'ioncam'".format(
+                st.port, where["where"])
+            out["hint"] = where["hint"]
         elif st.state == "starting":
             out["text"] = "RPC server on port {} starting".format(st.port)
         else:
@@ -142,7 +147,8 @@ class LocalBackend(Backend):
     def describe(self):
         st = self.server_thread
         if st is not None and st.state in ("running", "starting"):
-            return "local camera, RPC on port {}".format(st.port)
+            return "local camera, RPC on port {}{}".format(
+                st.port, "" if st.listening()["lan"] else " for this PC only")
         return "local camera, no RPC server"
 
     def _invoke(self, channel, name, args, kwargs):

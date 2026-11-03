@@ -1693,7 +1693,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self.rpc_chip.hide()
             return
         state = rpc["state"]
+        if state == "running" and rpc.get("lan") is False:
+            # ARTIQ on another PC cannot connect (the tooltip says what to do)
+            state = "local"
         text, tone = {"running": ("RPC :{}".format(rpc.get("port")), "good"),
+                      "local": ("RPC :{} (this PC only)".format(rpc.get("port")), "warn"),
                       "starting": ("RPC starting", "warn"),
                       "failed": ("RPC failed", "bad"),
                       "stopped": ("RPC stopped", "bad"),

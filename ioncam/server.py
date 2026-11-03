@@ -22,6 +22,7 @@ import argparse
 import asyncio
 import errno
 import logging
+import socket
 import sys
 import threading
 
@@ -66,6 +67,79 @@ def get_argparser():
     return parser
 
 
+def _unquoted(address):
+    """A --bind address without quotes: Windows' cmd.exe passes ``--bind '*'``
+    on as "'*'" (only PowerShell and Unix shells remove them)."""
+    a = str(address).strip()
+    while len(a) >= 2 and a[0] == a[-1] and a[0] in "'\"":
+        a = a[1:-1].strip()
+    return a
+
+
+def bind_from_args(args):
+    """The RPC server's addresses from --bind / --no-localhost-bind, as
+    sipyco's ``bind_address_from_args``: None (every address of this PC) for
+    '*', otherwise localhost and the addresses given."""
+    binds = [_unquoted(b) for b in args.bind]
+    if "*" in binds:
+        return None
+    return binds if args.no_localhost_bind else ["localhost"] + binds
+
+
+def is_loopback(host):
+    h = str(host).strip("[]").lower()
+    return h in ("localhost", "ip6-localhost", "ip6-loopback", "::1") or h.startswith("127.")
+
+
+def this_pc_addresses():
+    """This PC's IPv4 addresses that another PC may reach it at, best first
+    (best effort: [] if none is found).  It may take a moment (a name lookup)."""
+    found = []
+    try:
+        # the address of the way out: connecting a UDP socket sends nothing
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("192.0.2.1", 9))
+            found.append(s.getsockname()[0])
+    except OSError:
+        pass
+    try:
+        found += socket.gethostbyname_ex(socket.gethostname())[2]
+    except OSError:
+        pass
+    out = []
+    for a in found:
+        if a not in out and a != "0.0.0.0" and not is_loopback(a) and not a.startswith("169.254."):
+            out.append(a)
+    return out
+
+
+def listening(host, port, addresses=()):
+    """Where an RPC server bound to ``host`` (a list, None for every
+    address) answers, for people: ``lan`` (whether another PC can connect),
+    ``where`` and a ``hint`` on ARTIQ's device_db entry.  ``addresses``: this
+    PC's (``this_pc_addresses()``)."""
+    hosts = None if host is None else [host] if isinstance(host, str) else list(host)
+    ips = ", ".join(addresses)
+    firewall = "this PC's firewall must let TCP port {} in".format(port)
+    if hosts is None:
+        return {"lan": True,
+                "where": "every address of this PC" + (" ({})".format(ips) if ips else ""),
+                "hint": "ARTIQ's device_db: \"host\": \"{}\", \"port\": {}; for ARTIQ on "
+                        "another PC {}.".format(addresses[0] if addresses else
+                                                "<this PC's IP address>", port, firewall)}
+    lan = [h for h in hosts if not is_loopback(h)]
+    if lan:
+        return {"lan": True, "where": ", ".join(hosts),
+                "hint": "ARTIQ's device_db: \"host\": \"{}\", \"port\": {}; for ARTIQ on "
+                        "another PC {}.".format(lan[0], port, firewall)}
+    return {"lan": False, "where": "this PC only (localhost)",
+            "hint": "Only an artiq_master on this PC can connect (device_db \"host\": "
+                    "\"::1\"). ARTIQ on another PC cannot: its experiments stop after 15 s "
+                    "in build() with \"Timeout receiving data from worker\". Start ioncam "
+                    "with --bind '*' to answer on every address{}; then {}.".format(
+                        " ({})".format(ips) if ips else "", firewall)}
+
+
 def make_server(api):
     Server, _ = _sipyco()
     return Server({TARGET: api}, description="ioncam {}".format(__version__),
@@ -76,7 +150,9 @@ async def serve(api, host, port, stop_event=None):
     """Run the RPC server until terminated (Ctrl-C, ``terminate`` RPC, or stop_event)."""
     server = make_server(api)
     await server.start(host, port)
-    logger.info("listening on %s port %d (target '%s')", host, port, TARGET)
+    where = listening(host, port, this_pc_addresses())
+    (logger.info if where["lan"] else logger.warning)(
+        "RPC target '%s' on port %d, %s. %s", TARGET, port, where["where"], where["hint"])
     waits = [asyncio.ensure_future(server.wait_terminate())]
     if stop_event is not None:
         waits.append(asyncio.ensure_future(stop_event.wait()))
@@ -124,11 +200,14 @@ class ServerThread:
         self._lock = threading.Lock()
         self._ready = threading.Event()
         self.thread = threading.Thread(target=self._run, name="ioncam-rpc", daemon=True)
+        self.addresses = []         # this PC's, looked up in the background
 
     def start(self, timeout=30.0):
         """Start the server and wait until it listens; raises if it cannot start.
         After ``timeout`` (a very slow computer) it carries on starting in the
         background and a failure is logged and reported to ``on_stop``."""
+        threading.Thread(target=self._find_addresses, name="ioncam-addresses",
+                         daemon=True).start()
         self.thread.start()
         if not self._ready.wait(timeout):
             with self._lock:
@@ -140,6 +219,13 @@ class ServerThread:
         if self.error is not None:
             raise self.error
         return self
+
+    def _find_addresses(self):
+        self.addresses = this_pc_addresses()
+
+    def listening(self):
+        """Where the server answers (see ``listening``)."""
+        return listening(self.host, self.port, list(self.addresses))
 
     def _run(self):
         how, exc = "error", None
@@ -235,7 +321,7 @@ def main(argv=None):
         config.simulator.camera_model = args.sim_camera
     engine, api = build(config, simulate=args.simulate)
     engine.start(auto_live=not args.no_live)
-    bind = common_args.bind_address_from_args(args)
+    bind = bind_from_args(args)
     try:
         if args.gui:
             from ioncam.gui.app import run_embedded

@@ -56,7 +56,7 @@ pip install git+https://github.com/m-labs/sipyco      # not on PyPI (ARTIQ envs 
 ioncam_gui --simulate          # GUI + simulated trap; use the "Simulation" tab to play
 ioncam_gui --simulate --sim-camera 888    # ... as an iXon Ultra 888 (1024 x 1024)
 aqctl_ioncam --simulate        # headless RPC server with the simulator
-pytest                         # 189 tests (~6 min), all on the simulator / emulated SDK
+pytest                         # 202 tests (~6 min), all on the simulator / emulated SDK
 ```
 
 ### The GUI
@@ -108,10 +108,18 @@ With the real camera on the camera PC (Windows):
    not follow the checkout. (Without installing at all, `python -m ioncam.gui.app` and
    `python -m ioncam.server` run straight from the checkout.)
 2. `aqctl_ioncam --write-config ioncam.toml`, then edit it. Every option is commented.
-3. `ioncam_gui -c ioncam.toml` opens the camera, starts live video and serves RPC on port
-   3270: the chip at the right end of the status bar reads **RPC :3270** when ARTIQ can
-   connect (see [Troubleshooting](#troubleshooting) otherwise). Alternatively run `aqctl_ioncam -c ioncam.toml --bind '*'` headless, and from
-   any PC `ioncam_gui --host <camera-pc>`.
+3. `ioncam_gui -c ioncam.toml --bind '*'` opens the camera, starts live video and serves
+   RPC on port 3270 on every address of the camera PC. Without `--bind '*'` only an
+   `artiq_master` on the camera PC itself can connect. ARTIQ on another PC also needs the
+   camera PC's firewall to let TCP port 3270 in (see [Troubleshooting](#troubleshooting)).
+   The chip at the right end of the status bar reads:
+   - **RPC :3270** when ARTIQ on another PC can connect. Its tooltip names the camera
+     PC's addresses for the device_db.
+   - **RPC :3270 (this PC only)** when only that PC can.
+
+   (`--bind '*'` works in cmd.exe too: ioncam drops the quotes cmd passes on.)
+   Alternatively, run `aqctl_ioncam -c ioncam.toml --bind '*'` headless, and from any PC
+   `ioncam_gui --host <camera-pc>`.
 4. Add the controller to ARTIQ's `device_db.py` (see `examples/artiq/device_db_ioncam.py`):
 
 ```python
@@ -124,7 +132,7 @@ device_db["ioncam"] = {
 ## Using it from ARTIQ
 
 ```python
-self.setattr_device("ioncam")              # a sipyco Client
+self.ioncam = get_ioncam(self)             # in prepare(): a sipyco Client
 
 # loading: switch oven/PI on, then
 r = self.ioncam.wait_for_ions(3, timeout=300)        # stable crystal of 3 bright ions
@@ -137,6 +145,12 @@ x0, y0, x1, y1 = (plan["grabber_x0"], plan["grabber_y0"],
 #   with parallel: grabber0.gate_roi_pulse(plan_mask, gate); ttl_camera_trigger.pulse(10*us)
 #   grabber0.input_mu(sums)
 ```
+
+`get_ioncam` (in every example) checks within 5 s that ioncam answers, then requests the
+device. If ioncam does not answer, it says what to check. Request ioncam in prepare(), not
+build(): ARTIQ gives build() 15 s and connects a controller with no time limit of its own.
+An unreachable ioncam would end the experiment with only "Timeout receiving data from
+worker" (see [Troubleshooting](#troubleshooting)).
 
 Complete experiments are in `examples/artiq/repository/`:
 
@@ -165,6 +179,7 @@ with their docstrings):
 | `verify_readout()` | test frames with the current plan (e.g. after adjusting it by hand) |
 | `get_readout_plan()` / `get_grabber_rois()` / `get_grabber_roi_lists()` / `is_readout_valid()` | the plan |
 | `check_grabber_mapping(image)` / `get_grabber_mapping()` / `forget_grabber_mapping()` | how the camera puts its frame on Camera Link: measured from a frame the Grabber saw (the mapping check experiment), kept per camera |
+| `get_readout_frames(last, each)` | the newest armed frames received over USB (200 kept): their number, shape, mean, each frame's sum and, with `each`, the frames themselves (what the Grabber should see) |
 | `arm_readout()` / `disarm_readout(resume_live)` | external trigger + Camera Link on/off; arming follows the crystal on screen first if it changed since the plan, and returns the plan armed |
 | `get_readout_counts(since_shot)` / `get_readout_stats()` | per-ROI sums of every shot (USB copy), threshold fits |
 | `get_readout_histograms(source)` | histograms of every ROI (verification or triggered shots) and, with every shot prepared bright, a threshold and quick fidelity estimate per ion |
@@ -455,17 +470,33 @@ Some points that matter when using the Grabber:
   stream's pixels in a line and y as its lines. An iXon Ultra 897 sends one pixel per
   super-pixel, so the ROIs are the super-pixels; another camera may send its lines
   unbinned, start them with pre-scan pixels or run them the other way. On the lab's 888
-  at 4×4 binning, ROIs at x = 1 and x = 3 both read its first super-pixel, so its stream
-  is not laid out like the 897's. **Run `ioncam_grabber_mapping_check.py` once per
+  the ARTIQ tab's ROIs looked wrong at 4×4 binning; only a measurement tells how its
+  stream is laid out. **Run `ioncam_grabber_mapping_check.py` once per
   camera** (and after changing the binning), armed, with one ion dark or a single ion
-  off-centre and a small AQROI with some structure (e.g. 4 × 4 super-pixels). It finds
-  the Grabber's frame size (a single-column ROI sums the bias inside the frame and
-  nothing beyond it), reads every
-  stream pixel with single-pixel ROIs and calls `check_grabber_mapping(image)`. ioncam
+  off-centre and a small AQROI with some structure (e.g. 4 × 4 super-pixels). It:
+  - counts the frames that reach the Grabber with the gate open and no trigger;
+  - finds the Grabber's frame size, up to 4096 × 4096: single-pixel ROIs on the first
+    line give the width, single-row ROIs the height (see *ROI semantics* for why not
+    columns);
+  - reads every stream pixel with single-pixel ROIs, `frames_per_pixel` shots each, and
+    calls `check_grabber_mapping(image)`. The pixels are read 15 at a time, each batch in
+    other shots, and an ion's brightness changes from batch to batch (EM gain, shot noise,
+    drifts). So after each batch the check fetches ioncam's USB frames of the same shots
+    (`get_readout_frames(last, each=True)`), and each pixel is compared with its own
+    shots. Camera Link and USB carry the same pixels, so the right layout fits exactly
+    (r = 1), even with few frames.
+
+  Beside every probe, ROI engine 0 sums the whole frame. A frame whose whole sum is more
+  than 3× off the median (a frame without a trigger, a partial one) is counted and left
+  out. A probe counts as lit only if it is lit in most frames. Its report is printed also
+  when the check fails: frames per trigger, odd frames, frames without a trigger, and the
+  Grabber's whole-frame sum against ioncam's USB frames (`get_readout_frames()`). ioncam
   tries every layout that fits - stream pixels per super-pixel, offset, mirroring, per
   axis - against the frames it received over USB. A layout must give back each
-  super-pixel's light (gain 1, or as many copies as are sent), and every other way round
-  must fit clearly worse; a symmetric picture is refused, with what to change. The answer
+  super-pixel's light (gain 1, or as many copies as are sent), every other way round
+  must fit clearly worse, and so must every other layout (by 0.03 in r, or with twice
+  the misfit). A symmetric picture, or one too noisy to tell two layouts apart, is
+  refused with what to change, never answered wrongly. The answer
   is kept per camera (model and serial, `grabber_mapping.json` in the data folder), used
   for every plan from then on, also after a restart, and the current plan is mapped at
   once. The ARTIQ tab and the plan say which layout they use and where it comes from;
@@ -480,7 +511,11 @@ Some points that matter when using the Grabber:
   `grabber0 frame size: WxH` with the Grabber frame of the plan (the plan table shows it).
 * **ROI semantics.** Grabber ROIs are half-open, `x0 ≤ x < x1`. The gateware only clears
   its "in ROI" x flag when the pixel counter *equals* `x1`, so an ROI with `x1` beyond the
-  frame width silently sums whole rows. ioncam never produces that, and
+  frame width silently sums whole rows. So does an ROI with `x0` equal to the width W:
+  for the cycle after a line's last pixel the counter stands at W, which switches the ROI
+  on into the next lines. A column ROI one past the frame is therefore lit, and the
+  mapping check measures the width on the first line only (the flags are cleared at the
+  end of each frame). ioncam never produces such ROIs, and
   `analysis/readout.py` contains a cycle-faithful model of the ROI engine that the tests
   check against.
 * **Timing.** The plan reports `min_trigger_period` (exposure + readout + keep-clean).
@@ -890,6 +925,45 @@ uses.
 
 ## Troubleshooting
 
+**An ARTIQ experiment stops after 15 s with "got worker exception in prepare stage" and
+`WorkerTimeout: Timeout receiving data from worker` in `run.build()`.** The experiment
+never reached ioncam. It asked for the `ioncam` controller in build(), and ARTIQ waits for
+that connection with no time limit of its own, while build() may take only 15 s. A refused
+connection would fail at once; a hang means nothing answered at the device_db's host and
+port. The examples now check first (`get_ioncam`, in prepare()) and say so within 5 s.
+Check, in order:
+1. **Where ioncam listens.** On the camera PC, `netstat -an | findstr 3270`:
+   - `127.0.0.1:3270` (and `[::1]:3270`) `LISTENING`: this PC only, the default. The
+     status-bar chip reads *RPC :3270 (this PC only)*. Start ioncam with `--bind '*'`.
+   - `0.0.0.0:3270` and `[::]:3270`: every address. Good.
+   - Nothing: ioncam's RPC server is not running (see below).
+2. **The firewall** of the camera PC must let TCP port 3270 in. In PowerShell as
+   administrator:
+   `New-NetFirewallRule -DisplayName "ioncam RPC" -Direction Inbound -Protocol TCP -LocalPort 3270 -Action Allow`.
+   Windows drops a blocked connection without an answer: that is the 15 s hang.
+3. **device_db `"host"`** must be the camera PC's address. The chip's tooltip lists them,
+   or run `ipconfig`. The example's 192.168.1.50 is a placeholder. With `artiq_master` on
+   the camera PC itself, use `"host": "::1"`; then `--bind '*'` is not needed.
+4. **Test from the ARTIQ PC:** `sipyco_rpctool <camera-pc> 3270 list-targets` should print
+   `ioncam` at once. If it hangs, go back to 1-3.
+
+**The mapping check stopped with "the Grabber frame is larger than 512 pixels: make the
+AQROI smaller"** (versions before November 2026), once at the width and once at the
+height, with an AQROI of only 3 × 2 super-pixels. That check called a column lit if
+*any* of its 20 frames had light there. One frame that was not the AQROI's (a frame
+without a trigger, a keep-clean cycle on the link) then made every column look lit.
+The check also measured the width one too wide: a column ROI just past the line is lit
+(see *ROI semantics*). The current check leaves odd frames out, decides on most
+frames, and probes up to 4096. Its report says what reached the Grabber:
+- **frames per trigger** should be one;
+- **odd frames** and **frames with no trigger** should be none;
+- **Grabber / USB whole frame** is 1 for a stream binned like the USB frame, and
+  hbin × vbin for a stream not binned at all. Much more means the camera sends more
+  than the AQROI.
+
+The core device log (`artiq_coremgmt log`) prints `grabber0 frame size: WxH` for every
+new size the Grabber sees. Several sizes there mean several kinds of frames on the link.
+
 **The status bar says *RPC failed* or *RPC stopped*.** The GUI and the camera work, but
 ARTIQ cannot connect: the RPC server on port 3270 is not running. Its tooltip, a dialog at
 start-up and the console say why. Usually either:
@@ -1037,7 +1111,7 @@ These are worth knowing, because several would silently corrupt data:
 
 ## Tests
 
-`pytest` runs 189 tests in about 6 minutes, in the realistic regime (13k photons/s
+`pytest` runs 202 tests in about 6 minutes, in the realistic regime (13k photons/s
 per ion, blurred PSF with halo, laser scatter, surface defects):
 - chain physics against James' published values;
 - detector accuracy (photon-limited) and false-alarm rates at EM gain 1, 50 and 300,

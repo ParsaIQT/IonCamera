@@ -19,10 +19,35 @@ not yet measured (the 897's layout is assumed), run ioncam_grabber_mapping_check
 once: it measures how the camera puts its frame on Camera Link.
 """
 
+import socket
+
 import numpy as np
 
 from artiq.experiment import *
 from artiq.coredevice.grabber import GrabberTimeoutException
+
+
+def get_ioncam(exp, timeout=5.0):
+    """The "ioncam" controller, once it answers - call it in prepare().
+
+    ARTIQ connects a controller requested in build() with no time limit of its
+    own: when it cannot reach ioncam, the experiment dies after 15 s with
+    "Timeout receiving data from worker" and no word of why."""
+    db = exp.get_device_db()
+    desc = db["ioncam"]
+    while isinstance(desc, str):            # an alias
+        desc = db[desc]
+    host, port = desc["host"], desc["port"]
+    try:
+        socket.create_connection((host, port), timeout).close()
+    except OSError as e:
+        raise ConnectionError(
+            "ioncam does not answer at {}:{} ({}). On the camera PC: is ioncam_gui (or "
+            "aqctl_ioncam) running, started with --bind '*' (otherwise only that PC can "
+            "connect), and does its firewall let TCP port {} in? Is {} that PC's address? "
+            "Test from here: sipyco_rpctool {} {} list-targets".format(
+                host, port, e, port, host, host, port)) from None
+    return exp.get_device("ioncam")
 
 
 class IonCamGrabberReadout(EnvExperiment):
@@ -30,7 +55,6 @@ class IonCamGrabberReadout(EnvExperiment):
 
     def build(self):
         self.setattr_device("core")
-        self.setattr_device("ioncam")
         self.setattr_device("grabber0")
         self.setattr_device("ttl_camera_trigger")
         self.setattr_argument("n_ions", NumberValue(2, precision=0, step=1, min=1, max=15))
@@ -43,6 +67,7 @@ class IonCamGrabberReadout(EnvExperiment):
         self.setattr_argument("all_bright", BooleanValue(True))
 
     def prepare(self):
+        self.ioncam = get_ioncam(self)
         n = int(self.n_ions)
         if self.recalibrate or not self.ioncam.is_readout_valid():
             plan = self.ioncam.calibrate_readout(n_ions=n)
@@ -64,8 +89,9 @@ class IonCamGrabberReadout(EnvExperiment):
         self.roi_y1 = [int(v) for v in plan["grabber_y1"]]
         self.mask = int(plan["full_mask"])
         applied = plan["applied"]
-        # the gate must be open from the trigger until the frame has arrived
-        self.gate_time = applied["exposure"] + applied["readout_time"] + 2 * ms
+        # the gate must be open from the trigger until the frame has arrived:
+        # the camera may first finish a keep-clean cycle, then exposes and reads out
+        self.gate_time = applied["min_trigger_period"] + 2 * ms
         if self.shot_period < applied["min_trigger_period"] + self.gate_time:
             raise ValueError("shot_period shorter than exposure + readout ({:.2f} ms)".format(
                 1e3 * (applied["min_trigger_period"] + self.gate_time)))

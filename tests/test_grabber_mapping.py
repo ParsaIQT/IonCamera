@@ -167,3 +167,28 @@ def test_888_with_unbinned_camera_link(tmp_path):
         assert engine.readout_plan()["grabber_source"].startswith("assumed")
     finally:
         engine.shutdown()
+
+
+@pytest.mark.parametrize("levels", [[0.4, 1.6, 0.7, 1.3, 1.0], [1.8, 0.5, 1.2, 0.4, 1.1]])
+def test_fit_compares_each_pixel_with_its_own_shots(levels):
+    """The mapping check reads the stream 15 pixels at a time, each batch in
+    other shots - and an ion's brightness differs from batch to batch.  Against
+    the USB frames of each pixel's own shots the layout is exact (r = 1);
+    against the mean of all frames the light does not add up: refused (no
+    layout, or two that fit alike), never a wrong layout applied."""
+    geom, k = G(0, 1), 15
+    h, w = FRAME.shape
+    gh, gw = h, 4 * w
+    usb = [(FRAME - 500) * lv + 500 for lv in levels]
+    stream, batch = np.zeros((gh, gw)), np.zeros((gh, gw), int)
+    for i in range(gh * gw):
+        y, x = divmod(i, gw)
+        stream[y, x] = camera_link_frame(usb[i // k], geom, 4, 4, bias=500.0)[y, x]
+        batch[y, x] = i // k
+    res = infer_grabber_geometry(np.array(usb), stream, 4, 4, pixel_batch=batch)
+    assert res["ok"] and G.from_dict(res["geometry"]) == geom and res["r"] > 0.999, res
+    assert res["gain"] == pytest.approx(1.0, abs=0.01)
+    plain = infer_grabber_geometry(np.mean(usb, axis=0), stream, 4, 4)
+    assert not plain["ok"] and plain["reason"], plain
+    bad = infer_grabber_geometry(np.array(usb), stream, 4, 4, pixel_batch=batch[:, :-1])
+    assert not bad["ok"] and "pixel_batch" in bad["reason"]

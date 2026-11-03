@@ -924,7 +924,8 @@ def camera_link_frame(frame: np.ndarray, geom: GrabberGeometry, hbin: int, vbin:
 
 
 def infer_grabber_geometry(expected: np.ndarray, measured: np.ndarray, hbin: int = 1,
-                           vbin: int = 1, max_tries: int = 200000) -> dict:
+                           vbin: int = 1, max_tries: int = 200000,
+                           pixel_batch: Optional[np.ndarray] = None) -> dict:
     """How a frame the Grabber saw (``measured``: H_g x W_g stream pixels,
     e.g. rebuilt from single-pixel ROIs) holds the camera's binned frame
     (``expected``: H x W, the mean of USB frames of the same light): every
@@ -932,12 +933,30 @@ def infer_grabber_geometry(expected: np.ndarray, measured: np.ndarray, hbin: int
     the direction, per axis - is tried, the measured frame summed back into
     binned pixels and compared with the expected one (correlation).  The best
     wins if it explains the light (r >= 0.6) and every other way round - the
-    other mirrorings - fits clearly worse (by 0.03); a symmetric image cannot
-    tell those apart.  Also the intensity: summed stream pixels = ``gain`` x
-    USB pixel + ``offset`` (each stream pixel carries its own bias)."""
+    other mirrorings - fits clearly worse (by 0.03), and so does every other
+    layout (scale or offset: by 0.03, or with at least twice the misfit 1 - r):
+    a symmetric image cannot tell the mirrorings apart, a noisy one (too few
+    frames averaged) the layouts.  Also the
+    intensity: summed stream pixels = ``gain`` x USB pixel + ``offset`` (each
+    stream pixel carries its own bias).
+
+    ``pixel_batch``: when the stream pixels were measured in different shots
+    (n_engines at a time), the batch of each (H_g x W_g indices) and
+    ``expected`` the USB mean frame of each batch's shots (n x H x W): each
+    stream pixel is compared with the light of its own shots - an ion's
+    brightness differs from batch to batch (EM gain, shot noise, drifts) far
+    more than a layout's fit."""
     e = np.asarray(expected, float)
     m = np.asarray(measured, float)
     out: dict = {"ok": False, "frame": [int(m.shape[1]), int(m.shape[0])] if m.ndim == 2 else None}
+    stack = None
+    if pixel_batch is not None:
+        stack = e if e.ndim == 3 else e[None]
+        pb = np.asarray(pixel_batch, int)
+        if m.ndim != 2 or pb.shape != m.shape or pb.min() < 0 or pb.max() >= len(stack):
+            return dict(out, reason="pixel_batch must give a batch of the expected frames for "
+                                    "every pixel of the Grabber frame")
+        e = stack.mean(axis=0)
     if e.ndim != 2 or m.ndim != 2:
         return dict(out, reason="frames must be 2-D")
     h, w = e.shape
@@ -960,22 +979,42 @@ def infer_grabber_geometry(expected: np.ndarray, measured: np.ndarray, hbin: int
     if en <= 0:
         return dict(out, reason="the camera's frame is uniform: put light into it (an ion)")
     ev = ez.ravel() / (en * en)
+    jj = np.arange(h)[:, None, None, None]
+    ii = np.arange(w)[None, None, :, None]
     best: dict = {}
+    top: list = []                  # the 8 best (score, r, geometry): the best rival layout
     for sx, ox, fx in cx:
         cols = m[:, ox:ox + w * sx].reshape(gh, w, sx).sum(axis=2)
+        if stack is not None:
+            bx = pb[:, ox:ox + w * sx].reshape(gh, w, sx)
         if fx:
             cols = cols[:, ::-1]
+            if stack is not None:
+                bx = bx[:, ::-1]
         for sy, oy, fy in cy:
             b = cols[oy:oy + h * sy].reshape(h, sy, w).sum(axis=1)
             if fy:
                 b = b[::-1]
+            ez_g, en_g, ev_g = ez, en, ev
+            if stack is not None:
+                # the expected light of each binned pixel: the USB frames of
+                # the shots its stream pixels were measured in
+                by = bx[oy:oy + h * sy].reshape(h, sy, w, sx)
+                if fy:
+                    by = by[::-1]
+                eg = stack[by, jj, ii].mean(axis=(1, 3))
+                ez_g = eg - eg.mean()
+                en_g = float(np.sqrt((ez_g * ez_g).sum()))
+                if en_g <= 0:
+                    continue
+                ev_g = ez_g.ravel() / (en_g * en_g)
             bz = b - b.mean()
             bn = float(np.sqrt((bz * bz).sum()))
-            r = float((ez * bz).sum()) / (en * bn) if bn > 0 else 0.0
+            r = float((ez_g * bz).sum()) / (en_g * bn) if bn > 0 else 0.0
             # The stream pixels of a binned pixel hold its light: summed back,
             # gain 1 (or as many times as copies of it are sent).  A geometry
             # that sums part of the light, or a neighbour's, is no explanation.
-            gain = float(np.dot(ev, bz.ravel()))
+            gain = float(np.dot(ev_g, bz.ravel()))
             n_px = sx * sy
             if not (abs(gain - 1.0) <= 0.15 or abs(gain - n_px) <= 0.15 * n_px):
                 continue
@@ -983,32 +1022,53 @@ def infer_grabber_geometry(expected: np.ndarray, measured: np.ndarray, hbin: int
             score = r - 1e-9 * (sx + sy + ox + oy + fx + fy)
             key = (fx, fy)
             if key not in best or score > best[key][0]:
-                best[key] = (score, r, GrabberGeometry(sx, sy, ox, oy, fx, fy), b)
+                best[key] = (score, r, GrabberGeometry(sx, sy, ox, oy, fx, fy), b,
+                             ez_g + (e.mean() if stack is None else eg.mean()))
+            if len(top) < 8 or score > top[-1][0]:
+                top = sorted(top + [(score, r, (sx, sy, ox, oy, fx, fy))],
+                             key=lambda v: -v[0])[:8]
     if not best:
         return dict(out, reason="no geometry sums the Grabber's pixels back to the camera's "
                                 "light: is the readout armed with this plan, and light on it?")
     ranked = sorted(best.values(), key=lambda v: -v[0])
-    _, r, geom, b = ranked[0]
+    _, r, geom, b, e_fit = ranked[0]
     other = ranked[1][1] if len(ranked) > 1 else -1.0
+    # the best layout other than the winner's (any mirroring): at most 4 of
+    # the top 8 are the winner's layout
+    layout = (geom.x_scale, geom.y_scale, geom.x_offset, geom.y_offset)
+    rival = next((v for v in top if v[2][:4] != layout), None)
+    r_rival = rival[1] if rival is not None else -1.0
     # the intensity: binned stream pixels against USB pixels
-    a_, c_ = np.polyfit(e.ravel(), b.ravel(), 1) if np.ptp(e) > 0 else (1.0, 0.0)
+    a_, c_ = np.polyfit(e_fit.ravel(), b.ravel(), 1) if np.ptp(e_fit) > 0 else (1.0, 0.0)
     sx, sy = geom.scales(hbin, vbin)
     # a scale equal to the binning is the stream not binned: stored as 0, so
     # it follows the binning (a scale of 1 stays 1)
     stored = GrabberGeometry(0 if sx == hbin != 1 else sx, 0 if sy == vbin != 1 else sy,
                              geom.x_offset, geom.y_offset, geom.flip_x, geom.flip_y)
-    ok = r >= 0.6 and r - other >= 0.03
+    # clearly better than any other layout: by 0.03, or half its misfit (near r = 1)
+    clear = r - r_rival >= 0.03 or 1.0 - r <= 0.5 * (1.0 - r_rival)
+    ok = r >= 0.6 and r - other >= 0.03 and clear
     out.update(ok=bool(ok), geometry=stored.to_dict(), r=round(r, 4),
-               r_other_mirroring=round(other, 4), ambiguous=bool(r - other < 0.03),
+               r_other_mirroring=round(other, 4), r_other_layout=round(r_rival, 4),
+               ambiguous=bool(r - other < 0.03 or not clear),
                gain=round(float(a_), 4), offset=round(float(c_), 2),
                summary=stored.describe(hbin, vbin))
     if not ok:
-        out["reason"] = ("two ways round fit about as well - the picture looks alike "
-                         "mirrored: make it asymmetric (one ion dark, or the AQROI moved by a "
-                         "super-pixel so the light is off-centre both ways) and repeat"
-                         if r >= 0.6 else
-                         "no geometry explains the Grabber's frame (r = {:.2f}): is the "
-                         "readout armed with this plan and light on the ions?".format(r))
+        if r < 0.6:
+            out["reason"] = ("no geometry explains the Grabber's frame (r = {:.2f}): is the "
+                             "readout armed with this plan and light on the ions?".format(r))
+        elif r - other < 0.03:
+            out["reason"] = ("two ways round fit about as well - the picture looks alike "
+                             "mirrored: make it asymmetric (one ion dark, or the AQROI moved "
+                             "by a super-pixel so the light is off-centre both ways) and repeat")
+        else:
+            sx_, sy_, ox_, oy_, fx_, fy_ = rival[2]
+            other_geom = GrabberGeometry(sx_, sy_, ox_, oy_, fx_, fy_)
+            out["reason"] = ("two layouts fit about as well: {} (r = {:.3f}) and {} (r = "
+                             "{:.3f}) - average more frames per pixel or put more light into "
+                             "the AQROI, and repeat".format(
+                                 geom.describe(hbin, vbin), r, other_geom.describe(hbin, vbin),
+                                 r_rival))
     return out
 
 
